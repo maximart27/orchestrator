@@ -128,15 +128,38 @@ func (m *TenantManager) bootstrapProcess() error {
 	})
 	signalManager.Store(m)
 	signalsOnce.Do(func() { go acceptSignals() })
-	if m.base.RaftEnabled {
-		if err := orcraft.Setup(NewCommandApplier(m), NewSnapshotDataCreatorApplier(m), process.ThisHostname); err != nil {
-			return fmt.Errorf("raft: %w", err)
-		}
-		go orcraft.Monitor()
+	if err := m.bootstrapRaft(); err != nil {
+		return err
 	}
 	if grab := config.RuntimeCLIFlags.GrabElection; grab != nil && *grab {
 		_ = m.control.GrabElection()
 	}
+	return nil
+}
+
+// raftSetup and raftMonitor are orcraft.Setup and orcraft.Monitor, seams for tests.
+var (
+	raftSetup   = orcraft.Setup
+	raftMonitor = orcraft.Monitor
+)
+
+// bootstrapRaft starts the single Raft group of the process when it is enabled.
+//
+// Order matters: Raft replays its log and snapshot into the tenants as soon as it
+// opens, and a command for a tenant that does not exist yet is discarded, not
+// kept for later. That is why every tenant (backend, Store...) is built by
+// NewTenantManager, before Start gets here, and why the HTTP listener is only
+// opened after Start returns (see app.standardHttp). The consequence, for the
+// operator: every Raft node must run the same tenants (the same tenants file), or
+// a node lacking tenant X loses X's commands for good.
+func (m *TenantManager) bootstrapRaft() error {
+	if !m.base.RaftEnabled {
+		return nil
+	}
+	if err := raftSetup(NewCommandApplier(m), NewSnapshotDataCreatorApplier(m), process.ThisHostname); err != nil {
+		return fmt.Errorf("raft: %w", err)
+	}
+	go raftMonitor()
 	return nil
 }
 
