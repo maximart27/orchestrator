@@ -381,3 +381,41 @@ func TestConsulTxnStoreDistributePairs(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestGroupKVPairsByKeyPrefixNormalizedPrefix uses the prefix as the configuration holds it once loaded
+// ("mysql/master/", with a trailing "/"): the keys of one cluster must still be grouped together, and
+// the key published for a cluster master must not contain a "//".
+func TestGroupKVPairsByKeyPrefixNormalizedPrefix(t *testing.T) {
+	cfg := &config.Configuration{ConsulMaxKVsPerTransaction: 12, KVClusterMasterPrefix: "mysql/master/"}
+
+	kvPairs := consulapi.KVPairs{}
+	for cluster := 0; cluster < 20; cluster++ {
+		base := ClusterMasterKey(cfg.KVClusterMasterPrefix, fmt.Sprintf("cluster%d", cluster))
+		if strings.Contains(base, "//") {
+			t.Fatalf("cluster master key %q contains a double slash", base)
+		}
+		for _, suffix := range []string{"", "/hostname", "/ipv4", "/ipv6", "/port"} {
+			kvPairs = append(kvPairs, &consulapi.KVPair{Key: base + suffix, Value: []byte("v")})
+		}
+	}
+
+	grouped := groupKVPairsByKeyPrefixWithConfig(cfg, kvPairs)
+	if len(grouped) != 10 {
+		t.Fatalf("expected 10 groups, got %d", len(grouped))
+	}
+	clusterGroups := map[string]map[int]bool{}
+	for i, group := range grouped {
+		for _, kvPair := range group {
+			name := strings.Split(kvPair.Key, "/")[2]
+			if clusterGroups[name] == nil {
+				clusterGroups[name] = map[int]bool{}
+			}
+			clusterGroups[name][i] = true
+		}
+	}
+	for name, groups := range clusterGroups {
+		if len(groups) != 1 {
+			t.Fatalf("expected %s in a single group, found it in %d", name, len(groups))
+		}
+	}
+}

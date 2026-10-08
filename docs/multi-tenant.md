@@ -156,13 +156,27 @@ endpoints themselves.
 The tenant-scoped Prometheus metrics (discoveries, instances, recoveries, queue lengths...) carry a `tenant` label,
 registered once; process-wide metrics (health, Raft) have none. In the legacy setup the label is `default`.
 
-## Limitations of this version
+## Known limitations
 
-* **Agents and seeds are not multi-tenant.** The agents listener (`ServeAgentsHttp`) and the agents poll work on the
-  legacy single-tenant backend only; the process refuses to start with `ServeAgentsHttp` and a tenants file.
-* **One authentication realm** for all tenants (no per-tenant users or roles).
-* **No PostgreSQL as orchestrator backend**: SQLite or MySQL.
-* **No live reconfiguration of tenants**: adding, removing or changing a tenant means restarting the node.
+* **SIGHUP only reloads the global configuration.** Neither `SIGHUP` nor `reload-configuration` re-reads the tenants
+  file or changes a running tenant; adding, removing or changing a tenant means restarting the node (one Raft
+  node at a time).
+* **Agents and seeds are outside this version.** The agents listener (`ServeAgentsHttp`) and the agents poll work
+  on the legacy single-tenant backend only; the process refuses to start with `ServeAgentsHttp` and a tenants
+  file. Seeds are not multi-tenant either.
+* **The Raft snapshot reads the backends in the apply goroutine.** While a snapshot is being taken, the reading of
+  the backend of every tenant stops the application of Raft commands (`Apply` is blocked) for as long as it lasts.
+  With big or slow backends this delays the replication of every tenant on that node.
+* **`RecoveryPeriodBlockSeconds` must be longer than a failover with Raft.** A failover under Raft takes 40-60
+  seconds; if the block period is shorter than that, the recovery is considered expired before it finishes and is
+  repeated. The default (3600) is fine; if a tenant lowers it, keep it at **120 seconds or more** in multi-tenant
+  setups.
+* **`${ENV}` credentials are visible to every hook.** Hooks inherit the environment of the process, so anything a
+  tenant references as `${ENV}` can be read by the hooks of all the tenants (see
+  [Security between tenants](#security-between-tenants)).
+* **One authentication realm** for all tenants (no per-tenant users or roles); `ReadOnly` and `PowerAuthUsers`
+  are global.
+* **No PostgreSQL as orchestrator backend**: SQLite or MySQL. PostgreSQL is only a topology engine.
 * **`disable-global-recoveries` is per tenant**, not per process.
 * **No hot upgrade** from a version without multi-tenancy while a second tenant is active (see Requirements).
 

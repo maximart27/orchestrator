@@ -102,6 +102,32 @@ field (for example `tenant "mariadb-b": Config: field "RaftBind" is node-local a
 Field names are matched case-insensitively, like in the regular configuration file. Errors never abort the
 process by themselves: `config.LoadTenantConfigs` returns them to the caller.
 
+## PostgreSQL tenants: required role and `pg_hba`
+
+The PostgreSQL provider connects to the `postgres` database of every instance with the tenant's
+`PostgreSQLTopologyUser`, reads `pg_stat_replication` / `pg_stat_wal_receiver`, and, for recoveries, promotes a
+standby (`pg_promote`), runs `ALTER SYSTEM` and uses **that same user as the replication user** in
+`primary_conninfo`. The topology role therefore needs:
+
+* `pg_monitor`,
+* `REPLICATION` (and `LOGIN`),
+* `SUPERUSER`, like the role of the functional test (`tests/functional/postgres/init-primary.sh`),
+
+and `pg_hba.conf` needs a `replication` line for it, because the stock `host all all ...` rule does not match
+replication connections:
+
+```sql
+CREATE ROLE orchestrator_c WITH LOGIN SUPERUSER REPLICATION PASSWORD 'secret-c';
+GRANT pg_monitor TO orchestrator_c;
+```
+
+```
+host  replication  orchestrator_c  <orchestrator and standby network>  scram-sha-256
+```
+
+(then `select pg_reload_conf()`). Without the `SUPERUSER`/`REPLICATION` attributes or the `replication` line the
+tenant is discovered but a standby cannot be promoted or re-pointed.
+
 ## Which settings go where
 
 Every field of `Configuration` is classified in `go/config/field_scope.go` (`config.FieldScope`). A test fails when
@@ -154,7 +180,7 @@ Loading fails when tenants would silently interfere with each other:
 
 ## Reloading
 
-`config.Reload` (SIGHUP / `reload-configuration` API) only re-reads the regular configuration file. The tenants
-manifest is not reloaded by it yet. A reload should call `LoadTenantConfigs` on the new base configuration, validate it
-completely, and only then swap the tenants atomically: a manifest with errors must leave the running tenants
-untouched.
+`config.Reload` (SIGHUP / `reload-configuration` API) only re-reads the regular configuration file, that is the
+global configuration (and the `default` tenant of a legacy setup). The tenants file is **not** reloaded and the
+running tenants keep the configuration they started with: change a tenant, or the tenants file, by restarting the
+node (one Raft node at a time).

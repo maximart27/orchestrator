@@ -2269,6 +2269,8 @@ func (s *Store) InjectSeed(instanceKey *InstanceKey) error {
 	clusterName := instanceKey.StringCode()
 	// minimal details:
 	instance := &Instance{Key: *instanceKey, Version: "Unknown", ClusterName: clusterName}
+	// detectProviderType trusts the stored provider_type: store the stub with the right engine
+	instance.ProviderType = s.detectProviderType(instanceKey)
 	instance.SetSeed()
 	err := s.WriteInstance(instance, false, nil)
 	log.Debugf("InjectSeed: %+v, %+v", *instanceKey, err)

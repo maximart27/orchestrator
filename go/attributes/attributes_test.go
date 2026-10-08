@@ -97,3 +97,14 @@ func TestLegacyWrappersUseDefaultBackend(t *testing.T) {
 		t.Errorf("DefaultStore = %q %v", v, err)
 	}
 }
+
+func TestGetMissingAttributeReturnsErrorWithoutPanic(t *testing.T) {
+	s := NewStore(newTestBackend(t, "missing"))
+
+	if v, err := s.GetHostAttribute("nohost", "noattr"); err == nil || v != "" {
+		t.Errorf("GetHostAttribute on a missing attribute = %q, %v; want empty value and error", v, err)
+	}
+	if v, err := s.GetGeneralAttribute("noattr"); err == nil || v != "" {
+		t.Errorf("GetGeneralAttribute on a missing attribute = %q, %v; want empty value and error", v, err)
+	}
+}

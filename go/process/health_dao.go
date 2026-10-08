@@ -314,11 +314,12 @@ func (c *Control) TokenBelongsToHealthyHttpService(token string) (result bool, e
 		from
 			node_health
 		where
-			and token = ?
+			token = ?
 			and extra_info = ?
+			and last_seen_active > now() - interval ? second
 		`
 
-	err = c.control.backend.Query(query, sqlutils.Args(token, extraInfo), func(m sqlutils.RowMap) error {
+	err = c.control.backend.Query(query, sqlutils.Args(token, extraInfo, config.HealthPollSeconds*2), func(m sqlutils.RowMap) error {
 		// Row exists? We're happy
 		result = true
 		return nil

@@ -125,7 +125,7 @@ func (s *Store) GetHostAttribute(hostname string, attributeName string) (string,
 	if err != nil {
 		return "", err
 	}
-	if len(attributeName) == 0 {
+	if len(attributes) == 0 {
 		return "", log.Errorf("No attribute found for %+v, %+v", hostname, attributeName)
 	}
 	return attributes[0].AttributeValue, nil
