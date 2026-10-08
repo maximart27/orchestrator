@@ -354,3 +354,12 @@ func (this *HttpAPI) ListTenants(w http.ResponseWriter, r *http.Request) {
 func V2Tenants(w http.ResponseWriter, r *http.Request) {
 	respondOK(w, tenantStatuses(managerOf(nil)))
 }
+
+// renderTenantHTML renders a page; a page of a tenant workspace gets the
+// template variable tenantId.
+func renderTenantHTML(w http.ResponseWriter, r *http.Request, name string, data map[string]interface{}) {
+	if t := TenantFrom(r); t != nil {
+		data["tenantId"] = t.ID
+	}
+	renderHTML(w, http.StatusOK, name, data)
+}

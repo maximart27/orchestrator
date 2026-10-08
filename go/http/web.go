@@ -31,11 +31,15 @@ import (
 
 	"github.com/proxysql/orchestrator/go/config"
 	"github.com/proxysql/orchestrator/go/inst"
+	"github.com/proxysql/orchestrator/go/logic"
 )
 
 // HttpWeb is the web requests server, mapping each request to a web page
 type HttpWeb struct {
 	URLPrefix string
+	// Manager is the TenantManager the requests resolve their tenant in. Nil means
+	// the one given to SetTenantManager or, failing that, logic.DefaultManager().
+	Manager *logic.TenantManager
 }
 
 var Web HttpWeb = HttpWeb{}
@@ -61,48 +65,75 @@ func (this *HttpWeb) AccessToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (this *HttpWeb) Index(w http.ResponseWriter, r *http.Request) {
+	if tenant := TenantFrom(r); tenant != nil {
+		renderRedirect(w, r, this.URLPrefix+"/web/tenants/"+tenant.ID+"/clusters")
+		return
+	}
+	if managerOf(this.Manager).Default() == nil {
+		// several tenants and none of them is implicit: let the user choose
+		renderRedirect(w, r, this.URLPrefix+"/web/tenants")
+		return
+	}
 	renderRedirect(w, r, this.URLPrefix+"/web/clusters")
 }
 
+// Tenants renders the page that lists the tenants of the process, each linking
+// to its own workspace. It is global: it names no tenant.
+func (this *HttpWeb) Tenants(w http.ResponseWriter, r *http.Request) {
+	renderTenantHTML(w, r, "templates/tenants", map[string]interface{}{
+		"agentsHttpActive":    config.Config.ServeAgentsHttp,
+		"title":               "tenants",
+		"authorizedForAction": isAuthorizedForAction(r),
+		"userId":              getUserId(r),
+		"autoshow_problems":   false,
+		"prefix":              this.URLPrefix,
+		"webMessage":          config.Config.WebMessage,
+		"tenants":             tenantStatuses(managerOf(this.Manager)),
+	})
+}
+
 func (this *HttpWeb) Clusters(w http.ResponseWriter, r *http.Request) {
-	renderHTML(w, 200, "templates/clusters", map[string]interface{}{
+	tenant := tenantOf(r)
+	renderTenantHTML(w, r, "templates/clusters", map[string]interface{}{
 		"agentsHttpActive":              config.Config.ServeAgentsHttp,
 		"title":                         "clusters",
 		"autoshow_problems":             false,
 		"authorizedForAction":           isAuthorizedForAction(r),
 		"userId":                        getUserId(r),
-		"removeTextFromHostnameDisplay": config.Config.RemoveTextFromHostnameDisplay,
+		"removeTextFromHostnameDisplay": tenant.Cfg.RemoveTextFromHostnameDisplay,
 		"prefix":                        this.URLPrefix,
 		"webMessage":                    config.Config.WebMessage,
 	})
 }
 
 func (this *HttpWeb) ClustersAnalysis(w http.ResponseWriter, r *http.Request) {
-	renderHTML(w, 200, "templates/clusters_analysis", map[string]interface{}{
+	tenant := tenantOf(r)
+	renderTenantHTML(w, r, "templates/clusters_analysis", map[string]interface{}{
 		"agentsHttpActive":              config.Config.ServeAgentsHttp,
 		"title":                         "clusters",
 		"autoshow_problems":             false,
 		"authorizedForAction":           isAuthorizedForAction(r),
 		"userId":                        getUserId(r),
-		"removeTextFromHostnameDisplay": config.Config.RemoveTextFromHostnameDisplay,
+		"removeTextFromHostnameDisplay": tenant.Cfg.RemoveTextFromHostnameDisplay,
 		"prefix":                        this.URLPrefix,
 		"webMessage":                    config.Config.WebMessage,
 	})
 }
 
 func (this *HttpWeb) Cluster(w http.ResponseWriter, r *http.Request) {
-	clusterName, _ := figureClusterName(tenantOf(r), chi.URLParam(r, "clusterName"))
+	tenant := tenantOf(r)
+	clusterName, _ := figureClusterName(tenant, chi.URLParam(r, "clusterName"))
 
-	renderHTML(w, 200, "templates/cluster", map[string]interface{}{
+	renderTenantHTML(w, r, "templates/cluster", map[string]interface{}{
 		"agentsHttpActive":              config.Config.ServeAgentsHttp,
 		"title":                         "cluster",
 		"clusterName":                   clusterName,
 		"autoshow_problems":             true,
 		"contextMenuVisible":            true,
-		"pseudoGTIDModeEnabled":         (config.Config.PseudoGTIDPattern != ""),
+		"pseudoGTIDModeEnabled":         (tenant.Cfg.PseudoGTIDPattern != ""),
 		"authorizedForAction":           isAuthorizedForAction(r),
 		"userId":                        getUserId(r),
-		"removeTextFromHostnameDisplay": config.Config.RemoveTextFromHostnameDisplay,
+		"removeTextFromHostnameDisplay": tenant.Cfg.RemoveTextFromHostnameDisplay,
 		"compactDisplay":                template.JSEscapeString(r.URL.Query().Get("compact")),
 		"prefix":                        this.URLPrefix,
 		"webMessage":                    config.Config.WebMessage,
@@ -110,7 +141,8 @@ func (this *HttpWeb) Cluster(w http.ResponseWriter, r *http.Request) {
 }
 
 func (this *HttpWeb) ClusterByAlias(w http.ResponseWriter, r *http.Request) {
-	clusterName, err := inst.GetClusterByAlias(chi.URLParam(r, "clusterAlias"))
+	tenant := tenantOf(r)
+	clusterName, err := tenant.Store.GetClusterByAlias(chi.URLParam(r, "clusterAlias"))
 	// Willing to accept the case of multiple clusters; we just present one
 	if clusterName == "" && err != nil {
 		renderJSON(w, 200, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
@@ -121,12 +153,13 @@ func (this *HttpWeb) ClusterByAlias(w http.ResponseWriter, r *http.Request) {
 }
 
 func (this *HttpWeb) ClusterByInstance(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
 		renderJSON(w, 200, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, found, err := inst.ReadInstance(&instanceKey)
+	instance, found, err := tenant.Store.ReadInstance(&instanceKey)
 	if (!found) || (err != nil) {
 		renderJSON(w, 200, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", instanceKey)})
 		return
@@ -143,16 +176,17 @@ func (this *HttpWeb) ClusterByInstance(w http.ResponseWriter, r *http.Request) {
 
 // clusterWithName renders the cluster page for a given clusterName (shared by ClusterByAlias and ClusterByInstance).
 func (this *HttpWeb) clusterWithName(w http.ResponseWriter, r *http.Request, clusterName string) {
-	renderHTML(w, 200, "templates/cluster", map[string]interface{}{
+	tenant := tenantOf(r)
+	renderTenantHTML(w, r, "templates/cluster", map[string]interface{}{
 		"agentsHttpActive":              config.Config.ServeAgentsHttp,
 		"title":                         "cluster",
 		"clusterName":                   clusterName,
 		"autoshow_problems":             true,
 		"contextMenuVisible":            true,
-		"pseudoGTIDModeEnabled":         (config.Config.PseudoGTIDPattern != ""),
+		"pseudoGTIDModeEnabled":         (tenant.Cfg.PseudoGTIDPattern != ""),
 		"authorizedForAction":           isAuthorizedForAction(r),
 		"userId":                        getUserId(r),
-		"removeTextFromHostnameDisplay": config.Config.RemoveTextFromHostnameDisplay,
+		"removeTextFromHostnameDisplay": tenant.Cfg.RemoveTextFromHostnameDisplay,
 		"compactDisplay":                template.JSEscapeString(r.URL.Query().Get("compact")),
 		"prefix":                        this.URLPrefix,
 		"webMessage":                    config.Config.WebMessage,
@@ -160,17 +194,18 @@ func (this *HttpWeb) clusterWithName(w http.ResponseWriter, r *http.Request, clu
 }
 
 func (this *HttpWeb) ClusterPools(w http.ResponseWriter, r *http.Request) {
-	clusterName, _ := figureClusterName(tenantOf(r), chi.URLParam(r, "clusterName"))
-	renderHTML(w, 200, "templates/cluster_pools", map[string]interface{}{
+	tenant := tenantOf(r)
+	clusterName, _ := figureClusterName(tenant, chi.URLParam(r, "clusterName"))
+	renderTenantHTML(w, r, "templates/cluster_pools", map[string]interface{}{
 		"agentsHttpActive":              config.Config.ServeAgentsHttp,
 		"title":                         "cluster pools",
 		"clusterName":                   clusterName,
 		"autoshow_problems":             false, // because pool screen by default expands all hosts
 		"contextMenuVisible":            true,
-		"pseudoGTIDModeEnabled":         (config.Config.PseudoGTIDPattern != ""),
+		"pseudoGTIDModeEnabled":         (tenant.Cfg.PseudoGTIDPattern != ""),
 		"authorizedForAction":           isAuthorizedForAction(r),
 		"userId":                        getUserId(r),
-		"removeTextFromHostnameDisplay": config.Config.RemoveTextFromHostnameDisplay,
+		"removeTextFromHostnameDisplay": tenant.Cfg.RemoveTextFromHostnameDisplay,
 		"compactDisplay":                template.JSEscapeString(r.URL.Query().Get("compact")),
 		"prefix":                        this.URLPrefix,
 		"webMessage":                    config.Config.WebMessage,
@@ -183,7 +218,7 @@ func (this *HttpWeb) Search(w http.ResponseWriter, r *http.Request) {
 		searchString = r.URL.Query().Get("s")
 	}
 	searchString = template.JSEscapeString(searchString)
-	renderHTML(w, 200, "templates/search", map[string]interface{}{
+	renderTenantHTML(w, r, "templates/search", map[string]interface{}{
 		"agentsHttpActive":    config.Config.ServeAgentsHttp,
 		"title":               "search",
 		"searchString":        searchString,
@@ -196,12 +231,13 @@ func (this *HttpWeb) Search(w http.ResponseWriter, r *http.Request) {
 }
 
 func (this *HttpWeb) Discover(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	providerName := "MySQL"
-	if strings.EqualFold(config.Config.ProviderType, "postgresql") {
+	if strings.EqualFold(tenant.Cfg.ProviderType, "postgresql") {
 		providerName = "PostgreSQL"
 	}
 
-	renderHTML(w, 200, "templates/discover", map[string]interface{}{
+	renderTenantHTML(w, r, "templates/discover", map[string]interface{}{
 		"agentsHttpActive":    config.Config.ServeAgentsHttp,
 		"title":               "discover",
 		"authorizedForAction": isAuthorizedForAction(r),
@@ -210,7 +246,7 @@ func (this *HttpWeb) Discover(w http.ResponseWriter, r *http.Request) {
 		"prefix":              this.URLPrefix,
 		"webMessage":          config.Config.WebMessage,
 		"providerName":        providerName,
-		"defaultInstancePort": config.Config.DefaultInstancePort,
+		"defaultInstancePort": tenant.Cfg.DefaultInstancePort,
 	})
 }
 
@@ -220,7 +256,7 @@ func (this *HttpWeb) Audit(w http.ResponseWriter, r *http.Request) {
 		page = 0
 	}
 
-	renderHTML(w, 200, "templates/audit", map[string]interface{}{
+	renderTenantHTML(w, r, "templates/audit", map[string]interface{}{
 		"agentsHttpActive":    config.Config.ServeAgentsHttp,
 		"title":               "audit",
 		"authorizedForAction": isAuthorizedForAction(r),
@@ -235,6 +271,7 @@ func (this *HttpWeb) Audit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (this *HttpWeb) AuditRecovery(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	page, err := strconv.Atoi(chi.URLParam(r, "page"))
 	if err != nil {
 		page = 0
@@ -246,8 +283,8 @@ func (this *HttpWeb) AuditRecovery(w http.ResponseWriter, r *http.Request) {
 	recoveryUid := chi.URLParam(r, "uid")
 	clusterAlias := chi.URLParam(r, "clusterAlias")
 
-	clusterName, _ := figureClusterName(tenantOf(r), chi.URLParam(r, "clusterName"))
-	renderHTML(w, 200, "templates/audit_recovery", map[string]interface{}{
+	clusterName, _ := figureClusterName(tenant, chi.URLParam(r, "clusterName"))
+	renderTenantHTML(w, r, "templates/audit_recovery", map[string]interface{}{
 		"agentsHttpActive":    config.Config.ServeAgentsHttp,
 		"title":               "audit-recovery",
 		"authorizedForAction": isAuthorizedForAction(r),
@@ -274,7 +311,7 @@ func (this *HttpWeb) AuditFailureDetection(w http.ResponseWriter, r *http.Reques
 	}
 	clusterAlias := chi.URLParam(r, "clusterAlias")
 
-	renderHTML(w, 200, "templates/audit_failure_detection", map[string]interface{}{
+	renderTenantHTML(w, r, "templates/audit_failure_detection", map[string]interface{}{
 		"agentsHttpActive":    config.Config.ServeAgentsHttp,
 		"title":               "audit-failure-detection",
 		"authorizedForAction": isAuthorizedForAction(r),
@@ -289,7 +326,7 @@ func (this *HttpWeb) AuditFailureDetection(w http.ResponseWriter, r *http.Reques
 }
 
 func (this *HttpWeb) Agents(w http.ResponseWriter, r *http.Request) {
-	renderHTML(w, 200, "templates/agents", map[string]interface{}{
+	renderTenantHTML(w, r, "templates/agents", map[string]interface{}{
 		"agentsHttpActive":    config.Config.ServeAgentsHttp,
 		"title":               "agents",
 		"authorizedForAction": isAuthorizedForAction(r),
@@ -305,7 +342,7 @@ func (this *HttpWeb) Agent(w http.ResponseWriter, r *http.Request) {
 		this.Agents(w, r)
 		return
 	}
-	renderHTML(w, 200, "templates/agent", map[string]interface{}{
+	renderTenantHTML(w, r, "templates/agent", map[string]interface{}{
 		"agentsHttpActive":    config.Config.ServeAgentsHttp,
 		"title":               "agent",
 		"authorizedForAction": isAuthorizedForAction(r),
@@ -322,7 +359,7 @@ func (this *HttpWeb) AgentSeedDetails(w http.ResponseWriter, r *http.Request) {
 		this.Seeds(w, r)
 		return
 	}
-	renderHTML(w, 200, "templates/agent_seed_details", map[string]interface{}{
+	renderTenantHTML(w, r, "templates/agent_seed_details", map[string]interface{}{
 		"agentsHttpActive":    config.Config.ServeAgentsHttp,
 		"title":               "agent seed details",
 		"authorizedForAction": isAuthorizedForAction(r),
@@ -335,7 +372,7 @@ func (this *HttpWeb) AgentSeedDetails(w http.ResponseWriter, r *http.Request) {
 }
 
 func (this *HttpWeb) Seeds(w http.ResponseWriter, r *http.Request) {
-	renderHTML(w, 200, "templates/seeds", map[string]interface{}{
+	renderTenantHTML(w, r, "templates/seeds", map[string]interface{}{
 		"agentsHttpActive":    config.Config.ServeAgentsHttp,
 		"title":               "seeds",
 		"authorizedForAction": isAuthorizedForAction(r),
@@ -348,7 +385,7 @@ func (this *HttpWeb) Seeds(w http.ResponseWriter, r *http.Request) {
 
 func (this *HttpWeb) Home(w http.ResponseWriter, r *http.Request) {
 
-	renderHTML(w, 200, "templates/home", map[string]interface{}{
+	renderTenantHTML(w, r, "templates/home", map[string]interface{}{
 		"agentsHttpActive":    config.Config.ServeAgentsHttp,
 		"title":               "home",
 		"authorizedForAction": isAuthorizedForAction(r),
@@ -361,7 +398,7 @@ func (this *HttpWeb) Home(w http.ResponseWriter, r *http.Request) {
 
 func (this *HttpWeb) About(w http.ResponseWriter, r *http.Request) {
 
-	renderHTML(w, 200, "templates/about", map[string]interface{}{
+	renderTenantHTML(w, r, "templates/about", map[string]interface{}{
 		"agentsHttpActive":    config.Config.ServeAgentsHttp,
 		"title":               "about",
 		"authorizedForAction": isAuthorizedForAction(r),
@@ -374,7 +411,7 @@ func (this *HttpWeb) About(w http.ResponseWriter, r *http.Request) {
 
 func (this *HttpWeb) KeepCalm(w http.ResponseWriter, r *http.Request) {
 
-	renderHTML(w, 200, "templates/keep-calm", map[string]interface{}{
+	renderTenantHTML(w, r, "templates/keep-calm", map[string]interface{}{
 		"agentsHttpActive":    config.Config.ServeAgentsHttp,
 		"title":               "Keep Calm",
 		"authorizedForAction": isAuthorizedForAction(r),
@@ -387,7 +424,7 @@ func (this *HttpWeb) KeepCalm(w http.ResponseWriter, r *http.Request) {
 
 func (this *HttpWeb) FAQ(w http.ResponseWriter, r *http.Request) {
 
-	renderHTML(w, 200, "templates/faq", map[string]interface{}{
+	renderTenantHTML(w, r, "templates/faq", map[string]interface{}{
 		"agentsHttpActive":    config.Config.ServeAgentsHttp,
 		"title":               "FAQ",
 		"authorizedForAction": isAuthorizedForAction(r),
@@ -400,7 +437,7 @@ func (this *HttpWeb) FAQ(w http.ResponseWriter, r *http.Request) {
 
 func (this *HttpWeb) Status(w http.ResponseWriter, r *http.Request) {
 
-	renderHTML(w, 200, "templates/status", map[string]interface{}{
+	renderTenantHTML(w, r, "templates/status", map[string]interface{}{
 		"agentsHttpActive":    config.Config.ServeAgentsHttp,
 		"title":               "status",
 		"authorizedForAction": isAuthorizedForAction(r),
@@ -411,29 +448,63 @@ func (this *HttpWeb) Status(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// tenantMiddleware resolves the tenant of the requests of the tenant-scoped pages.
+func (this *HttpWeb) tenantMiddleware() func(http.Handler) http.Handler {
+	return tenantMiddleware(func() *logic.TenantManager { return managerOf(this.Manager) }, styleV1)
+}
+
+func (this *HttpWeb) registerRoute(router chi.Router, fullPath string, handler http.HandlerFunc, tenantScoped bool) {
+	var middlewares []func(http.Handler) http.Handler
+	if tenantScoped {
+		middlewares = append(middlewares, this.tenantMiddleware())
+	}
+	if config.Config.RaftEnabled {
+		middlewares = append(middlewares, raftReverseProxyMiddleware)
+	}
+	if len(middlewares) == 0 {
+		router.Get(fullPath, handler)
+		return
+	}
+	router.With(middlewares...).Get(fullPath, handler)
+}
+
+// registerWebRequest registers a page of a tenant: in its legacy form,
+// /web/<path>, which resolves the implicit tenant (or the one named by header or
+// query), and in its canonical form, /web/tenants/{tenantId}/<path>.
 func (this *HttpWeb) registerWebRequest(router chi.Router, path string, handler http.HandlerFunc) {
+	this.registerWebPage(router, path, handler, true)
+}
+
+// registerGlobalWebRequest registers a page that does not depend on a tenant (about,
+// faq, status...): its legacy form never resolves a tenant, so it works whatever
+// the tenants of the process, and its canonical form is tenant-scoped so that the
+// page of a tenant workspace knows its tenant (template variable tenantId).
+func (this *HttpWeb) registerGlobalWebRequest(router chi.Router, path string, handler http.HandlerFunc) {
+	this.registerWebPage(router, path, handler, false)
+}
+
+func (this *HttpWeb) registerWebPage(router chi.Router, path string, handler http.HandlerFunc, legacyTenantScoped bool) {
 	fullPath := fmt.Sprintf("%s/web/%s", this.URLPrefix, path)
 	if path == "/" {
 		fullPath = fmt.Sprintf("%s/", this.URLPrefix)
 	}
-
-	if config.Config.RaftEnabled {
-		router.With(raftReverseProxyMiddleware).Get(fullPath, handler)
-	} else {
-		router.Get(fullPath, handler)
+	this.registerRoute(router, fullPath, handler, legacyTenantScoped)
+	if path != "/" {
+		this.registerRoute(router, fmt.Sprintf("%s/web/tenants/{%s}/%s", this.URLPrefix, tenantPathParam, path), handler, true)
 	}
 }
 
 // RegisterRequests makes for the de-facto list of known Web calls
 func (this *HttpWeb) RegisterRequests(router chi.Router) {
-	this.registerWebRequest(router, "access-token", this.AccessToken)
-	this.registerWebRequest(router, "", this.Index)
-	this.registerWebRequest(router, "/", this.Index)
-	this.registerWebRequest(router, "home", this.About)
-	this.registerWebRequest(router, "about", this.About)
-	this.registerWebRequest(router, "keep-calm", this.KeepCalm)
-	this.registerWebRequest(router, "faq", this.FAQ)
-	this.registerWebRequest(router, "status", this.Status)
+	this.registerRoute(router, fmt.Sprintf("%s/web/tenants", this.URLPrefix), this.Tenants, false)
+	this.registerGlobalWebRequest(router, "access-token", this.AccessToken)
+	this.registerGlobalWebRequest(router, "", this.Index)
+	this.registerGlobalWebRequest(router, "/", this.Index)
+	this.registerGlobalWebRequest(router, "home", this.About)
+	this.registerGlobalWebRequest(router, "about", this.About)
+	this.registerGlobalWebRequest(router, "keep-calm", this.KeepCalm)
+	this.registerGlobalWebRequest(router, "faq", this.FAQ)
+	this.registerGlobalWebRequest(router, "status", this.Status)
 	this.registerWebRequest(router, "clusters", this.Clusters)
 	this.registerWebRequest(router, "clusters-analysis", this.ClustersAnalysis)
 	this.registerWebRequest(router, "cluster/{clusterName}", this.Cluster)
@@ -461,10 +532,10 @@ func (this *HttpWeb) RegisterRequests(router chi.Router) {
 	this.registerWebRequest(router, "audit-failure-detection/alias/{clusterAlias}", this.AuditFailureDetection)
 	this.registerWebRequest(router, "audit-failure-detection/alias/{clusterAlias}/{page}", this.AuditFailureDetection)
 	this.registerWebRequest(router, "audit-recovery-steps/{uid}", this.AuditRecovery)
-	this.registerWebRequest(router, "agents", this.Agents)
-	this.registerWebRequest(router, "agent/{host}", this.Agent)
-	this.registerWebRequest(router, "seed-details/{seedId}", this.AgentSeedDetails)
-	this.registerWebRequest(router, "seeds", this.Seeds)
+	this.registerGlobalWebRequest(router, "agents", this.Agents)
+	this.registerGlobalWebRequest(router, "agent/{host}", this.Agent)
+	this.registerGlobalWebRequest(router, "seed-details/{seedId}", this.AgentSeedDetails)
+	this.registerGlobalWebRequest(router, "seeds", this.Seeds)
 
 	this.RegisterDebug(router)
 }
