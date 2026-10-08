@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -289,6 +291,9 @@ func (b *Backend) connect(key string) (*backendConn, error) {
 	var db *sql.DB
 	var err error
 	if cfg.IsSQLite() {
+		if err = createSQLiteFile(cfg.SQLite3DataFile); err != nil {
+			return nil, fmt.Errorf("cannot create sqlite backend %q: %w", cfg.SQLite3DataFile, err)
+		}
 		if db, err = sqlutils.NewDB("sqlite3", cfg.SQLite3DataFile, nil); err != nil {
 			return nil, err
 		}
@@ -353,6 +358,29 @@ func (b *Backend) connect(key string) (*backendConn, error) {
 	db.SetMaxIdleConns(maxIdleConns)
 	b.publish(key, c)
 	return c, nil
+}
+
+// createSQLiteFile creates the data file of a SQLite backend that does not exist
+// yet, readable by its owner only: it holds host names, aliases and access
+// tokens, and SQLite would otherwise create it with the umask's 0644. The WAL
+// and shared-memory files SQLite adds next to it inherit its permissions. An
+// existing file is left alone (a too permissive one is only reported). The
+// directory is not created: a missing one is an error, as before.
+func createSQLiteFile(path string) error {
+	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file:") {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err == nil {
+		return f.Close()
+	}
+	if !errors.Is(err, fs.ErrExist) {
+		return err
+	}
+	if info, statErr := os.Stat(path); statErr == nil && info.Mode().Perm()&0o077 != 0 {
+		log.Warningf("sqlite backend %q is accessible by users other than its owner (mode %v); it holds access tokens: consider chmod 600", path, info.Mode().Perm())
+	}
+	return nil
 }
 
 // createMySQLDatabase issues "create database if not exists" on a short-lived
