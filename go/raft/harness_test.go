@@ -337,18 +337,26 @@ func (c *chaosCluster) Publish(i int, tenant, op string, value []byte) (interfac
 	return s.TenantCommand(tenant, op, value)
 }
 
-// PublishAny tries the nodes in turn (as the HTTP layer would after a redirect to the leader).
+// PublishAny tries the nodes in turn (as the HTTP layer would after a redirect to the
+// leader); if nobody leads it waits a little for an election to settle.
 func (c *chaosCluster) PublishAny(tenant, op string, value []byte) (interface{}, error) {
 	var lastErr error
-	for _, i := range rand.Perm(len(c.nodes)) {
-		if r := c.raftOf(i); r == nil || r.State() != raft.Leader {
-			continue
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for {
+		for _, i := range rand.Perm(len(c.nodes)) {
+			if r := c.raftOf(i); r == nil || r.State() != raft.Leader {
+				continue
+			}
+			resp, err := c.Publish(i, tenant, op, value)
+			if err == nil || !strings.Contains(err.Error(), "not leader") {
+				return resp, err
+			}
+			lastErr = err
 		}
-		resp, err := c.Publish(i, tenant, op, value)
-		if err == nil || !strings.Contains(err.Error(), "not leader") {
-			return resp, err
+		if time.Now().After(deadline) {
+			break
 		}
-		lastErr = err
+		time.Sleep(5 * time.Millisecond)
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("not leader")
@@ -395,13 +403,11 @@ func (c *chaosCluster) WaitConverged(timeout time.Duration) {
 	}
 }
 
-// AssertIdentical fails if the digest of any tenant differs between up nodes.
-func (c *chaosCluster) AssertIdentical(tenants ...string) {
-	c.t.Helper()
-	var ref string
-	refNode := -1
+// identicalDiff returns "" if the digest of every tenant is the same on every up node.
+func (c *chaosCluster) identicalDiff(tenants []string) string {
 	for _, tn := range tenants {
-		refNode = -1
+		refNode := -1
+		var ref string
 		for i, nd := range c.nodes {
 			if !c.Up(i) {
 				continue
@@ -412,9 +418,29 @@ func (c *chaosCluster) AssertIdentical(tenants ...string) {
 				continue
 			}
 			if d != ref {
-				c.t.Errorf("tenant %s differs between node%d and node%d:\n--- node%d\n%s\n--- node%d\n%s", tn, refNode, i, refNode, ref, i, d)
+				return fmt.Sprintf("tenant %s differs between node%d and node%d:\n--- node%d\n%s\n--- node%d\n%s", tn, refNode, i, refNode, ref, i, d)
 			}
 		}
+	}
+	return ""
+}
+
+// AssertIdentical fails if the digest of any tenant differs between up nodes. Raft's
+// AppliedIndex counts what was handed to the FSM goroutine, not what it has applied
+// yet, so it retries for a few seconds before declaring a difference.
+func (c *chaosCluster) AssertIdentical(tenants ...string) {
+	c.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		diff := c.identicalDiff(tenants)
+		if diff == "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			c.t.Errorf("%s", diff)
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
