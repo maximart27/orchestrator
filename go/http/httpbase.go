@@ -26,7 +26,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/proxysql/orchestrator/go/config"
-	"github.com/proxysql/orchestrator/go/inst"
+	"github.com/proxysql/orchestrator/go/logic"
 	"github.com/proxysql/orchestrator/go/os"
 	"github.com/proxysql/orchestrator/go/process"
 	"github.com/proxysql/orchestrator/go/raft"
@@ -178,21 +178,22 @@ func getClusterHintFromRequest(r *http.Request) string {
 
 // getClusterNameIfExistsFromRequest returns a cluster name by request hint, or an empty cluster name
 // if no hint is given
-func getClusterNameIfExistsFromRequest(r *http.Request) (clusterName string, err error) {
+func getClusterNameIfExistsFromRequest(tenant *logic.Tenant, r *http.Request) (clusterName string, err error) {
 	if clusterHint := getClusterHintFromRequest(r); clusterHint == "" {
 		return "", nil
 	} else {
-		return figureClusterName(clusterHint)
+		return figureClusterName(tenant, clusterHint)
 	}
 }
 
-// figureClusterName is a convenience function to get a cluster name from hints
-func figureClusterName(hint string) (clusterName string, err error) {
+// figureClusterName is a convenience function to get a cluster name from hints,
+// within the given tenant
+func figureClusterName(tenant *logic.Tenant, hint string) (clusterName string, err error) {
 	if hint == "" {
 		return "", fmt.Errorf("Unable to determine cluster name by empty hint")
 	}
-	instanceKey, _ := inst.ParseRawInstanceKey(hint)
-	return inst.FigureClusterName(hint, instanceKey, nil)
+	instanceKey, _ := tenant.Store.ParseRawInstanceKey(hint)
+	return tenant.Store.FigureClusterName(hint, instanceKey, nil)
 }
 
 // BasicAuthMiddleware returns a middleware that performs HTTP Basic Authentication.
