@@ -112,6 +112,19 @@ knows which tenant it runs for:
 Hooks are part of the tenant configuration, so different tenants can run different scripts; when they share one,
 use these to tell them apart (`/usr/local/bin/post-failover {tenantId} {successorHost}:{successorPort}`).
 
+## Security between tenants
+
+Tenants are isolated inside the process (configuration, backend, caches, queues), but a hook is a child process of
+the orchestrator and **inherits the whole environment of the process**, as it always did. Anything referenced as
+`${ENV}` in the configuration of *any* tenant (for instance `"MySQLTopologyPassword": "${ORC_A_TOPOLOGY_PASSWORD}"`)
+lives in that environment, so the hooks of tenant B can read the credentials of tenant A. The environment is not
+filtered because hooks that rely on it would break.
+
+When the tenants do not trust each other (different teams or customers sharing the node), do not use `${ENV}` for
+their credentials: give each tenant its own credentials file (`MySQLTopologyCredentialsConfigFile`, readable only
+by the orchestrator user) so the secrets never reach the process environment. Likewise keep the tenants file and
+those credentials files at mode `0600`.
+
 ## API
 
 All the existing endpoints are available per tenant under a tenant prefix:
