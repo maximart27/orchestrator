@@ -17,21 +17,48 @@
 package kv
 
 import (
+	"database/sql"
+
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
 	"github.com/proxysql/orchestrator/go/db"
 )
 
-// Internal key-value store, based on relational backend
-type internalKVStore struct {
+// Backend is the relational backend an internal KV store reads from and writes to.
+// A per-tenant database backend satisfies it; the package-level db functions
+// (default backend) are used when none is given.
+type Backend interface {
+	ExecOrchestrator(query string, args ...interface{}) (sql.Result, error)
+	QueryOrchestrator(query string, argsArray []interface{}, onRow func(sqlutils.RowMap) error) error
 }
 
+// defaultBackend adapts the package-level (default backend) functions of the db package.
+type defaultBackend struct{}
+
+func (defaultBackend) ExecOrchestrator(query string, args ...interface{}) (sql.Result, error) {
+	return db.ExecOrchestrator(query, args...)
+}
+
+func (defaultBackend) QueryOrchestrator(query string, argsArray []interface{}, onRow func(sqlutils.RowMap) error) error {
+	return db.QueryOrchestrator(query, argsArray, onRow)
+}
+
+// Internal key-value store, based on relational backend
+type internalKVStore struct {
+	backend Backend
+}
+
+// NewInternalKVStore creates an internal store on the default backend (legacy, single tenant).
 func NewInternalKVStore() KVStore {
-	return &internalKVStore{}
+	return newInternalKVStore(defaultBackend{})
+}
+
+func newInternalKVStore(backend Backend) *internalKVStore {
+	return &internalKVStore{backend: backend}
 }
 
 func (this *internalKVStore) PutKeyValue(key string, value string) (err error) {
-	_, err = db.ExecOrchestrator(`
+	_, err = this.backend.ExecOrchestrator(`
 		replace
 			into kv_store (
         store_key, store_value, last_updated
@@ -53,7 +80,7 @@ func (this *internalKVStore) GetKeyValue(key string) (value string, found bool, 
       store_key = ?
 		`
 
-	err = db.QueryOrchestrator(query, sqlutils.Args(key), func(m sqlutils.RowMap) error {
+	err = this.backend.QueryOrchestrator(query, sqlutils.Args(key), func(m sqlutils.RowMap) error {
 		value = m.GetString("store_value")
 		found = true
 		return nil

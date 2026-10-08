@@ -36,11 +36,17 @@ func normalizeKey(key string) (normalizedKey string) {
 	return normalizedKey
 }
 
+// NewZkStore creates a ZooKeeper store from config.Config (legacy, single tenant constructor).
 func NewZkStore() KVStore {
+	return newZkStore(config.Config)
+}
+
+// newZkStore creates a ZooKeeper store from cfg. Its client is nil if ZkAddress is empty.
+func newZkStore(cfg *config.Configuration) *zkStore {
 	store := &zkStore{}
 
-	if config.Config.ZkAddress != "" {
-		serversArray := strings.Split(config.Config.ZkAddress, ",")
+	if cfg.ZkAddress != "" {
+		serversArray := strings.Split(cfg.ZkAddress, ",")
 		zook := zk.NewZooKeeper()
 		zook.SetServers(serversArray)
 		store.zook = zook
