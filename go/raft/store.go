@@ -211,7 +211,7 @@ func (store *Store) tenantCommand(tenantID string, op string, bytes []byte) (res
 		return nil, fmt.Errorf("not leader")
 	}
 
-	b, err := json.Marshal(&storeCommand{Op: op, Value: bytes, Tenant: tenantID})
+	b, err := marshalForTenant(tenantID, op, bytes)
 	if err != nil {
 		return nil, err
 	}
@@ -227,4 +227,12 @@ func (store *Store) tenantCommand(tenantID string, op string, bytes []byte) (res
 		return r, err
 	}
 	return r, nil
+}
+
+// marshalForTenant encodes a log entry; the legacy tenant is written without tenant field.
+func marshalForTenant(tenantID, op string, value []byte) ([]byte, error) {
+	if tenantID == LegacyTenantID {
+		tenantID = ""
+	}
+	return json.Marshal(&storeCommand{Op: op, Value: value, Tenant: tenantID})
 }
