@@ -156,6 +156,7 @@ func Setup(applier CommandApplier, snapshotCreatorApplier SnapshotCreatorApplier
 		for isTurnedLeader := range leaderCh {
 			if isTurnedLeader {
 				_, _ = PublishCommand("leader-uri", thisLeaderURI)
+				_ = PublishTenantSet()
 			}
 		}
 	}()
@@ -412,6 +413,7 @@ func Monitor() {
 	t := time.Tick(5 * time.Second)
 	heartbeat := time.Tick(1 * time.Minute)
 	followerHealthTick := time.Tick(config.RaftHealthPollSeconds * time.Second)
+	tenantSetTick := time.Tick(TenantSetPublishInterval)
 	for {
 		select {
 		case <-t:
@@ -425,6 +427,10 @@ func Monitor() {
 		case <-heartbeat:
 			if IsLeader() {
 				go func() { _, _ = PublishCommand("heartbeat", "") }()
+			}
+		case <-tenantSetTick:
+			if IsLeader() {
+				go func() { _ = PublishTenantSet() }()
 			}
 		case <-followerHealthTick:
 			if IsLeader() {

@@ -40,6 +40,12 @@ const (
 
 var configurationLoaded chan bool = make(chan bool)
 
+// Values of Configuration.RaftTenantSetMismatchPolicy.
+const (
+	TenantSetMismatchWarn  = "warn"
+	TenantSetMismatchYield = "yield"
+)
+
 const (
 	HealthPollSeconds                            = 1
 	RaftHealthPollSeconds                        = 10
@@ -99,6 +105,7 @@ type Configuration struct {
 	RaftDataDir                                string
 	DefaultRaftPort                            int      // if a RaftNodes entry does not specify port, use this one
 	RaftNodes                                  []string // Raft nodes to make initial connection with
+	RaftTenantSetMismatchPolicy                string   // What this node does when the tenants it runs differ from the ones the Raft leader announces: "warn" (default; log + metric) or "yield" (a leader with different tenants also yields leadership; a non-leader only warns). Node-local
 	ExpectFailureAnalysisConcensus             bool
 	MySQLOrchestratorHost                      string
 	MySQLOrchestratorMaxPoolConnections        int // The maximum size of the connection pool to the Orchestrator backend.
@@ -319,6 +326,7 @@ func newConfiguration() *Configuration {
 		RaftDataDir:                                "",
 		DefaultRaftPort:                            10008,
 		RaftNodes:                                  []string{},
+		RaftTenantSetMismatchPolicy:                TenantSetMismatchWarn,
 		ExpectFailureAnalysisConcensus:             true,
 		MySQLOrchestratorMaxPoolConnections:        128, // limit concurrent conns to backend DB
 		MySQLOrchestratorPort:                      3306,
@@ -669,6 +677,14 @@ func (this *Configuration) adjustNodeLevel() error {
 	}
 	if this.RaftAdvertise == "" {
 		this.RaftAdvertise = this.RaftBind
+	}
+	switch policy := strings.ToLower(strings.TrimSpace(this.RaftTenantSetMismatchPolicy)); policy {
+	case "":
+		this.RaftTenantSetMismatchPolicy = TenantSetMismatchWarn
+	case TenantSetMismatchWarn, TenantSetMismatchYield:
+		this.RaftTenantSetMismatchPolicy = policy
+	default:
+		return fmt.Errorf("RaftTenantSetMismatchPolicy must be %q or %q, got %q", TenantSetMismatchWarn, TenantSetMismatchYield, this.RaftTenantSetMismatchPolicy)
 	}
 	if this.HTTPAdvertise != "" {
 		u, err := url.Parse(this.HTTPAdvertise)

@@ -22,6 +22,7 @@ Some breakdown:
 - `RaftDataDir` must be set to a directory writable to `orchestrator.` `orchestrator` will attempt to create the directory if not exists.
 - `RaftBind` must be set, use the IP address or full hostname of local host. This IP or hostname will also be listed as one of the `RaftNodes` variable.
 - `DefaultRaftPort` can be set to any port, but must be consistent across all deployments.
+- `RaftTenantSetMismatchPolicy` (node-local, `"warn"` by default, or `"yield"`): what a node does when the tenants it runs differ from the ones announced by the leader in a multi-tenant deployment (see [multi-tenant](multi-tenant.md)). With `"yield"` a leader that runs different tenants than the previous leader gives up the leadership; followers only warn.
 - `RaftNodes` should list all nodes of the raft cluster. This list will consist of either IP addresses or host names, and will include the value of this host itself as presented in `RaftBind`.
 
 As example, the following might be a working setup:

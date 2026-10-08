@@ -21,6 +21,7 @@ const (
 	RegisterNodeCommand        = "register-node"
 	LeaderURICommand           = "leader-uri"
 	RequestHealthReportCommand = "request-health-report"
+	// TenantSetCommand is declared in tenant_set.go
 	// YieldCommand and YieldHintCommand are declared in raft.go
 )
 
@@ -31,6 +32,7 @@ var globalOps = map[string]struct{}{
 	RegisterNodeCommand:        {},
 	LeaderURICommand:           {},
 	RequestHealthReportCommand: {},
+	TenantSetCommand:           {},
 	YieldCommand:               {},
 	YieldHintCommand:           {},
 }

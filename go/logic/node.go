@@ -64,6 +64,9 @@ var (
 	isHealthyGauge     = metrics.NewGauge()
 	isRaftHealthyGauge = metrics.NewGauge()
 	isRaftLeaderGauge  = metrics.NewGauge()
+	// tenantSetMismatchGauge is 1 when the tenants of this node differ from the ones the
+	// Raft leader announced (see tenant_set.go); global, not per tenant.
+	tenantSetMismatchGauge = metrics.NewGauge()
 
 	registerNodeMetricsOnce sync.Once
 	processMetricsOnce      sync.Once
@@ -98,6 +101,7 @@ func registerNodeMetrics() {
 		_ = metrics.Register("health.is_healthy", isHealthyGauge)
 		_ = metrics.Register("raft.is_healthy", isRaftHealthyGauge)
 		_ = metrics.Register("raft.is_leader", isRaftLeaderGauge)
+		_ = metrics.Register("raft.tenant_set_mismatch", tenantSetMismatchGauge)
 
 		ometrics.OnMetricsTick(func() {
 			isElectedGauge.Update(atomic.LoadInt64(&isElectedNode))
@@ -114,6 +118,13 @@ func registerNodeMetrics() {
 		})
 		ometrics.OnMetricsTick(func() {
 			isRaftLeaderGauge.Update(atomic.LoadInt64(&isElectedNode))
+		})
+		ometrics.OnMetricsTick(func() {
+			var mismatch int64
+			if orcraft.TenantSetMismatch() {
+				mismatch = 1
+			}
+			tenantSetMismatchGauge.Update(mismatch)
 		})
 	})
 }
@@ -151,11 +162,13 @@ var (
 // NewTenantManager, before Start gets here, and why the HTTP listener is only
 // opened after Start returns (see app.standardHttp). The consequence, for the
 // operator: every Raft node must run the same tenants (the same tenants file), or
-// a node lacking tenant X loses X's commands for good.
+// a node lacking tenant X loses X's commands for good. The leader announces its tenants
+// (tenant-set, see tenant_set.go) so that a node that differs says so.
 func (m *TenantManager) bootstrapRaft() error {
 	if !m.base.RaftEnabled {
 		return nil
 	}
+	orcraft.SetTenantSetSource(m.tenantProviders)
 	if err := raftSetup(NewCommandApplier(m), NewSnapshotDataCreatorApplier(m), process.ThisHostname); err != nil {
 		return fmt.Errorf("raft: %w", err)
 	}

@@ -268,6 +268,16 @@ var (
 		return 0
 	})
 
+	TenantSetMismatch = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "orchestrator_tenant_set_mismatch",
+		Help: "1 if the tenants of this node differ from the ones announced by the raft leader, 0 otherwise.",
+	}, func() float64 {
+		if orcraft.TenantSetMismatch() {
+			return 1
+		}
+		return 0
+	})
+
 	RaftIsPartOfQuorum = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "orchestrator_raft_is_part_of_quorum",
 		Help: "1 if the node is part of raft quorum, 0 otherwise.",
@@ -310,5 +320,6 @@ func registerPrometheusUnchecked(reg prometheus.Registerer) {
 		RaftIsLeader,
 		RaftPeersTotal,
 		RaftIsPartOfQuorum,
+		TenantSetMismatch,
 	)
 }
