@@ -11,7 +11,7 @@ import (
 )
 
 const AppPrompt string = `
-orchestrator [-c command] [-i instance] [-d destination] [--verbose|--debug] [... cli ] | http
+orchestrator [-c command] [-i instance] [-d destination] [-tenant id] [--verbose|--debug] [... cli ] | http
 
 Cheatsheet:
     Run orchestrator in HTTP mode:
@@ -888,6 +888,30 @@ func init() {
   Utility command to resolve a CNAME and return resolved hostname name. Example:
 
   orchestrator -c resolve -i cname.to.resolve
+	`
+	CommandHelp["tenants"] = `
+  List the tenants configured for this orchestrator, one per line: ID, provider and backend, tab separated.
+  Without a "TenantsConfigFile" there is a single tenant, "default". The backend is not contacted. Example:
+
+  orchestrator -c tenants
+	`
+	CommandHelp["tenant"] = `
+  Orchestrator can manage several tenants (independent topologies, each with its own backend and engine) in a
+  single process. A command line invocation acts on ONE tenant, chosen with the global flag -tenant or, if the
+  flag is absent, with the ORCHESTRATOR_TENANT environment variable (the flag wins). If neither is given
+  the command acts on the tenant named "default" or, failing that, on the only tenant. When there are
+  several tenants and none is named "default" the tenant is required: the command fails and lists them.
+  Examples:
+
+  orchestrator -c clusters -tenant mariadb-a
+
+  ORCHESTRATOR_TENANT=pg-b orchestrator -c which-cluster -i db1.example.com
+
+  orchestrator -c tenants
+      list the available tenants
+
+  The commands "active-nodes", "access-token" and "continuous" are about the node, not about a tenant
+  ("continuous" runs every tenant). See docs/multi-tenant.md.
 	`
 	CommandHelp["redeploy-internal-db"] = `
 	Force internal schema migration to current backend structure. Orchestrator keeps track of the deployed
