@@ -1,0 +1,24 @@
+<section class="legacy-workspace" id="tenants_workspace" aria-labelledby="tenants_title">
+  <header class="legacy-workspace-header">
+    <div>
+      <p class="legacy-workspace-eyebrow">Runtime</p>
+      <h1 id="tenants_title">Tenants</h1>
+      <p>Tenants served by this orchestrator, with their database engine and health. Pick one to open its dashboard.</p>
+    </div>
+  </header>
+
+  <div class="legacy-panel p-0 overflow-hidden">
+    <div id="tenants_loading" class="legacy-state m-3" role="status">Loading tenants…</div>
+    <div id="tenants_unavailable" class="legacy-state legacy-state--error m-3" role="alert" style="display: none">
+      <h2>Tenants are unavailable</h2>
+      <p>The Orchestrator tenants endpoint could not be reached.</p>
+    </div>
+    <div id="tenants_empty" class="legacy-state m-3" role="status" style="display: none">No tenants are configured.</div>
+    <div id="tenants_content" class="legacy-table-shell border-0 rounded-0" style="display: none">
+      <table class="table">
+        <thead><tr><th scope="col">Tenant</th><th scope="col">Engine</th><th scope="col">Health</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</section>

@@ -15,6 +15,7 @@
 	<script type="text/javascript" src="{{.prefix}}/js/corex-jquery.js?v={{.assetVersion}}"></script>
 	<script src="{{.prefix}}/js/md5.js?v={{.assetVersion}}"></script>
 	<script src="{{.prefix}}/js/common.js?v={{.assetVersion}}"></script>
+	<script src="{{.prefix}}/js/tenant.js?v={{.assetVersion}}"></script>
 	<script src="{{.prefix}}/js/orchestrator.js?v={{.assetVersion}}"></script>
 	<script src="{{.prefix}}/js/custom.js?v={{.assetVersion}}"></script>
 	<link href="{{.prefix}}/bootstrap5/css/bootstrap.min.css?v={{.assetVersion}}" rel="stylesheet">
@@ -84,6 +85,10 @@
 						<li><a class="dropdown-item" href="{{.prefix}}/web/seeds">Seeds</a></li>
 						{{end}}
 					</ul>
+				</li>
+
+				<li class="nav-item d-none me-2" id="tenant-selector-item">
+					<select id="tenant-selector" class="form-select form-select-sm" aria-label="Tenant" title="Tenant"></select>
 				</li>
 
 				<li class="nav-item" data-nav-page="search">
@@ -263,6 +268,7 @@
 		}
 	</script>
 	<script src="{{.prefix}}/js/instance-problems.js?v={{.assetVersion}}"></script>
+	<script src="{{.prefix}}/js/tenant-ui.js?v={{.assetVersion}}"></script>
 </body>
 
 </html>
