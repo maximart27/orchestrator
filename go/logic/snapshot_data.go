@@ -25,6 +25,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/proxysql/orchestrator/go/inst"
 
@@ -228,19 +229,46 @@ func (t *Tenant) createSnapshot() (*TenantSnapshot, error) {
 	return ts, nil
 }
 
+// forEachTenantConcurrently runs f for every tenant, each in its own goroutine (their backends are
+// independent), and waits for all of them.
+func (m *TenantManager) forEachTenantConcurrently(f func(i int, t *Tenant)) {
+	var wg sync.WaitGroup
+	for i, t := range m.tenants {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f(i, t)
+		}()
+	}
+	wg.Wait()
+}
+
+// readSnapshots reads the state of every tenant, concurrently. A tenant whose backend cannot be read
+// has a nil entry (and the error is logged): an empty entry would make the nodes that restore the
+// snapshot forget the instances of the tenant.
+func (m *TenantManager) readSnapshots() []*TenantSnapshot {
+	snapshots := make([]*TenantSnapshot, len(m.tenants))
+	m.forEachTenantConcurrently(func(i int, t *Tenant) {
+		ts, err := t.createSnapshot()
+		if err != nil {
+			_ = log.Errorf("raft snapshot: tenant %s is omitted from the snapshot, its backend could not be read: %+v", t.ID, err)
+			return
+		}
+		snapshots[i] = ts
+	})
+	return snapshots
+}
+
 // CreateSnapshotData reads the state of every tenant. A tenant whose backend
 // cannot be read is left out of the snapshot (and the error logged): an empty
 // entry would make the nodes that restore it forget the instances of the tenant.
 func (m *TenantManager) CreateSnapshotData() *SnapshotData {
 	snapshotData := NewSnapshotData()
 	snapshotData.LeaderURI = orcraft.LeaderURI.Get()
-	for _, t := range m.tenants {
-		ts, err := t.createSnapshot()
-		if err != nil {
-			_ = log.Errorf("raft snapshot: tenant %s is omitted from the snapshot, its backend could not be read: %+v", t.ID, err)
-			continue
+	for i, ts := range m.readSnapshots() {
+		if ts != nil {
+			snapshotData.Tenants[m.tenants[i].ID] = ts
 		}
-		snapshotData.Tenants[t.ID] = ts
 	}
 	log.Debugf("raft snapshot data created")
 	return snapshotData
@@ -264,21 +292,89 @@ func (s *SnapshotDataCreatorApplier) tenants() *TenantManager {
 	return s.manager
 }
 
-func (s *SnapshotDataCreatorApplier) GetData() (data []byte, err error) {
-	snapshotData := s.tenants().CreateSnapshotData()
-	b, err := json.Marshal(snapshotData)
-	if err != nil {
-		return b, err
-	}
+func gzipped(b ...[]byte) ([]byte, error) {
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
-	if _, err := zw.Write(b); err != nil {
-		return b, err
+	for _, chunk := range b {
+		if _, err := zw.Write(chunk); err != nil {
+			return nil, err
+		}
 	}
 	if err := zw.Close(); err != nil {
-		return b, err
+		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// GetData reads the state of every tenant and encodes it (gzip of a SnapshotData in JSON).
+//
+// The FSM is stopped while this runs (the snapshot is the state at a point of the log), so it is
+// concurrent per tenant: the tenants are read and marshalled each in its own goroutine and the
+// pieces are compressed concurrently too, as the members of a multi-member gzip stream, which is
+// still one gzip stream that every reader of a snapshot (decodeSnapshot, older nodes) decodes.
+func (s *SnapshotDataCreatorApplier) GetData() (data []byte, err error) {
+	manager := s.tenants()
+	leaderURI, err := json.Marshal(orcraft.LeaderURI.Get())
+	if err != nil {
+		return nil, err
+	}
+	snapshots := manager.readSnapshots()
+	marshalled := make([][]byte, len(snapshots))
+	errs := make([]error, len(snapshots))
+	manager.forEachTenantConcurrently(func(i int, t *Tenant) {
+		if snapshots[i] == nil {
+			return
+		}
+		body, err := json.Marshal(snapshots[i])
+		if err != nil {
+			errs[i] = err
+			return
+		}
+		id, err := json.Marshal(t.ID)
+		if err != nil {
+			errs[i] = err
+			return
+		}
+		marshalled[i] = append(append(id, ':'), body...)
+	})
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// {"FormatVersion":2,"LeaderURI":...,"Tenants":{<id>:<state>,<id>:<state>}}
+	pieces := [][]byte{[]byte(fmt.Sprintf(`{"FormatVersion":%d,"LeaderURI":%s,"Tenants":{`, SnapshotFormatVersion, leaderURI))}
+	for _, piece := range marshalled {
+		if piece == nil {
+			continue
+		}
+		if len(pieces) > 1 {
+			piece = append([]byte{','}, piece...)
+		}
+		pieces = append(pieces, piece)
+	}
+	pieces = append(pieces, []byte(`}}`))
+
+	members := make([][]byte, len(pieces))
+	memberErrs := make([]error, len(pieces))
+	var wg sync.WaitGroup
+	for i := range pieces {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			members[i], memberErrs[i] = gzipped(pieces[i])
+		}()
+	}
+	wg.Wait()
+	var out bytes.Buffer
+	for i, member := range members {
+		if memberErrs[i] != nil {
+			return nil, memberErrs[i]
+		}
+		out.Write(member)
+	}
+	return out.Bytes(), nil
 }
 
 // decodeSnapshot reads a snapshot of any known format version as SnapshotData.
