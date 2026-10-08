@@ -104,9 +104,7 @@ log "distinct polls of the master in ${CADENCE_WINDOW}s: $(for t in "${TENANTS[@
 [ "${cnt[$TENANT_A]}" -gt "${cnt[$TENANT_B]}" ] && pass "InstancePollSeconds is per tenant (a=3s polled ${cnt[$TENANT_A]}x > b=5s polled ${cnt[$TENANT_B]}x)" \
   || fail "poll cadence does not follow per-tenant InstancePollSeconds" "a=${cnt[$TENANT_A]} b=${cnt[$TENANT_B]} c=${cnt[$TENANT_C]}"
 
-echo "== 4. API (TODO(m1): endpoints of the runtime/http agents) =="
-# TODO(m1): GET /api/tenants -> list with the 3 ids;  GET /api/tenants/<id>/clusters -> only that tenant's cluster;
-#           GET /api/clusters (legacy path) -> 400 "ambiguous tenant" because there is no 'default' tenant.
+echo "== 4. API =="
 if [ "$(api_http_code $N /api/tenants)" = 200 ]; then
   ids="$(api $N /api/tenants | python3 -c 'import json,sys; d=json.load(sys.stdin); d=d.get("Details",d) if isinstance(d,dict) else d; print(" ".join(sorted(x if isinstance(x,str) else x.get("ID") or x.get("id") or x.get("tenantId","") for x in d)))' 2>/dev/null)"
   assert_eq "GET /api/tenants lists the tenants" "$(printf '%s\n' "${TENANTS[@]}" | sort | tr '\n' ' ' | sed 's/ $//')" "$ids"
@@ -117,9 +115,11 @@ if [ "$(api_http_code $N /api/tenants)" = 200 ]; then
     for o in $others; do echo "$c" | grep -q "$o" && leak=1; done
     assert_eq "GET /api/tenants/$t/clusters leaks nothing from other tenants" 0 "$leak"
   done
+  h="$(api $N /api/health)"
+  for t in "${TENANTS[@]}"; do echo "$h" | grep -q "\"$t\"" && pass "GET /api/health reports tenant $t" || fail "GET /api/health does not mention tenant $t" "$h"; done
   assert_eq "legacy GET /api/clusters is ambiguous with 3 tenants" 400 "$(api_http_code $N /api/clusters)"
 else
-  skip "/api/tenants not implemented yet (TODO(m1))"
+  skip "/api/tenants not available (emulation or runtime without the tenant API)"
 fi
 
 echo "== 5. process health =="
@@ -128,9 +128,9 @@ bad="$(node_logs $N | grep -E -i 'panic|fatal|unknown tenant|goroutine [0-9]+ \[
 [ -z "$bad" ] && pass "log has no panic / fatal / 'unknown tenant'" || fail "suspicious log lines" "$bad"
 denied="$(node_logs $N | grep -c -i 'access denied\|password authentication failed')"
 assert_eq "no topology authentication errors (tenant credentials not mixed up)" 0 "$denied"
-# TODO(m1): the runtime should log one line per started tenant; adjust the pattern to the real message.
-for t in "${TENANTS[@]}"; do
-  node_logs $N | grep -q "$t" && pass "log mentions tenant $t" || skip "log never mentions tenant $t (TODO(m1): pattern)"
+for t in "${TENANTS[@]}"; do   # runtime logs "tenant <id>: continuous discovery: starting (provider=...)"
+  if [ "$EMU" = 1 ]; then skip "tenant start line (emulation)"; continue; fi
+  [ "$(log_count $N "tenant $t: continuous discovery: starting")" -ge 1 ] && pass "log: tenant $t started its continuous discovery" || fail "log: no start line for tenant $t"
 done
 
 if [ "$M1_FAILOVER" = 1 ]; then
@@ -149,6 +149,10 @@ if [ "$M1_FAILOVER" = 1 ]; then
   # hooks are tenant-scoped config: a's hook ran for a, never for b/c
   wait_until "$T_FAILOVER" "hook file of $TENANT_A" docker exec $NC test -s "$(tenant_hook "$TENANT_A")" \
     && pass "$TENANT_A: PostMasterFailoverProcesses ran: $(docker exec $NC tail -1 "$(tenant_hook "$TENANT_A")")" || fail "$TENANT_A: its hook never ran"
+  if [ "$EMU" != 1 ]; then   # {tenantId} placeholder and ORC_TENANT_ID env of the hooks
+    hl="$(hook_last $N $TENANT_A)"
+    case "$hl" in *"tid=$TENANT_A env=$TENANT_A "*) pass "hook knows its tenant ({tenantId} and ORC_TENANT_ID = $TENANT_A)";; *) fail "hook does not carry the tenant id" "$hl";; esac
+  fi
   docker exec $NC test -e "$(tenant_hook "$TENANT_B")" && fail "$TENANT_B: hook ran although b had no failover" || pass "$TENANT_B: hook did not run"
   # promoted replicas
   wait_until "$T_FAILOVER" "a2 promoted (read_only=0)" bash -c "[ \"\$(docker exec $(cname a2) mariadb -uroot -p$MARIADB_ROOT_PW -N -B -e 'select @@read_only' 2>/dev/null)\" = 0 ]" && pass "a2 promoted" || fail "a2 not promoted"

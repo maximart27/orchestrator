@@ -72,10 +72,14 @@ if wait_until "$T_DISCOVERY" "leader $L1 discovered all 3 tenants" all_tenants_o
 else
   fail "leader $L1: tenants not discovered" "$(for t in "${TENANTS[@]}"; do echo "$t: $(topology_rows $L1 "$(tenant_db "$t")" | tr '\n' ';')"; done)"
 fi
+for n in "${NODES[@]}"; do   # per-tenant API on every node (followers forward to the leader, tenant included)
+  for t in "${TENANTS[@]}"; do
+    api "$n" "/api/tenants/$t/clusters" | grep -q "$(tenant_master "$t")" && pass "$n: GET /api/tenants/$t/clusters" || fail "$n: GET /api/tenants/$t/clusters has no $(tenant_master "$t")" "$(api "$n" "/api/tenants/$t/clusters" | head -c 200)"
+  done
+done
 for n in "${NODES[@]}"; do [ "$n" = "$L1" ] && continue
   all_tenants_on "$n" && log "follower $n also probes every tenant (expected: raft followers discover independently)" || log "follower $n: not all tenants discovered yet (informational)"
 done
-# TODO(m2): GET /api/tenants/<id>/raft-health? / per-tenant leader view -- all tenants must report the SAME leader.
 
 # ---------------------------------------------------------------------------------------------- failover 1
 echo "== 2. leader $L1 recovers ALL tenants; followers recover none =="
@@ -113,9 +117,8 @@ for t in "${MYS[@]}"; do
   assert_eq "$t: the failover hook ran exactly once on the leader (no repeated recovery)" 1 "$(hook_lines $L1 $t)"
 done
 for t in "${TENANTS[@]}"; do
-  [ "$(log_count $L1 "will recover $(tenant_master "$t"):")" -ge 1 ] && pass "$t: leader log shows it ran the recovery of $(tenant_master "$t")" || fail "$t: leader log has no recovery of $(tenant_master "$t")"
+  [ "$(log_count $L1 "will handle Dead(Master|Primary) event on $(tenant_master "$t"):")" -ge 1 ] && pass "$t: leader log shows it ran the recovery of $(tenant_master "$t")" || fail "$t: leader log has no recovery of $(tenant_master "$t")"
 done
-# TODO(m2): the runtime should tag recovery log lines / audit rows with the tenant id; assert it here.
 
 # ---------------------------------------------------------------------------------------------- re-attach
 echo "== 3. old masters of a and b rejoin as replicas of the promoted ones =="
@@ -169,18 +172,16 @@ for t in "${MYS[@]}"; do
   assert_eq "dead ex-leader $L1: hook log of $t untouched" "${old_hooks[$t]}" "$(hook_lines $L1 $t)"
   assert_eq "$t: processed by exactly one node in the new term ($LC2)" 0 "$(sql $L2 "$(tenant_db $t)" "select count(*) from topology_recovery where hostname='$(tenant_replica "$t")' and processing_node_hostname <> '$LC2'")"
 done
-# TODO(m2): the new leader must also take over the OTHER leader-only duties of every tenant (forget/expire/ack
-#           loops, KV master submission); once the runtime exposes per-tenant counters, assert they advance here.
+# (Other leader-only duties -- expire/forget/ack loops, KV master submission -- have no per-tenant observable
+#  in this environment; recoveries + hooks are the evidence used.)
 
 # ---------------------------------------------------------------------------------------------- snapshot
-echo "== 6. raft snapshot is tenant-aware (TODO(m2): format v2) =="
+echo "== 6. raft snapshot is tenant-aware (format v2: gzip(JSON{FormatVersion:2, Tenants:{id:...}})) =="
 api "$L2" /api/raft-snapshot >/dev/null
-snap="$(docker exec $(cname $L2) sh -c 'ls -t /data/raft/snapshots/*/state.bin 2>/dev/null | head -1')"
-if [ -n "$snap" ] && docker exec $(cname $L2) grep -q -E '"FormatVersion": ?2|"Tenants"' "$snap" 2>/dev/null; then
-  pass "snapshot $snap carries the per-tenant section"
-else
-  skip "snapshot v2 not detectable ($snap) (TODO(m2): check the real file format / FormatVersion)"
-fi
+snap_json() { docker exec "$(cname $L2)" sh -c 'f=$(ls -t /data/raft/snapshots/*/state.bin 2>/dev/null | head -1); [ -n "$f" ] && gzip -dc "$f"'; }
+snapshot_ok() { local j; j="$(snap_json)"; echo "$j" | grep -q '"FormatVersion":2' && for t in "${TENANTS[@]}"; do echo "$j" | grep -q "\"$t\":" || return 1; done; }
+wait_until 30 "snapshot with FormatVersion 2 and every tenant" snapshot_ok \
+  && pass "raft snapshot is v2 and carries a section for each of: ${TENANTS[*]}" || fail "raft snapshot lacks FormatVersion 2 / tenant sections" "$(snap_json | head -c 300)"
 
 echo "== 7. process health =="
 for n in "$L2" "$F2"; do

@@ -43,7 +43,7 @@ cfg_a() { cat <<JSON
 "RecoverIntermediateMasterClusterFilters": ["*"],
 "RecoveryPeriodBlockSeconds": $RECOVERY_BLOCK_SECONDS,
 "KVClusterMasterPrefix": "mariadb-a/master",
-"PostMasterFailoverProcesses": ["echo \"tenant=$TENANT_A failed={failedHost} successor={successorHost}\" >> /data/hook-$TENANT_A.log"]
+"PostMasterFailoverProcesses": ["echo \"tenant=$TENANT_A tid={tenantId} env=\$ORC_TENANT_ID failed={failedHost} successor={successorHost}\" >> /data/hook-$TENANT_A.log"]
 JSON
 }
 cfg_b() { cat <<JSON
@@ -62,7 +62,7 @@ cfg_b() { cat <<JSON
 "RecoveryPeriodBlockSeconds": $RECOVERY_BLOCK_SECONDS,
 "KVClusterMasterPrefix": "mariadb-b/master",
 "PreFailoverProcesses": ["echo \"tenant=$TENANT_B pre failed={failedHost}\" >> /data/hook-$TENANT_B-pre.log"],
-"PostMasterFailoverProcesses": ["echo \"tenant=$TENANT_B failed={failedHost} successor={successorHost}\" >> /data/hook-$TENANT_B.log"]
+"PostMasterFailoverProcesses": ["echo \"tenant=$TENANT_B tid={tenantId} env=\$ORC_TENANT_ID failed={failedHost} successor={successorHost}\" >> /data/hook-$TENANT_B.log"]
 JSON
 }
 cfg_c() { cat <<JSON
