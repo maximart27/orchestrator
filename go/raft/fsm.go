@@ -19,6 +19,7 @@ package orcraft
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync/atomic"
@@ -35,7 +36,19 @@ type fsm Store
 func (f *fsm) Apply(l *raft.Log) interface{} {
 	var c storeCommand
 	if err := json.Unmarshal(l.Data, &c); err != nil {
-		_ = log.Errorf("failed to unmarshal command: %s", err.Error())
+		// Nothing of an entry that does not decode is trustworthy -- json.Unmarshal can
+		// leave op and tenant filled in when only the value is malformed. Apply nothing.
+		_ = log.Errorf("orchestrator/raft: index=%d: failed to unmarshal command: %s", l.Index, err.Error())
+		return fmt.Errorf("%w: %v", ErrUndecodableCommand, err)
+	}
+
+	// Global ops never carry a tenant. Reject it for every one of them -- including the
+	// two yields, which are handled here and never reach routeCommand -- so that all
+	// nodes answer the same to a malformed entry, without acting on it.
+	if tenantID := ResolveTenant(c.Tenant); IsGlobalOp(c.Op) && tenantID != LegacyTenantID {
+		err := fmt.Errorf("%w: op=%s tenant=%s", ErrTenantOnGlobalCommand, c.Op, tenantID)
+		_ = log.Errorf("orchestrator/raft: index=%d: %+v", l.Index, err)
+		return err
 	}
 
 	if c.Op == YieldCommand {
@@ -94,10 +107,18 @@ func (f *fsm) yieldByHint(hint string) interface{} {
 	return Yield()
 }
 
-// Snapshot returns a snapshot object of freno's state
+// Snapshot returns a snapshot object of the state of the FSM. Raft labels the snapshot
+// with the index of the last applied entry and, after restoring it, replays the log from
+// the next one: the state must therefore be read NOW, while Raft guarantees that no
+// entry is being applied (Apply and Snapshot run on the same goroutine), and not later in
+// Persist, which runs concurrently with Apply. Reading it lazily would put the effect of
+// entries beyond the labelled index in the snapshot, and the replay would apply them twice.
 func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
-	snapshot := newFsmSnapshot(f.snapshotCreatorApplier)
-	return snapshot, nil
+	data, err := f.snapshotCreatorApplier.GetData()
+	if err != nil {
+		return nil, err
+	}
+	return newFsmSnapshot(data), nil
 }
 
 // Restore restores freno state

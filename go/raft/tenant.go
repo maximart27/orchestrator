@@ -59,6 +59,10 @@ var ErrUnknownTenant = errors.New("orchestrator/raft: unknown tenant")
 // non-legacy tenant.
 var ErrTenantOnGlobalCommand = errors.New("orchestrator/raft: global command must not carry a tenant")
 
+// ErrUndecodableCommand is the response to a log entry that is not a valid command. It is
+// never applied, on any node.
+var ErrUndecodableCommand = errors.New("orchestrator/raft: undecodable command")
+
 // TenantCommandApplier is implemented by appliers that are tenant-aware. tenantID
 // is never empty: the FSM resolves "" to LegacyTenantID. Only tenant-scoped ops
 // are routed here; global ops (IsGlobalOp) are handled by ApplyCommand.
