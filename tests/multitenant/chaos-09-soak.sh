@@ -29,8 +29,36 @@ sample_leaders() {
   [ "$l1" -gt 1 ] && [ "$l2" -gt 1 ] && violation "two Leaders for >1.5s: $(states_line "${NODES[@]}")"
   return 0
 }
-check_logs() { local n b; for n in "${NODES[@]}"; do b="$(bad_log_lines "$n")"; [ -n "$b" ] && violation "bad log lines on $n: $(echo "$b" | head -2 | cut -c1-200)"; done; return 0; }
-check_hooks() { local t b; for t in "${TENANTS[@]}"; do b="$(hooks_non_leader "$t")"; [ -n "$b" ] && violation "hook of $t ran on a non-leader: $b"; done; return 0; }
+SEEN_HOOKS=""
+check_hooks() {
+  local t b line
+  for t in "${TENANTS[@]}"; do
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      case "$SEEN_HOOKS" in *"$line"*) continue;; esac
+      SEEN_HOOKS="$SEEN_HOOKS|$line"; violation "hook of $t ran on a node that was not Leader: $line"
+    done < <(hooks_non_leader "$t")
+  done
+  return 0
+}
+SEEN_BAD=""
+check_logs() {
+  local n b line
+  for n in "${NODES[@]}"; do
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      case "$SEEN_BAD" in *"$line"*) continue;; esac
+      SEEN_BAD="$SEEN_BAD|$line"; violation "bad log line on $n: $(echo "$line" | cut -c1-200)"
+    done < <(bad_log_lines "$n")
+  done
+  return 0
+}
+# a node that exited by itself (log.Fatal on health, OOM...) is restarted like a supervisor would; it is counted and reported
+SUPERVISOR_RESTARTS=0
+supervise() { local n; for n in "${NODES[@]}"; do
+  node_paused "$n" && node_unpause "$n"
+  if ! node_running "$n"; then SUPERVISOR_RESTARTS=$((SUPERVISOR_RESTARTS+1)); log "SOAK: $n is not running (exit code $(docker inspect -f '{{.State.ExitCode}}' "$(cname $n)")): $(node_logs "$n" | grep -E 'FATAL' | tail -1 | cut -c1-160); restarting it"; node_up "$n"; fi
+done; }
 fail_master() { # a|b|c
   local l="$1" m r
   case "$l" in a) m=$CUR_M_a; r=$CUR_R_a;; b) m=$CUR_M_b; r=$CUR_R_b;; c) m=c1; r=c2;; esac
@@ -55,9 +83,15 @@ settle_master() { # a|b|c : wait for the promotion and re-attach the old master 
 T_END=$((SECONDS+SOAK_SECONDS)); cycle=0
 while [ $SECONDS -lt $T_END ]; do
   cycle=$((cycle+1))
+  supervise
   node="${NODES[$((RANDOM%3))]}"; kind=$((RANDOM%5)); dur=$((8+RANDOM%15)); mf=$((RANDOM%100))
   tenant_fail=""; if [ $mf -lt 40 ]; then case $((RANDOM%5)) in 0|1) tenant_fail=a;; 2|3) tenant_fail=b;; 4) [ $CDONE = 0 ] && tenant_fail=c;; esac; fi
   [ -n "$tenant_fail" ] && ! fail_master "$tenant_fail" && tenant_fail=""
+  if [ -n "$tenant_fail" ]; then
+    # hit the leader (60%) a few seconds after the master crash: that is when a recovery is in flight
+    [ $((RANDOM%10)) -lt 6 ] && { l="$(single_leader "${NODES[@]}")"; [ -n "$l" ] && node="$l"; }
+    sleep $((RANDOM%10))
+  fi
   case $kind in
     0) act="kill9+restart $node (${dur}s)"; ACTIONS+=("$act"); log "SOAK cycle $cycle: $act master-failure=${tenant_fail:-none}"; node_kill9 "$node"; sleep "$dur"; node_up "$node";;
     1) act="pause $node (${dur}s)"; ACTIONS+=("$act"); log "SOAK cycle $cycle: $act master-failure=${tenant_fail:-none}"; node_pause "$node"; sleep "$dur"; sample_leaders; node_unpause "$node";;
@@ -74,7 +108,7 @@ while [ $SECONDS -lt $T_END ]; do
 done
 log "SOAK done after $cycle cycles; final healing and convergence"
 traffic_stop; traffic_stats >&2
-for n in "${NODES[@]}"; do node_usable "$n" || { node_paused "$n" && node_unpause "$n"; node_running "$n" || node_up "$n"; }; done
+supervise
 cluster_stable "${NODES[@]}" && pass "final: single Leader $LEADER ($(states_line "${NODES[@]}"))" || violation "no stable cluster at the end"
 for t in "${TENANTS[@]}"; do
   wait_until 120 "$t converged" converged "$t" "${NODES[@]}" && pass "final: $t identical on the three nodes" || violation "tenant $t diverges at the end: $(for n in "${NODES[@]}"; do echo -n "$n=$(tenant_fp $n $t) "; done)"
@@ -82,5 +116,6 @@ done
 check_logs; check_hooks
 log "hook runs per tenant (cluster-wide): $(for t in "${TENANTS[@]}"; do echo -n "$t=$(hooks_total $t) "; done)"
 log "actions ($cycle): $(printf '%s; ' "${ACTIONS[@]}")"
+log "nodes that exited by themselves and were restarted: $SUPERVISOR_RESTARTS"
 [ ${#VIOL[@]} -eq 0 ] && pass "soak (seed $SEED, ${cycle} cycles): no invariant violated" || fail "soak (seed $SEED): ${#VIOL[@]} violations" "$(printf '%s\n' "${VIOL[@]}" | head -10)"
 scenario_verdict; summary

@@ -4,7 +4,8 @@
 # node) that fills up ("database or disk is full") on the LEADER only. Expected (docs/multi-tenant.md "Health of a tenant"):
 # the leader yields after 5s ("yielding leadership: backend of tenant mariadb-b unhealthy"), another node takes ALL the
 # tenants (the masters of the three tenants are stopped to prove it), the affected process does NOT die, and once the
-# space is back it is healthy again. Then the commands it could not apply meanwhile are checked.
+# space is back it is healthy again. Then the commands it could not apply meanwhile are checked (they are NOT retried:
+# documented finding) and the way out (rebuild the node) is verified.
 source "$(dirname "$0")/lib-chaos.sh"
 scenario_begin "07-tenant-backend-failure"
 export CHAOS_TMPFS_B=1
@@ -53,15 +54,19 @@ assert_eq "$OLD still the same process" "$started_before" "$(docker inspect -f '
 for t in "$TENANT_A" "$TENANT_C"; do
   wait_until 45 "$t converged" converged "$t" "${NODES[@]}" && pass "$t: identical on the three nodes (not affected by b's failure)" || fail "$t diverges" "$(for n in "${NODES[@]}"; do echo "$n=$(tenant_fp $n $t)"; done | tr '\n' ' ')"
 done
-if wait_until 45 "b converged without a restart" converged "$TENANT_B" "${NODES[@]}"; then
+if wait_until 30 "b converged without a restart" converged "$TENANT_B" "${NODES[@]}"; then
   pass "tenant b converged on the three nodes without restarting $OLD"
 else
-  fail "tenant b: commands the broken node failed to apply are NOT re-applied once its backend is healthy again (no retry)" \
-       "$(diverge_report "$TENANT_B" "${NODES[@]}")"
-  log "workaround: restart $OLD (the Raft log is replayed from the last snapshot)"
+  fail "tenant b: the commands the broken node could not apply stay lost on it once its backend is healthy again (no retry)" "$(diverge_report "$TENANT_B" "${NODES[@]}")"
+  # restarting does not help: a Raft snapshot (taken automatically after every leadership change: async-snapshot) was
+  # created from the backend that had missed the commands, and the restart restores THAT snapshot
   node_stop "$OLD" 15; node_up "$OLD"
+  wait_until "$T_NODE_READY" "$OLD HTTP" node_http_ready "$OLD"; cluster_stable "${NODES[@]}" >/dev/null; sleep 15
+  converged "$TENANT_B" "${NODES[@]}" && log "RESULT-INFO: restarting $OLD re-applied the lost commands" || log "RESULT-INFO: restarting $OLD does NOT bring the lost commands back (it restores its own post-fault snapshot): $(diverge_report "$TENANT_B" "$OLD" | cut -c1-250)"
+  # the way out: a new node (empty Raft dir and empty tenant backends) rebuilt from the leader
+  node_stop "$OLD" 15; docker rm -f -v "$(cname $OLD)" >/dev/null 2>&1; node_remove_volume "$OLD"; cnode_start "$OLD"
   wait_until "$T_NODE_READY" "$OLD HTTP" node_http_ready "$OLD"; cluster_stable "${NODES[@]}" >/dev/null
-  wait_until 60 "b converged after the restart of $OLD" converged "$TENANT_B" "${NODES[@]}" && pass "after restarting $OLD tenant b converges (log replay)" || fail "tenant b still diverges after restarting $OLD" "$(diverge_report "$TENANT_B" "${NODES[@]}")"
+  wait_until 90 "b converged after rebuilding $OLD" converged "$TENANT_B" "${NODES[@]}" && pass "wiping $OLD's data and re-joining rebuilds tenant b (the documented reconstruction)" || fail "tenant b still diverges after rebuilding $OLD" "$(diverge_report "$TENANT_B" "${NODES[@]}")"
 fi
 assert_clean_logs "end" "${NODES[@]}"
 scenario_verdict; summary
