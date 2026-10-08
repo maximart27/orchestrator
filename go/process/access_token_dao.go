@@ -19,18 +19,19 @@ package process
 import (
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
-	"github.com/proxysql/orchestrator/go/config"
-	"github.com/proxysql/orchestrator/go/db"
 	"github.com/proxysql/orchestrator/go/util"
 )
 
+// Access tokens are control data (one HTTP server per process): they live in
+// the control backend, not in a tenant backend.
+
 // GenerateAccessToken attempts to generate a new access token and returns the public
 // part of the token
-func GenerateAccessToken(owner string) (publicToken string, err error) {
+func (c *Control) GenerateAccessToken(owner string) (publicToken string, err error) {
 	publicToken = util.NewToken().Hash
 	secretToken := util.NewToken().Hash
 
-	_, err = db.ExecOrchestrator(`
+	_, err = c.control.backend.Exec(`
 			insert into access_token (
 					public_token, secret_token, generated_at, generated_by, is_acquired, is_reentrant
 				) values (
@@ -47,9 +48,9 @@ func GenerateAccessToken(owner string) (publicToken string, err error) {
 
 // AcquireAccessToken attempts to acquire a hopefully free token; returning in such case
 // the secretToken as proof of ownership.
-func AcquireAccessToken(publicToken string) (secretToken string, err error) {
+func (c *Control) AcquireAccessToken(publicToken string) (secretToken string, err error) {
 	secretToken = ""
-	sqlResult, err := db.ExecOrchestrator(`
+	sqlResult, err := c.control.backend.Exec(`
 			update access_token
 				set
 					is_acquired=1,
@@ -64,7 +65,7 @@ func AcquireAccessToken(publicToken string) (secretToken string, err error) {
 						or is_reentrant=1
 					)
 			`,
-		publicToken, config.Config.AccessTokenUseExpirySeconds,
+		publicToken, c.control.backend.Config().AccessTokenUseExpirySeconds,
 	)
 	if err != nil {
 		return secretToken, log.Errore(err)
@@ -80,7 +81,7 @@ func AcquireAccessToken(publicToken string) (secretToken string, err error) {
 	query := `
 		select secret_token from access_token where public_token=?
 		`
-	err = db.QueryOrchestrator(query, sqlutils.Args(publicToken), func(m sqlutils.RowMap) error {
+	err = c.control.backend.Query(query, sqlutils.Args(publicToken), func(m sqlutils.RowMap) error {
 		secretToken = m.GetString("secret_token")
 		return nil
 	})
@@ -88,7 +89,7 @@ func AcquireAccessToken(publicToken string) (secretToken string, err error) {
 }
 
 // TokenIsValid checks to see whether a given token exists and is not outdated.
-func TokenIsValid(publicToken string, secretToken string) (result bool, err error) {
+func (c *Control) TokenIsValid(publicToken string, secretToken string) (result bool, err error) {
 	query := `
 		select
 				count(*) as valid_token
@@ -102,7 +103,7 @@ func TokenIsValid(publicToken string, secretToken string) (result bool, err erro
 					or is_reentrant = 1
 				)
 		`
-	err = db.QueryOrchestrator(query, sqlutils.Args(publicToken, secretToken, config.Config.AccessTokenExpiryMinutes), func(m sqlutils.RowMap) error {
+	err = c.control.backend.Query(query, sqlutils.Args(publicToken, secretToken, c.control.backend.Config().AccessTokenExpiryMinutes), func(m sqlutils.RowMap) error {
 		result = m.GetInt("valid_token") > 0
 		return nil
 	})
@@ -110,15 +111,33 @@ func TokenIsValid(publicToken string, secretToken string) (result bool, err erro
 }
 
 // ExpireAccessTokens removes old, known to be uneligible tokens
-func ExpireAccessTokens() error {
-	_, err := db.ExecOrchestrator(`
+func (c *Control) ExpireAccessTokens() error {
+	_, err := c.control.backend.Exec(`
 			delete
 				from access_token
 			where
 				generated_at < now() - interval ? minute
 				and is_reentrant = 0
 			`,
-		config.Config.AccessTokenExpiryMinutes,
+		c.control.backend.Config().AccessTokenExpiryMinutes,
 	)
 	return log.Errore(err)
 }
+
+// GenerateAccessToken is the legacy wrapper of (*Control).GenerateAccessToken.
+func GenerateAccessToken(owner string) (publicToken string, err error) {
+	return DefaultControl().GenerateAccessToken(owner)
+}
+
+// AcquireAccessToken is the legacy wrapper of (*Control).AcquireAccessToken.
+func AcquireAccessToken(publicToken string) (secretToken string, err error) {
+	return DefaultControl().AcquireAccessToken(publicToken)
+}
+
+// TokenIsValid is the legacy wrapper of (*Control).TokenIsValid.
+func TokenIsValid(publicToken string, secretToken string) (result bool, err error) {
+	return DefaultControl().TokenIsValid(publicToken, secretToken)
+}
+
+// ExpireAccessTokens is the legacy wrapper of (*Control).ExpireAccessTokens.
+func ExpireAccessTokens() error { return DefaultControl().ExpireAccessTokens() }
