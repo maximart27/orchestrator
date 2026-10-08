@@ -160,6 +160,15 @@ func (b *Backend) orchestratorTLSName() string {
 	return "orchestrator-" + b.id
 }
 
+// redactDSN returns the DSN without its password, safe to put in errors and
+// logs. A DSN that cannot be parsed is not echoed at all.
+func redactDSN(dsn string) string {
+	if safe, err := matchDSN(dsn); err == nil {
+		return safe
+	}
+	return "<dsn redacted>"
+}
+
 // setupTopologyTLS creates a TLS configuration from the config supplied CA, Certificate, and Private key.
 // It registers it with the mysql driver under topologyTLSName and modifies the supplied URI to use it.
 func (b *Backend) setupTopologyTLS(uri string) (string, error) {
@@ -170,7 +179,7 @@ func (b *Backend) setupTopologyTLS(uri string) (string, error) {
 		cfg := b.cfg
 		tlsConfig, err := ssl.NewTLSConfig(cfg.MySQLTopologySSLCAFile, !cfg.MySQLTopologySSLSkipVerify)
 		if err != nil {
-			return "", log.Errorf("Can't create TLS configuration for Topology connection %s: %s", uri, err)
+			return "", log.Errorf("Can't create TLS configuration for Topology connection %s: %s", redactDSN(uri), err)
 		}
 		// Drop to TLS 1.0 for talking to MySQL
 		tlsConfig.MinVersion = tls.VersionTLS10
@@ -180,7 +189,7 @@ func (b *Backend) setupTopologyTLS(uri string) (string, error) {
 			cfg.MySQLTopologySSLCertFile != "" &&
 			cfg.MySQLTopologySSLPrivateKeyFile != "" {
 			if err = ssl.AppendKeyPair(tlsConfig, cfg.MySQLTopologySSLCertFile, cfg.MySQLTopologySSLPrivateKeyFile); err != nil {
-				return "", log.Errorf("Can't setup TLS key pairs for %s: %s", uri, err)
+				return "", log.Errorf("Can't setup TLS key pairs for %s: %s", redactDSN(uri), err)
 			}
 		}
 		if err = mysql.RegisterTLSConfig(name, tlsConfig); err != nil {
@@ -200,7 +209,7 @@ func (b *Backend) setupOrchestratorTLS(uri string) (string, error) {
 		cfg := b.cfg
 		tlsConfig, err := ssl.NewTLSConfig(cfg.MySQLOrchestratorSSLCAFile, !cfg.MySQLOrchestratorSSLSkipVerify)
 		if err != nil {
-			return "", fmt.Errorf("can't create TLS configuration for Orchestrator connection %s: %w", uri, err)
+			return "", fmt.Errorf("can't create TLS configuration for Orchestrator connection %s: %w", redactDSN(uri), err)
 		}
 		// Drop to TLS 1.0 for talking to MySQL
 		tlsConfig.MinVersion = tls.VersionTLS10
@@ -209,7 +218,7 @@ func (b *Backend) setupOrchestratorTLS(uri string) (string, error) {
 			cfg.MySQLOrchestratorSSLCertFile != "" &&
 			cfg.MySQLOrchestratorSSLPrivateKeyFile != "" {
 			if err = ssl.AppendKeyPair(tlsConfig, cfg.MySQLOrchestratorSSLCertFile, cfg.MySQLOrchestratorSSLPrivateKeyFile); err != nil {
-				return "", fmt.Errorf("can't setup TLS key pairs for %s: %w", uri, err)
+				return "", fmt.Errorf("can't setup TLS key pairs for %s: %w", redactDSN(uri), err)
 			}
 		}
 		if err = mysql.RegisterTLSConfig(name, tlsConfig); err != nil {

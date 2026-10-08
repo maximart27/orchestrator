@@ -55,8 +55,9 @@ type storesOptions struct {
 }
 
 // WithBackend sets the relational backend of the internal KV store (typically the
-// tenant's own database backend). Without it the default backend is used, which
-// is only correct for the legacy single tenant.
+// tenant's own database backend). It is required for every tenant but the legacy
+// DefaultTenantID, whose internal KV lives in the default backend; NewStores fails
+// otherwise rather than silently writing in another tenant's database.
 func WithBackend(backend Backend) StoresOption {
 	return func(o *storesOptions) { o.backend = backend }
 }
@@ -81,6 +82,9 @@ func NewStores(cfg *config.Configuration, tenantID string, opts ...StoresOption)
 		opt(&o)
 	}
 	if o.backend == nil {
+		if tenantID != DefaultTenantID {
+			return nil, fmt.Errorf("kv: tenant %q: a backend is required (WithBackend)", tenantID)
+		}
 		o.backend = defaultBackend{}
 	}
 

@@ -542,8 +542,8 @@ func (s *Store) GetReplicationAnalysis(clusterName string, hints *ReplicationAna
 			analysisMessage := fmt.Sprintf("analysis: ClusterName: %+v, IsMaster: %+v, LastCheckValid: %+v, LastCheckPartialSuccess: %+v, CountReplicas: %+v, CountValidReplicas: %+v, CountValidReplicatingReplicas: %+v, CountLaggingReplicas: %+v, CountDelayedReplicas: %+v, CountReplicasFailingToConnectToMaster: %+v",
 				a.ClusterDetails.ClusterName, a.IsMaster, a.LastCheckValid, a.LastCheckPartialSuccess, a.CountReplicas, a.CountValidReplicas, a.CountValidReplicatingReplicas, a.CountLaggingReplicas, a.CountDelayedReplicas, a.CountReplicasFailingToConnectToMaster,
 			)
-			if util.ClearToLog("analysis_dao", analysisMessage) {
-				log.Debugf("%s", analysisMessage)
+			if util.ClearToLog("analysis_dao", s.logKey(analysisMessage)) {
+				log.Debugf("%s%s", s.logPrefix(), analysisMessage)
 			}
 		}
 		if !a.IsReplicationGroupMember /* Traditional Async/Semi-sync replication issue detection */ {

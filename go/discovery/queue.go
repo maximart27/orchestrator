@@ -19,7 +19,7 @@
 package discovery manages a queue of discovery requests: an ordered
 queue with no duplicates.
 
-push() operation never blocks while pop() blocks on an empty queue.
+push() blocks only while the queue is full (and never holds the lock then), while pop() blocks on an empty queue.
 
 */
 
@@ -187,23 +187,48 @@ func (q *Queue) QueueLen() int {
 }
 
 // Push enqueues a key if it is not on a queue and is not being
-// processed; silently returns otherwise.
+// processed; silently returns otherwise. When the queue is full it blocks until
+// there is room or the queue is Closed (the key is then dropped); it never holds
+// the queue's lock while blocked, so workers can still Consume and Release.
 func (q *Queue) Push(key inst.InstanceKey) {
-	q.Lock()
-	defer q.Unlock()
+	q.PushContext(context.Background(), key)
+}
 
+// PushContext is Push that also gives up when ctx is done. It returns true if
+// the key was enqueued, false if it was already queued/being processed or was
+// dropped because ctx is done or the queue was closed while waiting for room.
+func (q *Queue) PushContext(ctx context.Context, key inst.InstanceKey) bool {
+	q.Lock()
 	// is it enqueued already?
 	if _, found := q.queuedKeys[key]; found {
-		return
+		q.Unlock()
+		return false
 	}
-
 	// is it being processed now?
 	if _, found := q.consumedKeys[key]; found {
-		return
+		q.Unlock()
+		return false
 	}
-
+	// reserve the key so concurrent Pushes of it are deduplicated while we wait
+	// for room in the channel without holding the lock
 	q.queuedKeys[key] = time.Now()
-	q.queue <- key
+	q.Unlock()
+
+	select {
+	case q.queue <- key:
+		return true
+	default:
+	}
+	select {
+	case q.queue <- key:
+		return true
+	case <-ctx.Done():
+	case <-q.done:
+	}
+	q.Lock()
+	delete(q.queuedKeys, key)
+	q.Unlock()
+	return false
 }
 
 // Consume fetches a key to process; blocks if queue is empty.

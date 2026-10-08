@@ -1747,12 +1747,14 @@ func (s *Store) TakeMasterHook(successor *Instance, demoted *Instance) {
 
 	env = append(env, fmt.Sprintf("ORC_SUCCESSOR_HOST=%s", successorKey))
 	env = append(env, fmt.Sprintf("ORC_FAILED_HOST=%s", demotedKey))
+	env = append(env, fmt.Sprintf("ORC_TENANT_ID=%s", s.id))
 
 	successorStr := successorKey.String()
 	demotedStr := demotedKey.String()
 
 	processCount := len(s.cfg.PostTakeMasterProcesses)
 	for i, command := range s.cfg.PostTakeMasterProcesses {
+		command = strings.ReplaceAll(command, "{tenantId}", s.id)
 		fullDescription := fmt.Sprintf("PostTakeMasterProcesses hook %d of %d", i+1, processCount)
 		log.Debugf("Take-Master: PostTakeMasterProcesses: Calling %+s", fullDescription)
 		start := time.Now()

@@ -83,8 +83,8 @@ func TestStoresNilConfig(t *testing.T) {
 }
 
 func TestClusterMasterKeyUsesTenantPrefix(t *testing.T) {
-	a, _ := NewStores(&config.Configuration{KVClusterMasterPrefix: "tenant-a/master/"}, "tenant-a")
-	b, _ := NewStores(&config.Configuration{KVClusterMasterPrefix: "tenant-b/master/"}, "tenant-b")
+	a, _ := NewStores(&config.Configuration{KVClusterMasterPrefix: "tenant-a/master/"}, "tenant-a", WithBackend(newFakeBackend()))
+	b, _ := NewStores(&config.Configuration{KVClusterMasterPrefix: "tenant-b/master/"}, "tenant-b", WithBackend(newFakeBackend()))
 	if got := a.ClusterMasterKey("c1"); got != "tenant-a/master/c1" {
 		t.Errorf("a: got %q", got)
 	}
@@ -210,11 +210,11 @@ func TestStoresDistributionGuardIsPerInstance(t *testing.T) {
 
 // TestStoresConsulTxnProvider checks that the provider is chosen per tenant config.
 func TestStoresConsulTxnProvider(t *testing.T) {
-	a, err := NewStores(&config.Configuration{ConsulKVStoreProvider: "consul-txn"}, "a")
+	a, err := NewStores(&config.Configuration{ConsulKVStoreProvider: "consul-txn"}, "a", WithBackend(newFakeBackend()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := NewStores(&config.Configuration{}, "b")
+	b, err := NewStores(&config.Configuration{}, "b", WithBackend(newFakeBackend()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestStoresConsulTxnProvider(t *testing.T) {
 // TestStoresDistributionWithoutConsulIsNoop used to dereference a nil Consul client.
 func TestStoresDistributionWithoutConsulIsNoop(t *testing.T) {
 	for _, provider := range []string{"", "consul-txn"} {
-		s, err := NewStores(&config.Configuration{ConsulCrossDataCenterDistribution: true, ConsulKVStoreProvider: provider}, "x")
+		s, err := NewStores(&config.Configuration{ConsulCrossDataCenterDistribution: true, ConsulKVStoreProvider: provider}, "x", WithBackend(newFakeBackend()))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -241,3 +241,14 @@ func TestStoresDistributionWithoutConsulIsNoop(t *testing.T) {
 
 // *db.Backend is what a tenant hands to WithBackend: keep the two in sync at compile time.
 var _ Backend = (*db.Backend)(nil)
+
+// A tenant that forgets WithBackend must not silently write into the legacy
+// default backend (another tenant's database).
+func TestNewStoresRequiresBackendForNonDefaultTenant(t *testing.T) {
+	if _, err := NewStores(&config.Configuration{}, "tenant-x"); err == nil {
+		t.Fatal("expected an error for a non-default tenant without a backend")
+	}
+	if _, err := NewStores(&config.Configuration{}, DefaultTenantID); err != nil {
+		t.Fatalf("the default tenant may use the default backend: %v", err)
+	}
+}

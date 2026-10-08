@@ -86,7 +86,7 @@ type Store struct {
 
 	hostnameResolvesLightweightCache                 *cache.Cache
 	hostnameResolvesLightweightCacheInit             sync.Mutex
-	hostnameResolvesLightweightCacheLoadedOnceFromDB bool
+	hostnameResolvesLightweightCacheLoadedOnceFromDB atomic.Bool
 
 	accessDeniedCounter               metrics.Counter
 	readTopologyInstanceCounter       metrics.Counter
@@ -263,6 +263,25 @@ func (s *Store) Close() error {
 		}
 	})
 	return nil
+}
+
+// logKey scopes a key of the process-wide deduplicated-log cache (util.ClearToLog)
+// to this tenant, so the error of one tenant does not silence the same error of
+// another one. The legacy default tenant keeps the unscoped key.
+func (s *Store) logKey(key string) string {
+	if s.id == config.DefaultTenantID {
+		return key
+	}
+	return s.id + "/" + key
+}
+
+// logPrefix identifies the tenant in messages that end up in logs shared by all
+// the tenants of the node (empty for the legacy default tenant).
+func (s *Store) logPrefix() string {
+	if s.id == config.DefaultTenantID {
+		return ""
+	}
+	return "[tenant:" + s.id + "] "
 }
 
 // ID returns the tenant id of the Store.
