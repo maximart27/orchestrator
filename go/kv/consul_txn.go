@@ -35,8 +35,13 @@ import (
 // groupKVPairsByKeyPrefix groups Consul Transaction operations by KV key prefix. This
 // ensures KVs for a single cluster are grouped into a single transaction
 func groupKVPairsByKeyPrefix(kvPairs consulapi.KVPairs) (groups []consulapi.KVPairs) {
-	maxOpsPerTxn := config.Config.ConsulMaxKVsPerTransaction
-	clusterMasterPrefix := config.Config.KVClusterMasterPrefix + "/"
+	return groupKVPairsByKeyPrefixWithConfig(config.Config, kvPairs)
+}
+
+// groupKVPairsByKeyPrefixWithConfig is groupKVPairsByKeyPrefix for the given (tenant) configuration
+func groupKVPairsByKeyPrefixWithConfig(cfg *config.Configuration, kvPairs consulapi.KVPairs) (groups []consulapi.KVPairs) {
+	maxOpsPerTxn := cfg.ConsulMaxKVsPerTransaction
+	clusterMasterPrefix := cfg.KVClusterMasterPrefix + "/"
 	groupsMap := map[string]consulapi.KVPairs{}
 	for _, pair := range kvPairs {
 		prefix := pair.Key
@@ -67,36 +72,51 @@ func groupKVPairsByKeyPrefix(kvPairs consulapi.KVPairs) (groups []consulapi.KVPa
 
 // A Consul store based on config's `ConsulAddress`, `ConsulScheme`, and `ConsulKVPrefix`
 type consulTxnStore struct {
+	cfg                 *config.Configuration
 	client              *consulapi.Client
 	kvCache             *cache.Cache
 	distributionReentry int64
 }
 
-// NewConsulTxnStore creates a new consul store that uses Consul Transactions to read/write multiple KVPairs.
-// It is possible that the client for this store is nil, which is the case if no consul config is provided
+// NewConsulTxnStore creates a new consul store from config.Config that uses Consul Transactions to
+// read/write multiple KVPairs. It is possible that the client for this store is nil, which is the
+// case if no consul config is provided.
+// This is the legacy (single tenant) constructor; see NewStores for per-tenant stores.
 func NewConsulTxnStore() KVStore {
+	store, err := newConsulTxnStore(config.Config)
+	if err != nil {
+		_ = log.Errore(err)
+	}
+	return store
+}
+
+// newConsulTxnStore creates a consul txn store with the client built from cfg. The returned store
+// is never nil; on error its client is nil, so all operations are no-ops.
+func newConsulTxnStore(cfg *config.Configuration) (*consulTxnStore, error) {
 	store := &consulTxnStore{
+		cfg:     cfg,
 		kvCache: cache.New(cache.NoExpiration, cache.DefaultExpiration),
 	}
 
-	if config.Config.ConsulAddress != "" {
-		consulConfig := consulapi.DefaultConfig()
-		consulConfig.Address = config.Config.ConsulAddress
-		consulConfig.Scheme = config.Config.ConsulScheme
-		if config.Config.ConsulScheme == "https" {
-			consulConfig.HttpClient = &http.Client{
-				Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-			}
-		}
-		// ConsulAclToken defaults to ""
-		consulConfig.Token = config.Config.ConsulAclToken
-		if client, err := consulapi.NewClient(consulConfig); err != nil {
-			_ = log.Errore(err)
-		} else {
-			store.client = client
+	if cfg.ConsulAddress == "" {
+		return store, nil
+	}
+	consulConfig := consulapi.DefaultConfig()
+	consulConfig.Address = cfg.ConsulAddress
+	consulConfig.Scheme = cfg.ConsulScheme
+	if cfg.ConsulScheme == "https" {
+		consulConfig.HttpClient = &http.Client{
+			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
 		}
 	}
-	return store
+	// ConsulAclToken defaults to ""
+	consulConfig.Token = cfg.ConsulAclToken
+	client, err := consulapi.NewClient(consulConfig)
+	if err != nil {
+		return store, err
+	}
+	store.client = client
+	return store, nil
 }
 
 // doWriteTxn performs one or many of write operations using a Consul Transaction and handles any client/server
@@ -262,7 +282,7 @@ func (this *consulTxnStore) DistributePairs(kvPairs [](*KVPair)) (err error) {
 		return
 	}
 
-	if !config.Config.ConsulCrossDataCenterDistribution {
+	if !this.cfg.ConsulCrossDataCenterDistribution || this.client == nil {
 		return nil
 	}
 
@@ -304,7 +324,7 @@ func (this *consulTxnStore) DistributePairs(kvPairs [](*KVPair)) (err error) {
 			// launch an .updateDatacenterKVPairs() goroutine
 			// for each grouping of consul KV pairs and wait
 			var dcWg sync.WaitGroup
-			for _, kvPairGroup := range groupKVPairsByKeyPrefix(consulPairs) {
+			for _, kvPairGroup := range groupKVPairsByKeyPrefixWithConfig(this.cfg, consulPairs) {
 				dcWg.Add(1)
 				go this.updateDatacenterKVPairs(&dcWg, datacenter, kvPairGroup, responses)
 			}

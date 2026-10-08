@@ -38,36 +38,56 @@ func getConsulKVCacheKey(dc, key string) string {
 
 // A Consul store based on config's `ConsulAddress`, `ConsulScheme`, and `ConsulKVPrefix`
 type consulStore struct {
+	cfg                 *config.Configuration
 	client              *consulapi.Client
 	kvCache             *cache.Cache
 	distributionReentry int64
 }
 
-// NewConsulStore creates a new consul store. It is possible that the client for this store is nil,
-// which is the case if no consul config is provided.
+// NewConsulStore creates a new consul store from config.Config. It is possible that the client
+// for this store is nil, which is the case if no consul config is provided.
+// This is the legacy (single tenant) constructor; see NewStores for per-tenant stores.
 func NewConsulStore() KVStore {
+	store, err := newConsulStore(config.Config)
+	if err != nil {
+		_ = log.Errore(err)
+	}
+	return store
+}
+
+// newConsulStore creates a consul store with the client built from cfg. The returned store is
+// never nil; on error its client is nil, so all operations are no-ops.
+func newConsulStore(cfg *config.Configuration) (*consulStore, error) {
 	store := &consulStore{
+		cfg:     cfg,
 		kvCache: cache.New(cache.NoExpiration, cache.DefaultExpiration),
 	}
 
-	if config.Config.ConsulAddress != "" {
-		consulConfig := consulapi.DefaultConfig()
-		consulConfig.Address = config.Config.ConsulAddress
-		consulConfig.Scheme = config.Config.ConsulScheme
-		if config.Config.ConsulScheme == "https" {
-			consulConfig.HttpClient = &http.Client{
-				Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-			}
-		}
-		// ConsulAclToken defaults to ""
-		consulConfig.Token = config.Config.ConsulAclToken
-		if client, err := consulapi.NewClient(consulConfig); err != nil {
-			_ = log.Errore(err)
-		} else {
-			store.client = client
+	client, err := newConsulClient(cfg)
+	if err != nil {
+		return store, err
+	}
+	store.client = client
+	return store, nil
+}
+
+// newConsulClient returns a Consul client based on cfg, or nil (and no error) if no
+// ConsulAddress is configured.
+func newConsulClient(cfg *config.Configuration) (*consulapi.Client, error) {
+	if cfg.ConsulAddress == "" {
+		return nil, nil
+	}
+	consulConfig := consulapi.DefaultConfig()
+	consulConfig.Address = cfg.ConsulAddress
+	consulConfig.Scheme = cfg.ConsulScheme
+	if cfg.ConsulScheme == "https" {
+		consulConfig.HttpClient = &http.Client{
+			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
 		}
 	}
-	return store
+	// ConsulAclToken defaults to ""
+	consulConfig.Token = cfg.ConsulAclToken
+	return consulapi.NewClient(consulConfig)
 }
 
 func (this *consulStore) PutKeyValue(key string, value string) (err error) {
@@ -110,7 +130,7 @@ func (this *consulStore) DistributePairs(kvPairs [](*KVPair)) (err error) {
 		return
 	}
 
-	if !config.Config.ConsulCrossDataCenterDistribution {
+	if !this.cfg.ConsulCrossDataCenterDistribution || this.client == nil {
 		return nil
 	}
 

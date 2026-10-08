@@ -102,3 +102,80 @@ func TestAppend(t *testing.T) {
 		}
 	}
 }
+
+// TestNewIsolatedFromNamedRegistry checks that New() instances are
+// independent from each other and from the named registry.
+func TestNewIsolatedFromNamedRegistry(t *testing.T) {
+	a := New(time.Minute)
+	b := New(time.Minute)
+	defer a.Close()
+	defer b.Close()
+
+	if a == b {
+		t.Fatalf("New returned the same instance twice")
+	}
+	named := CreateOrReturnCollection("TEST_NEW_ISOLATED")
+	if named == a || named == b {
+		t.Fatalf("New() instance leaked into the named registry")
+	}
+
+	_ = a.Append(&testMetric{})
+	_ = a.Append(&testMetric{})
+	_ = b.Append(&testMetric{})
+	if got := len(a.Metrics()); got != 2 {
+		t.Errorf("a: expected 2 metrics, got %d", got)
+	}
+	if got := len(b.Metrics()); got != 1 {
+		t.Errorf("b: expected 1 metric, got %d", got)
+	}
+	if got := len(named.Metrics()); got != 0 {
+		t.Errorf("named: expected 0 metrics, got %d", got)
+	}
+	if a.ExpirePeriod() != time.Minute {
+		t.Errorf("expected expire period of a minute, got %v", a.ExpirePeriod())
+	}
+}
+
+// TestStopAutoExpirationIdempotent checks Close/Stop never block, can be
+// repeated, and that expiration can be restarted afterwards.
+func TestStopAutoExpirationIdempotent(t *testing.T) {
+	c := New(time.Minute)
+
+	finished := make(chan struct{})
+	go func() {
+		c.Close()
+		c.Close()
+		c.StopAutoExpiration()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close blocked")
+	}
+
+	restarted := make(chan struct{})
+	go func() {
+		c.StartAutoExpiration() // blocks until stopped again
+		close(restarted)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c.Lock()
+		running := c.monitoring
+		c.Unlock()
+		if running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("auto expiration did not restart")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	c.StopAutoExpiration()
+	select {
+	case <-restarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StartAutoExpiration did not return after stop")
+	}
+}
