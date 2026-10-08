@@ -28,6 +28,7 @@ import (
 	"github.com/proxysql/orchestrator/go/config"
 	"github.com/proxysql/orchestrator/go/db"
 	"github.com/proxysql/orchestrator/go/inst"
+	ometrics "github.com/proxysql/orchestrator/go/metrics"
 	"github.com/proxysql/orchestrator/go/process"
 )
 
@@ -189,6 +190,12 @@ func NewTenantManagerFor(base *config.Configuration, tenantConfigs []*config.Ten
 	if !m.legacy {
 		disableLegacyDefaults()
 		m.defaultsDisabled = true
+		if _, hasDefault := tenantIDs(tenantConfigs)[config.DefaultTenantID]; !hasDefault {
+			// The legacy metric variables of package metrics are the series of the
+			// tenant "default", created when the package loads. Without such a
+			// tenant they would be exported (at 0) for nothing.
+			ometrics.ForTenant(ometrics.DefaultTenant).Forget()
+		}
 	}
 
 	for _, tc := range tenantConfigs {
@@ -214,6 +221,14 @@ func NewTenantManagerFor(base *config.Configuration, tenantConfigs []*config.Ten
 		t.control = m.control
 	}
 	return m, nil
+}
+
+func tenantIDs(tenantConfigs []*config.TenantConfig) map[string]struct{} {
+	ids := make(map[string]struct{}, len(tenantConfigs))
+	for _, tc := range tenantConfigs {
+		ids[tc.ID] = struct{}{}
+	}
+	return ids
 }
 
 // setupControl decides the control backend (see TenantManager.control) and builds the control.

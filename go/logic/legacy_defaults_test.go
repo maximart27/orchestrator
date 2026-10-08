@@ -5,8 +5,12 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/proxysql/orchestrator/go/config"
 	"github.com/proxysql/orchestrator/go/db"
 	"github.com/proxysql/orchestrator/go/inst"
+	ometrics "github.com/proxysql/orchestrator/go/metrics"
 )
 
 // legacyDefaultsDisabled tells whether db.DefaultBackend() is the inert one.
@@ -61,5 +65,35 @@ func TestFailedManagerConstructionReenablesTheLegacyDefaults(t *testing.T) {
 	}
 	if legacyDefaultsDisabled() {
 		t.Error("a failed construction must not leave the legacy defaults disabled")
+	}
+}
+
+// The legacy metric variables are the series of the tenant "default": in a
+// multi-tenant process without such a tenant they must not be exported.
+func TestNoPhantomDefaultTenantSeriesInMultiTenantProcess(t *testing.T) {
+	prev := config.Config.PrometheusEnabled
+	config.Config.PrometheusEnabled = true
+	ometrics.InitPrometheus() // registers the vecs in the default registry, once
+	config.Config.PrometheusEnabled = prev
+	newTestManager(t, []string{"a", "b"}, nil)
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, f := range families {
+		for _, metric := range f.GetMetric() {
+			for _, l := range metric.GetLabel() {
+				if l.GetName() == "tenant" {
+					seen[l.GetValue()] = true
+				}
+			}
+		}
+	}
+	if seen[config.DefaultTenantID] {
+		t.Errorf("series of the tenant %q exported although there is no such tenant", config.DefaultTenantID)
+	}
+	if !seen["a"] {
+		t.Errorf("series of tenant a missing; tenants seen: %v", seen)
 	}
 }
