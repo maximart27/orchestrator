@@ -126,7 +126,7 @@ func ParseTenantConfigs(base *Configuration, data []byte) ([]*TenantConfig, erro
 		}
 		tenants = append(tenants, tenant)
 	}
-	if err := validateTenantSet(tenants); err != nil {
+	if err := validateTenantSet(base, tenants); err != nil {
 		return nil, err
 	}
 	return tenants, nil
@@ -257,19 +257,76 @@ func resolveTenantSynonyms(cfg *Configuration, set map[string]bool) {
 	}
 }
 
+// owners of SQLite files that are not tenants, for validateTenantSet messages
+const (
+	controlBackendOwner = "\x00control"
+	raftStoreOwner      = "\x00raft"
+)
+
+// canonicalPath resolves p to an absolute path with symlinks evaluated, so two spellings of
+// the same file compare equal. The file need not exist: the deepest existing ancestor is
+// resolved and the rest appended; dangling symlinks are followed to their target.
+func canonicalPath(p string) string {
+	return canonicalPathDepth(p, 0)
+}
+
+func canonicalPathDepth(p string, depth int) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return filepath.Clean(p)
+	}
+	if depth > 40 { // symlink loop
+		return abs
+	}
+	rest := ""
+	for cur := abs; ; {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(resolved, rest)
+		}
+		if target, err := os.Readlink(cur); err == nil {
+			// a dangling symlink: EvalSymlinks cannot follow it
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(cur), target)
+			}
+			return filepath.Join(canonicalPathDepth(target, depth+1), rest)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
+}
+
 // validateTenantSet checks the constraints between tenants: resources that must not be shared.
-func validateTenantSet(tenants []*TenantConfig) error {
+// base is the node configuration: its SQLite backend (the control backend of the node) and the
+// Raft store must not be used by any tenant either.
+func validateTenantSet(base *Configuration, tenants []*TenantConfig) error {
 	var errs []error
 
 	sqliteFiles := map[string]string{}
+	if base.IsSQLite() && base.SQLite3DataFile != "" {
+		sqliteFiles[canonicalPath(base.SQLite3DataFile)] = controlBackendOwner
+	}
+	if base.RaftEnabled && base.RaftDataDir != "" {
+		sqliteFiles[canonicalPath(filepath.Join(base.RaftDataDir, "raft_store.db"))] = raftStoreOwner
+	}
 	mysqlBackends := map[string]string{}
 	for _, t := range tenants {
 		cfg := t.Cfg
 		switch {
 		case cfg.IsSQLite():
-			key := filepath.Clean(cfg.SQLite3DataFile)
+			key := canonicalPath(cfg.SQLite3DataFile)
 			if other, found := sqliteFiles[key]; found {
-				errs = append(errs, fmt.Errorf("tenants %q and %q share the same SQLite3DataFile %s", other, t.ID, cfg.SQLite3DataFile))
+				switch other {
+				case controlBackendOwner:
+					errs = append(errs, fmt.Errorf("tenant %q uses the SQLite3DataFile %s of the node's own (control) backend: give the tenant its own Backend.SQLite3DataFile", t.ID, cfg.SQLite3DataFile))
+				case raftStoreOwner:
+					errs = append(errs, fmt.Errorf("tenant %q SQLite3DataFile %s is the Raft store", t.ID, cfg.SQLite3DataFile))
+				default:
+					errs = append(errs, fmt.Errorf("tenants %q and %q share the same SQLite3DataFile %s", other, t.ID, cfg.SQLite3DataFile))
+				}
 			} else {
 				sqliteFiles[key] = t.ID
 			}
