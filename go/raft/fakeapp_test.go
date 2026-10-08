@@ -22,12 +22,13 @@ import (
 //	del K     delete state[K]
 //	cat K V   state[K] += V + ","    (order- and duplicate-sensitive)
 type fakeApp struct {
-	mu      sync.Mutex
-	known   map[string]bool
-	state   map[string]map[string]string
-	seq     map[string][]string // per tenant, value of every applied command (the apply order)
-	applied int
-	globals []string
+	mu       sync.Mutex
+	known    map[string]bool
+	state    map[string]map[string]string
+	seq      map[string][]string // per tenant, value of every applied command (the apply order)
+	applied  int
+	restores int
+	globals  []string
 	// persistent: keep the state across Restarted (a SQLite backend); otherwise the
 	// state is rebuilt by Raft (snapshot + log replay).
 	persistent bool
@@ -124,6 +125,7 @@ func (a *fakeApp) Restore(rc io.ReadCloser) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.restores++
 	// like a SQL restore of a tenant of the snapshot: replace what that tenant had
 	for t := range s.State {
 		if a.known[t] {
@@ -202,4 +204,16 @@ func newFakeApps(n int, persistent bool, tenants ...string) ([]nodeApp, []*fakeA
 		fakes = append(fakes, f)
 	}
 	return apps, fakes
+}
+
+func (a *fakeApp) restoreCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.restores
+}
+
+func (a *fakeApp) globalOps() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.globals...)
 }

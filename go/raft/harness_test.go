@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,17 +48,21 @@ type chaosNode struct {
 	app   nodeApp
 	store *orcraft.Store
 	up    bool
+	epoch int // incremented every time the node is stopped
+	// lossy: the responses to the AppendEntries this node sends are lost
+	lossy atomic.Bool
 }
 
 type chaosCluster struct {
-	t       *testing.T
-	nodes   []*chaosNode
-	link    [][]bool // link[i][j]: i can reach j (directional)
-	mu      sync.Mutex
-	tune    func(*raft.Config)
-	seed    int64
-	dir     string
-	relLogs bool
+	t         *testing.T
+	nodes     []*chaosNode
+	link      [][]bool // link[i][j]: i can reach j (directional)
+	mu        sync.Mutex
+	tune      func(*raft.Config)
+	seed      int64
+	dir       string
+	abandoned int
+	relLogs   bool
 
 	// leader samples (term -> set of node idx that were seen leading in that term)
 	leadersMu    sync.Mutex
@@ -125,7 +130,7 @@ func newChaosCluster(t *testing.T, apps []nodeApp, tune func(*raft.Config), opts
 		_, tr := raft.NewInmemTransportWithTimeout(nd.addr, 250*time.Millisecond)
 		nd.trans = tr
 		cfg := raftConfig(nd.addr, tune)
-		if err := raft.BootstrapCluster(cfg, nd.logs, nd.logs, nd.snaps, noPipeline{tr}, raft.Configuration{Servers: servers}); err != nil {
+		if err := raft.BootstrapCluster(cfg, nd.logs, nd.logs, nd.snaps, noPipeline{tr, new(atomic.Bool)}, raft.Configuration{Servers: servers}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -143,7 +148,7 @@ func (c *chaosCluster) startRaft(nd *chaosNode) {
 	c.t.Helper()
 	cfg := raftConfig(nd.addr, c.tune)
 	s, f := orcraft.NewStoreForTest(string(nd.addr), nd.app, nd.app)
-	r, err := raft.NewRaft(cfg, f, nd.logs, nd.logs, nd.snaps, noPipeline{nd.trans})
+	r, err := raft.NewRaft(cfg, f, nd.logs, nd.logs, nd.snaps, noPipeline{nd.trans, &nd.lossy})
 	if err != nil {
 		c.t.Fatalf("starting %s: %v", nd.addr, err)
 	}
@@ -194,6 +199,13 @@ func (c *chaosCluster) AssertSingleLeaderPerTerm() {
 }
 
 func (c *chaosCluster) Close() {
+	defer func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.abandoned > 0 {
+			c.t.Logf("%d Publish call(s) were on a node that was shut down mid-call and never got an answer (hashicorp/raft abandons queued apply futures on Shutdown)", c.abandoned)
+		}
+	}()
 	if c.stopSampler != nil {
 		select {
 		case <-c.stopSampler:
@@ -232,6 +244,9 @@ func (c *chaosCluster) applyLinksLocked() {
 func (c *chaosCluster) Heal() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	for _, nd := range c.nodes {
+		nd.lossy.Store(false)
+	}
 	for i := range c.link {
 		for j := range c.link[i] {
 			c.link[i][j] = i != j
@@ -280,6 +295,7 @@ func (c *chaosCluster) Stop(i int) {
 		return
 	}
 	nd.up = false
+	nd.epoch++
 	r := nd.store.Raft()
 	c.applyLinksLocked()
 	c.mu.Unlock()
@@ -374,6 +390,9 @@ func (c *chaosCluster) Publish(i int, tenant, op string, value []byte) (interfac
 		resp interface{}
 		err  error
 	}
+	c.mu.Lock()
+	epoch := c.nodes[i].epoch
+	c.mu.Unlock()
 	done := make(chan result, 1)
 	go func() {
 		resp, err := s.TenantCommand(tenant, op, value)
@@ -382,8 +401,20 @@ func (c *chaosCluster) Publish(i int, tenant, op string, value []byte) (interfac
 	select {
 	case r := <-done:
 		return r.resp, r.err
-	case <-time.After(30 * time.Second):
-		c.t.Errorf("Publish(%s, %s) on node%d did not return in 30s: the Raft apply future never completed", tenant, op, i)
+	case <-time.After(10 * time.Second):
+		c.mu.Lock()
+		gone := !c.nodes[i].up || c.nodes[i].epoch != epoch
+		if gone {
+			c.abandoned++
+		}
+		c.mu.Unlock()
+		if gone {
+			// hashicorp/raft does not fail the apply futures still queued when the
+			// node is shut down: the caller (an HTTP request of a process that is
+			// exiting) is simply gone. Not an orchestrator matter.
+			return nil, fmt.Errorf("node shut down during publish: apply future abandoned by Raft")
+		}
+		c.t.Errorf("Publish(%s, %s) on node%d did not return in 10s on a running node: the Raft apply future never completed", tenant, op, i)
 		return nil, fmt.Errorf("publish hung")
 	}
 }
@@ -552,8 +583,41 @@ func (c *chaosCluster) logState(i int) (firstLog uint64, snapshots int) {
 // towards a node that was shut down and restarted (a new transport instance) can wedge
 // forever, which a real network connection never does (it errors out). Plain
 // AppendEntries RPCs, with a timeout, fail and are retried instead.
-type noPipeline struct{ *raft.InmemTransport }
+type noPipeline struct {
+	*raft.InmemTransport
+	lossy *atomic.Bool
+}
+
+// AppendEntries delivers the request but, when the node is lossy, drops the answer: the
+// receiver has appended the entries, the sender does not know.
+func (t noPipeline) AppendEntries(id raft.ServerID, target raft.ServerAddress, args *raft.AppendEntriesRequest, resp *raft.AppendEntriesResponse) error {
+	err := t.InmemTransport.AppendEntries(id, target, args, resp)
+	if err == nil && t.lossy.Load() {
+		return fmt.Errorf("response from %s lost", target)
+	}
+	return err
+}
+
+// SetLossy makes the AppendEntries answers that node i would receive disappear (or not).
+func (c *chaosCluster) SetLossy(i int, lossy bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nodes[i].lossy.Store(lossy)
+}
 
 func (noPipeline) AppendEntriesPipeline(raft.ServerID, raft.ServerAddress) (raft.AppendPipeline, error) {
 	return nil, raft.ErrPipelineReplicationNotSupported
+}
+
+// CutOneWay makes node from unable to reach node to (the reverse direction keeps working).
+func (c *chaosCluster) CutOneWay(from, to int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.link[from][to] = false
+	c.applyLinksLocked()
+}
+
+// GenericCommand publishes a global (tenant-less) command through node i.
+func (c *chaosCluster) GenericCommand(i int, op string, value []byte) (interface{}, error) {
+	return c.Publish(i, "", op, value)
 }

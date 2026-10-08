@@ -198,7 +198,11 @@ func runChaos(t *testing.T, seed int64, nodes int, steps int, tune func(*raft.Co
 			}
 			c.Partition(g1, g2)
 		case r < 45:
-			c.Isolate(rng.Intn(nodes))
+			if rng.Intn(2) == 0 {
+				c.Isolate(rng.Intn(nodes))
+			} else {
+				c.SetLossy(rng.Intn(nodes), true) // answers to this node's AppendEntries get lost
+			}
 		case r < 65:
 			c.Heal()
 		case r < 75:
