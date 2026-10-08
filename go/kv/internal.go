@@ -28,18 +28,18 @@ import (
 // A per-tenant database backend satisfies it; the package-level db functions
 // (default backend) are used when none is given.
 type Backend interface {
-	ExecOrchestrator(query string, args ...interface{}) (sql.Result, error)
-	QueryOrchestrator(query string, argsArray []interface{}, onRow func(sqlutils.RowMap) error) error
+	Exec(query string, args ...interface{}) (sql.Result, error)
+	Query(query string, argsArray []interface{}, onRow func(sqlutils.RowMap) error) error
 }
 
 // defaultBackend adapts the package-level (default backend) functions of the db package.
 type defaultBackend struct{}
 
-func (defaultBackend) ExecOrchestrator(query string, args ...interface{}) (sql.Result, error) {
+func (defaultBackend) Exec(query string, args ...interface{}) (sql.Result, error) {
 	return db.ExecOrchestrator(query, args...)
 }
 
-func (defaultBackend) QueryOrchestrator(query string, argsArray []interface{}, onRow func(sqlutils.RowMap) error) error {
+func (defaultBackend) Query(query string, argsArray []interface{}, onRow func(sqlutils.RowMap) error) error {
 	return db.QueryOrchestrator(query, argsArray, onRow)
 }
 
@@ -58,7 +58,7 @@ func newInternalKVStore(backend Backend) *internalKVStore {
 }
 
 func (this *internalKVStore) PutKeyValue(key string, value string) (err error) {
-	_, err = this.backend.ExecOrchestrator(`
+	_, err = this.backend.Exec(`
 		replace
 			into kv_store (
         store_key, store_value, last_updated
@@ -80,7 +80,7 @@ func (this *internalKVStore) GetKeyValue(key string) (value string, found bool, 
       store_key = ?
 		`
 
-	err = this.backend.QueryOrchestrator(query, sqlutils.Args(key), func(m sqlutils.RowMap) error {
+	err = this.backend.Query(query, sqlutils.Args(key), func(m sqlutils.RowMap) error {
 		value = m.GetString("store_value")
 		found = true
 		return nil

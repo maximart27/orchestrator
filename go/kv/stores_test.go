@@ -13,6 +13,7 @@ import (
 
 	"github.com/proxysql/golib/sqlutils"
 	"github.com/proxysql/orchestrator/go/config"
+	"github.com/proxysql/orchestrator/go/db"
 )
 
 // fakeBackend is an in-memory stand-in for a tenant's relational backend: it understands
@@ -26,14 +27,14 @@ func newFakeBackend() *fakeBackend {
 	return &fakeBackend{rows: map[string]string{}}
 }
 
-func (f *fakeBackend) ExecOrchestrator(query string, args ...interface{}) (sql.Result, error) {
+func (f *fakeBackend) Exec(query string, args ...interface{}) (sql.Result, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rows[args[0].(string)] = args[1].(string)
 	return nil, nil
 }
 
-func (f *fakeBackend) QueryOrchestrator(query string, argsArray []interface{}, onRow func(sqlutils.RowMap) error) error {
+func (f *fakeBackend) Query(query string, argsArray []interface{}, onRow func(sqlutils.RowMap) error) error {
 	f.mu.Lock()
 	value, found := f.rows[argsArray[0].(string)]
 	f.mu.Unlock()
@@ -237,3 +238,6 @@ func TestStoresDistributionWithoutConsulIsNoop(t *testing.T) {
 		}
 	}
 }
+
+// *db.Backend is what a tenant hands to WithBackend: keep the two in sync at compile time.
+var _ Backend = (*db.Backend)(nil)
