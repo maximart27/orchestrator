@@ -2016,6 +2016,35 @@ func (this *HttpAPI) ClustersInfo(w http.ResponseWriter, r *http.Request) {
 	renderTenantJSON(w, r, http.StatusOK, clustersInfo)
 }
 
+// tenantClusterInfo is a ClusterInfo of the aggregated view, which names its tenant.
+type tenantClusterInfo struct {
+	TenantId string
+	inst.ClusterInfo
+}
+
+// AllTenantsClustersInfo lists the clusters of every tenant, each with its
+// TenantId (cluster names are only unique within a tenant). A tenant that cannot
+// be read is left out and named in the message. It is a global route.
+func (this *HttpAPI) AllTenantsClustersInfo(w http.ResponseWriter, r *http.Request) {
+	all := []tenantClusterInfo{}
+	var failures []string
+	for _, tenant := range managerOf(this.Manager).All() {
+		clustersInfo, err := tenant.Store.ReadClustersInfo("")
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("tenant %s: %v", tenant.ID, err))
+			continue
+		}
+		for _, clusterInfo := range clustersInfo {
+			all = append(all, tenantClusterInfo{TenantId: tenant.ID, ClusterInfo: clusterInfo})
+		}
+	}
+	respond := &APIResponse{Code: OK, Message: fmt.Sprintf("%d clusters", len(all)), Details: all}
+	if len(failures) > 0 {
+		respond.Message += "; " + strings.Join(failures, "; ")
+	}
+	Respond(w, respond)
+}
+
 // Tags lists existing tags for a given instance
 func (this *HttpAPI) Tags(w http.ResponseWriter, r *http.Request) {
 	tenant := tenantOf(r)
@@ -4258,6 +4287,8 @@ func (this *HttpAPI) RegisterRequests(router chi.Router) {
 
 	// Tenants of the process (global, node-local)
 	this.registerGlobalAPIRequestNoProxy(router, "tenants", this.ListTenants)
+	// Aggregated view over every tenant (global; each element names its tenant)
+	this.registerGlobalAPIRequest(router, "all-tenants/clusters-info", this.AllTenantsClustersInfo)
 
 	// Meta, no proxy
 	this.registerGlobalAPIRequestNoProxy(router, "headers", this.Headers)
