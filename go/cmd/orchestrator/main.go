@@ -67,6 +67,7 @@ func main() {
 	pattern := flag.String("pattern", "", "regular expression pattern")
 	clusterAlias := flag.String("alias", "", "cluster alias")
 	pool := flag.String("pool", "", "Pool logical name (applies for pool-related commands)")
+	tenantFlag := flag.String("tenant", "", "tenant ID the command acts on (cli); defaults to $"+app.TenantEnvVar+", then to the tenant 'default' or the only tenant. See 'orchestrator -c tenants'")
 	hostnameFlag := flag.String("hostname", "", "Hostname/fqdn/CNAME/VIP (applies for hostname/resolve related commands)")
 	discovery := flag.Bool("discovery", true, "auto discovery mode")
 	quiet := flag.Bool("quiet", false, "quiet")
@@ -184,7 +185,7 @@ func main() {
 	case helpTopic != "":
 		app.HelpCommand(helpTopic)
 	case len(flag.Args()) == 0 || flag.Arg(0) == "cli":
-		app.CliWrapper(*command, *strict, *instance, *destination, *owner, *reason, *duration, *pattern, *clusterAlias, *pool, *hostnameFlag)
+		app.CliWrapperForTenant(*tenantFlag, *command, *strict, *instance, *destination, *owner, *reason, *duration, *pattern, *clusterAlias, *pool, *hostnameFlag)
 	case flag.Arg(0) == "http":
 		app.Http(*discovery)
 	default:
