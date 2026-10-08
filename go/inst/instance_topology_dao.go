@@ -1582,8 +1582,8 @@ func (s *Store) CheckAndInjectPseudoGTIDOnWriter(instance *Instance) (injected b
 		return injected, log.Errore(err)
 	}
 	if !canInject {
-		if util.ClearToLog("CheckAndInjectPseudoGTIDOnWriter", instance.Key.StringCode()) {
-			_ = log.Warningf("AutoPseudoGTID enabled, but orchestrator has no privileges on %+v to inject pseudo-gtid", instance.Key)
+		if util.ClearToLog("CheckAndInjectPseudoGTIDOnWriter", s.logKey(instance.Key.StringCode())) {
+			_ = log.Warningf("%sAutoPseudoGTID enabled, but orchestrator has no privileges on %+v to inject pseudo-gtid", s.logPrefix(), instance.Key)
 		}
 
 		return injected, nil

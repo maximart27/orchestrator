@@ -49,6 +49,10 @@ func (s *Store) AuditOperation(auditType string, instanceKey *InstanceKey, messa
 		clusterName, _ = s.GetClusterName(instanceKey)
 	}
 
+	// the audit file, syslog and log are shared by all the tenants of the node
+	// (the backend table is per tenant already, so it keeps the plain message)
+	logged := s.logPrefix() + message
+
 	auditWrittenToFile := false
 	if s.cfg.AuditLogFile != "" {
 		auditWrittenToFile = true
@@ -60,7 +64,7 @@ func (s *Store) AuditOperation(auditType string, instanceKey *InstanceKey, messa
 				}
 
 				defer func() { _ = f.Close() }()
-				text := fmt.Sprintf("%s\t%s\t%s\t%d\t[%s]\t%s\t\n", time.Now().Format(log.TimeFormat), auditType, instanceKey.Hostname, instanceKey.Port, clusterName, message)
+				text := fmt.Sprintf("%s\t%s\t%s\t%d\t[%s]\t%s\t\n", time.Now().Format(log.TimeFormat), auditType, instanceKey.Hostname, instanceKey.Port, clusterName, logged)
 				if _, err = f.WriteString(text); err != nil {
 					return log.Errore(err)
 				}
@@ -87,7 +91,7 @@ func (s *Store) AuditOperation(auditType string, instanceKey *InstanceKey, messa
 			return log.Errore(err)
 		}
 	}
-	logMessage := fmt.Sprintf("auditType:%s instance:%s cluster:%s message:%s", auditType, instanceKey.DisplayString(), clusterName, message)
+	logMessage := fmt.Sprintf("auditType:%s instance:%s cluster:%s message:%s", auditType, instanceKey.DisplayString(), clusterName, logged)
 	if syslogWriter != nil {
 		auditWrittenToFile = true
 		go func() {

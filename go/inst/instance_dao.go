@@ -190,18 +190,19 @@ func (s *Store) ExpireTableData(tableName string, timestampColumn string) error 
 // logReadTopologyInstanceError logs an error, if applicable, for a ReadTopologyInstance operation,
 // providing context and hint as for the source of the error. If there's no hint just provide the
 // original error.
-func logReadTopologyInstanceError(instanceKey *InstanceKey, hint string, err error) error {
+func (s *Store) logReadTopologyInstanceError(instanceKey *InstanceKey, hint string, err error) error {
 	if err == nil {
 		return nil
 	}
-	if !util.ClearToLog("ReadTopologyInstance", instanceKey.StringCode()) {
+	if !util.ClearToLog("ReadTopologyInstance", s.logKey(instanceKey.StringCode())) {
 		return err
 	}
 	var msg string
 	if hint == "" {
-		msg = fmt.Sprintf("ReadTopologyInstance(%+v): %+v", *instanceKey, err)
+		msg = fmt.Sprintf("%sReadTopologyInstance(%+v): %+v", s.logPrefix(), *instanceKey, err)
 	} else {
-		msg = fmt.Sprintf("ReadTopologyInstance(%+v) %+v: %+v",
+		msg = fmt.Sprintf("%sReadTopologyInstance(%+v) %+v: %+v",
+			s.logPrefix(),
 			*instanceKey,
 			strings.ReplaceAll(hint, "%", "%%"), // escape %
 			err)
@@ -313,9 +314,9 @@ func (s *Store) instanceCheckMaxScale(instance *Instance, db *sql.DB, latency *s
 			s.accessDeniedCounter.Inc(1)
 		}
 		if unrecoverableError(err) {
-			_ = logReadTopologyInstanceError(&instance.Key, "", err)
+			_ = s.logReadTopologyInstanceError(&instance.Key, "", err)
 		} else {
-			_ = logReadTopologyInstanceError(&instance.Key, "show variables like 'maxscale%'", err)
+			_ = s.logReadTopologyInstanceError(&instance.Key, "show variables like 'maxscale%'", err)
 		}
 	}
 
@@ -364,7 +365,7 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 
 	defer func() {
 		if r := recover(); r != nil {
-			err = logReadTopologyInstanceError(instanceKey, "Unexpected, aborting", fmt.Errorf("%+v", r))
+			err = s.logReadTopologyInstanceError(instanceKey, "Unexpected, aborting", fmt.Errorf("%+v", r))
 		}
 	}()
 
@@ -619,7 +620,7 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 				err := db.QueryRow("show global status like 'Uptime'").Scan(&dummy, &instance.Uptime)
 
 				if err != nil {
-					logReadTopologyInstanceError(instanceKey, "show global status like 'Uptime'", err)
+					s.logReadTopologyInstanceError(instanceKey, "show global status like 'Uptime'", err)
 
 					// We do not "goto Cleanup" here, although it should be the correct flow.
 					// Reason is 5.7's new security feature that requires GRANTs on performance_schema.global_variables.
@@ -830,11 +831,11 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 		// Resolve cache has been updated, so we can finalize resolving master
 		masterKey, err = s.NewResolveInstanceKey(masterHostnameTmp, masterPortTmp)
 		if err != nil {
-			logReadTopologyInstanceError(instanceKey, "NewResolveInstanceKey", err)
+			s.logReadTopologyInstanceError(instanceKey, "NewResolveInstanceKey", err)
 		}
 		masterKey.Hostname, resolveErr = s.ResolveHostname(masterKey.Hostname)
 		if resolveErr != nil {
-			logReadTopologyInstanceError(instanceKey, fmt.Sprintf("ResolveHostname(%q)", masterKey.Hostname), resolveErr)
+			s.logReadTopologyInstanceError(instanceKey, fmt.Sprintf("ResolveHostname(%q)", masterKey.Hostname), resolveErr)
 		}
 		instance.MasterKey = *masterKey
 		instance.IsDetachedMaster = instance.MasterKey.IsDetached()
@@ -868,7 +869,7 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 				}
 			} else {
 				instance.ReplicationLagSeconds = instance.SecondsBehindMaster
-				logReadTopologyInstanceError(instanceKey, "ReplicationLagQuery", err)
+				s.logReadTopologyInstanceError(instanceKey, "ReplicationLagQuery", err)
 			}
 		}()
 	}
@@ -930,7 +931,7 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 				}
 				return err
 			})
-		logReadTopologyInstanceError(instanceKey, "show slave hosts", err)
+		s.logReadTopologyInstanceError(instanceKey, "show slave hosts", err)
 	}
 	if !foundByShowSlaveHosts && !isMaxScale {
 		// Either not configured to read SHOW SLAVE HOSTS or nothing was there.
@@ -943,7 +944,7 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 					cname, resolveErr := s.ResolveHostname(m.GetString("slave_hostname"))
 					user := m.GetString("user")
 					if resolveErr != nil {
-						logReadTopologyInstanceError(instanceKey, "ResolveHostname: processlist", resolveErr)
+						s.logReadTopologyInstanceError(instanceKey, "ResolveHostname: processlist", resolveErr)
 					}
 
 					// Note that here we assume that the replica port is the same as our port
@@ -959,7 +960,7 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 					return err
 				})
 
-			logReadTopologyInstanceError(instanceKey, "processlist", err)
+			s.logReadTopologyInstanceError(instanceKey, "processlist", err)
 		}()
 	}
 
@@ -979,14 +980,14 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 				func(m sqlutils.RowMap) error {
 					cname, resolveErr := s.ResolveHostname(m.GetString("mysql_host"))
 					if resolveErr != nil {
-						logReadTopologyInstanceError(instanceKey, "ResolveHostname: ndbinfo", resolveErr)
+						s.logReadTopologyInstanceError(instanceKey, "ResolveHostname: ndbinfo", resolveErr)
 					}
 					replicaKey := InstanceKey{Hostname: cname, Port: instance.Key.Port}
 					instance.AddReplicaKey(&replicaKey)
 					return err
 				})
 
-			logReadTopologyInstanceError(instanceKey, "ndbinfo", err)
+			s.logReadTopologyInstanceError(instanceKey, "ndbinfo", err)
 		}()
 	}
 
@@ -995,7 +996,7 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 		go func() {
 			defer waitGroup.Done()
 			err := db.QueryRow(s.cfg.DetectDataCenterQuery).Scan(&instance.DataCenter)
-			logReadTopologyInstanceError(instanceKey, "DetectDataCenterQuery", err)
+			s.logReadTopologyInstanceError(instanceKey, "DetectDataCenterQuery", err)
 		}()
 	}
 
@@ -1004,7 +1005,7 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 		go func() {
 			defer waitGroup.Done()
 			err := db.QueryRow(s.cfg.DetectRegionQuery).Scan(&instance.Region)
-			logReadTopologyInstanceError(instanceKey, "DetectRegionQuery", err)
+			s.logReadTopologyInstanceError(instanceKey, "DetectRegionQuery", err)
 		}()
 	}
 
@@ -1013,7 +1014,7 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 		go func() {
 			defer waitGroup.Done()
 			err := db.QueryRow(s.cfg.DetectPhysicalEnvironmentQuery).Scan(&instance.PhysicalEnvironment)
-			logReadTopologyInstanceError(instanceKey, "DetectPhysicalEnvironmentQuery", err)
+			s.logReadTopologyInstanceError(instanceKey, "DetectPhysicalEnvironmentQuery", err)
 		}()
 	}
 
@@ -1022,7 +1023,7 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 		go func() {
 			defer waitGroup.Done()
 			err := db.QueryRow(s.cfg.DetectInstanceAliasQuery).Scan(&instance.InstanceAlias)
-			logReadTopologyInstanceError(instanceKey, "DetectInstanceAliasQuery", err)
+			s.logReadTopologyInstanceError(instanceKey, "DetectInstanceAliasQuery", err)
 		}()
 	}
 
@@ -1031,7 +1032,7 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 		go func() {
 			defer waitGroup.Done()
 			err := db.QueryRow(s.cfg.DetectSemiSyncEnforcedQuery).Scan(&instance.SemiSyncPriority)
-			logReadTopologyInstanceError(instanceKey, "DetectSemiSyncEnforcedQuery", err)
+			s.logReadTopologyInstanceError(instanceKey, "DetectSemiSyncEnforcedQuery", err)
 		}()
 	}
 
@@ -1039,7 +1040,7 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 		latency.Start("backend")
 		err = s.ReadInstanceClusterAttributes(instance)
 		latency.Stop("backend")
-		logReadTopologyInstanceError(instanceKey, "ReadInstanceClusterAttributes", err)
+		s.logReadTopologyInstanceError(instanceKey, "ReadInstanceClusterAttributes", err)
 	}
 
 	{
@@ -1063,7 +1064,7 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 						}
 					}
 				} else {
-					logReadTopologyInstanceError(instanceKey, "DetectPseudoGTIDQuery", err)
+					s.logReadTopologyInstanceError(instanceKey, "DetectPseudoGTIDQuery", err)
 				}
 			}()
 		}
@@ -1074,7 +1075,7 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 		latency.Start("backend")
 		err = s.ReadInstancePromotionRule(instance)
 		latency.Stop("backend")
-		logReadTopologyInstanceError(instanceKey, "ReadInstancePromotionRule", err)
+		s.logReadTopologyInstanceError(instanceKey, "ReadInstancePromotionRule", err)
 	}
 	// Then check if the instance wants to set a different PromotionRule.
 	// We'll set it here on their behalf so there's no race between the first
@@ -1085,16 +1086,16 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 			defer waitGroup.Done()
 			var value string
 			err := db.QueryRow(s.cfg.DetectPromotionRuleQuery).Scan(&value)
-			logReadTopologyInstanceError(instanceKey, "DetectPromotionRuleQuery", err)
+			s.logReadTopologyInstanceError(instanceKey, "DetectPromotionRuleQuery", err)
 			promotionRule, err := ParseCandidatePromotionRule(value)
-			logReadTopologyInstanceError(instanceKey, "ParseCandidatePromotionRule", err)
+			s.logReadTopologyInstanceError(instanceKey, "ParseCandidatePromotionRule", err)
 			if err == nil {
 				// We need to update candidate_database_instance.
 				// We register the rule even if it hasn't changed,
 				// to bump the last_suggested time.
 				instance.PromotionRule = promotionRule
 				err = s.RegisterCandidateInstance(s.CandidateDatabaseInstanceWithCurrentTime(NewCandidateDatabaseInstance(instanceKey, promotionRule)))
-				logReadTopologyInstanceError(instanceKey, "RegisterCandidateInstance", err)
+				s.logReadTopologyInstanceError(instanceKey, "RegisterCandidateInstance", err)
 			}
 		}()
 	}
@@ -1106,7 +1107,7 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 			if s.cfg.DetectClusterAliasQuery != "" {
 				clusterAlias := ""
 				if err := db.QueryRow(s.cfg.DetectClusterAliasQuery).Scan(&clusterAlias); err != nil {
-					logReadTopologyInstanceError(instanceKey, "DetectClusterAliasQuery", err)
+					s.logReadTopologyInstanceError(instanceKey, "DetectClusterAliasQuery", err)
 				} else {
 					instance.SuggestedClusterAlias = clusterAlias
 				}
@@ -1125,13 +1126,13 @@ func (s *Store) ReadTopologyInstanceBufferable(instanceKey *InstanceKey, bufferW
 		domainName := ""
 		if err := db.QueryRow(s.cfg.DetectClusterDomainQuery).Scan(&domainName); err != nil {
 			domainName = ""
-			logReadTopologyInstanceError(instanceKey, "DetectClusterDomainQuery", err)
+			s.logReadTopologyInstanceError(instanceKey, "DetectClusterDomainQuery", err)
 		}
 		if domainName != "" {
 			latency.Start("backend")
 			err := s.WriteClusterDomainName(instance.ClusterName, domainName)
 			latency.Stop("backend")
-			logReadTopologyInstanceError(instanceKey, "WriteClusterDomainName", err)
+			s.logReadTopologyInstanceError(instanceKey, "WriteClusterDomainName", err)
 		}
 	}
 
