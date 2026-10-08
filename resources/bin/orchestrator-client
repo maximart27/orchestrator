@@ -266,7 +266,7 @@ function is_global_api_path {
   local first="${1#/}"
   first="${first%%[/?]*}"
   case "$first" in
-    "headers"|"health"|"status"|"lb-check"|"_ping"|"leader-check"|"routed-leader-check"|"grab-election"|"reelect"|"metrics"|"tenants"|"raft-"*)
+    "headers"|"health"|"status"|"lb-check"|"_ping"|"leader-check"|"routed-leader-check"|"grab-election"|"reelect"|"metrics"|"tenants"|"all-tenants"|"reload-configuration"|"agents"|"agent"|"agent-"*|"seeds"|"seed"|"seed-"*|"access-token"|"debug"|"raft-"*)
       return 0 ;;
   esac
   return 1

@@ -117,7 +117,7 @@ run_case "-c api with leading slash, no tenant: unchanged" \
   ORCHESTRATOR_API="$api_a" $C -c api -P /clusters
 
 # --- global endpoints never carry the tenant ---
-for gp in health status lb-check _ping grab-election reelect metrics headers raft-state raft-peers raft-health "raft-yield-hint/node1" "leader-check/418"; do
+for gp in all-tenants/clusters-info reload-configuration agents seeds health status lb-check _ping grab-election reelect metrics headers raft-state raft-peers raft-health "raft-yield-hint/node1" "leader-check/418"; do
   run_case "global endpoint $gp has no tenant" \
     "/api/$gp" \
     ORCHESTRATOR_API="$api_a" $C -T t1 -c api -P "$gp"

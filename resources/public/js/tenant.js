@@ -17,7 +17,7 @@
   var TENANT_PATH = /\/web\/tenants\/([a-z0-9][a-z0-9_-]{0,62})(?=\/|$)/;
 
   // First path segment of the API endpoints that are global (never tenant-scoped).
-  var GLOBAL_API_SEGMENT = /^(headers|health|status|lb-check|_ping|leader-check|routed-leader-check|grab-election|reelect|metrics|tenants|raft-[^\/?#]*)$/;
+  var GLOBAL_API_SEGMENT = /^(headers|health|status|lb-check|_ping|leader-check|routed-leader-check|grab-election|reelect|metrics|tenants|all-tenants|reload-configuration|agents|agent|agent-[^\/?#]*|seeds|seed|seed-[^\/?#]*|access-token|debug|raft-[^\/?#]*)$/;
 
   // Web pages that make sense on any tenant (the rest are specific to a tenant's clusters and instances).
   var TENANT_AGNOSTIC_PAGES = {

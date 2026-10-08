@@ -55,7 +55,7 @@ test('web links are scoped to the tenant', () => {
 });
 test('global API endpoints are never scoped', () => {
   for (const g of ['health', 'status', 'leader-check', 'routed-leader-check', 'lb-check', '_ping', 'grab-election', 'reelect',
-    'metrics', 'headers', 'tenants', 'raft-state', 'raft-peers', 'raft-yield-hint/node1', 'raft-health?x=1', 'leader-check/418']) {
+    'metrics', 'headers', 'tenants', 'all-tenants/clusters-info', 'reload-configuration', 'agents', 'seeds', 'raft-state', 'raft-peers', 'raft-yield-hint/node1', 'raft-health?x=1', 'leader-check/418']) {
     assert.strictEqual(T.rewriteUrl('/api/' + g, page), '/api/' + g, g);
   }
 });
