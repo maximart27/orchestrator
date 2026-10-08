@@ -12,7 +12,8 @@ import (
 // backend that kept its data) and, with the pre-fix lazy snapshot, after a restore. This
 // applies every command of CommandApplier twice and compares the state with the state
 // after applying it once. The test FAILS for none of them: it asserts the CURRENT,
-// documented behaviour so that a change in it is noticed.
+// documented behaviour so that a change in it is noticed. (The one that was not idempotent,
+// write-recovery-step, is since the leader stamps the step with its instant.)
 func TestApplierReapplyingACommandIsIdempotentOrDocumented(t *testing.T) {
 	key := inst.InstanceKey{Hostname: "db1", Port: 3306}
 	downtime := inst.NewDowntime(&key, "me", "r", time.Hour)
@@ -44,8 +45,10 @@ func TestApplierReapplyingACommandIsIdempotentOrDocumented(t *testing.T) {
 		{op: "submit-pool-instances", value: inst.PoolInstancesSubmission{Pool: "p", DelimitedInstances: "db1:3306,db2:3306"}, idempotent: true},
 		{op: "register-failure-detection", value: analysis, idempotent: true},
 		{op: "write-recovery", value: recovery, idempotent: true},
+		{op: "write-recovery-step", value: TopologyRecoveryStep{RecoveryUID: "uid-1", Message: "step", AuditAt: "2026-01-02 03:04:05"}, setup: []opCase{writeRecovery},
+			idempotent: true},
 		{op: "write-recovery-step", value: TopologyRecoveryStep{RecoveryUID: "uid-1", Message: "step"}, setup: []opCase{writeRecovery},
-			idempotent: false, note: "inserts a row per application (auto-increment id, no natural key)"},
+			idempotent: false, note: "an entry without AuditAt (log of a version that did not stamp the step) has no natural key: a row per application"},
 		{op: "resolve-recovery", value: recovery, setup: []opCase{writeRecovery}, idempotent: true},
 		{op: "ack-recovery", value: RecoveryAcknowledgement{Owner: "me", Comment: "c", AllRecoveries: true}, setup: []opCase{writeRecovery}, idempotent: true},
 		{op: "disable-global-recoveries", idempotent: true},
@@ -59,7 +62,11 @@ func TestApplierReapplyingACommandIsIdempotentOrDocumented(t *testing.T) {
 
 	for _, tc := range cases {
 		tc := tc
-		t.Run(tc.op, func(t *testing.T) {
+		name := tc.op
+		if tc.op == "write-recovery-step" && !tc.idempotent {
+			name += "-without-audit-at"
+		}
+		t.Run(name, func(t *testing.T) {
 			m, _ := newTestManager(t, []string{"a"}, nil)
 			tn := mustTenant(t, m, "a")
 			applier := NewCommandApplier(m)

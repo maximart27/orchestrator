@@ -19,10 +19,13 @@ package logic
 import (
 	"bytes"
 	"compress/gzip"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
+	"strings"
+	"sync"
 
 	"github.com/proxysql/orchestrator/go/inst"
 
@@ -78,32 +81,68 @@ type snapshotDataV1 struct {
 	LeaderURI string
 }
 
-// snapshotTables are the tables of a tenant's backend that a snapshot carries,
-// by the TenantSnapshot field that holds them.
-func (ts *TenantSnapshot) tables() []struct {
+// snapshotTable is a table of a tenant's backend that a snapshot carries, with the
+// TenantSnapshot field that holds it and how it is restored.
+type snapshotTable struct {
 	name string
 	data *sqlutils.NamedResultData
-} {
-	return []struct {
-		name string
-		data *sqlutils.NamedResultData
-	}{
-		{"cluster_alias", &ts.ClusterAlias},
-		{"cluster_alias_override", &ts.ClusterAliasOverride},
-		{"cluster_domain_name", &ts.ClusterDomainName},
-		{"access_token", &ts.AccessToken},
-		{"host_attributes", &ts.HostAttributes},
-		{"database_instance_tags", &ts.InstanceTags},
-		{"database_instance_pool", &ts.PoolInstances},
-		{"hostname_resolve", &ts.HostnameResolves},
-		{"hostname_unresolve", &ts.HostnameUnresolves},
-		{"database_instance_downtime", &ts.DowntimedInstances},
-		{"candidate_database_instance", &ts.Candidates},
-		{"topology_failure_detection", &ts.Detections},
-		{"kv_store", &ts.KVStore},
-		{"topology_recovery", &ts.Recovery},
-		{"topology_recovery_steps", &ts.RecoverySteps},
-		{"cluster_injected_pseudo_gtid", &ts.InjectedPseudoGTIDClusters},
+	// authoritative tables are written by Raft commands only: the snapshot is their
+	// whole content, so restoring one deletes what it does not hold (a row the leader
+	// deleted while this node was down would otherwise stay here forever: nothing
+	// replays a delete that is behind the snapshot). The others are also written by
+	// the node itself and are only added to (REPLACE), never emptied.
+	authoritative bool
+}
+
+// tables lists the tables of a tenant's backend that a snapshot carries.
+//
+// Classification (who writes the table; "applier" is CommandApplier, i.e. Raft):
+//
+//	table                         writers                                                       restore
+//	cluster_alias                 local: UpdateClusterAliases on every tick, from the           additive
+//	                              discovered instances; ReplaceAliasClusterName
+//	cluster_alias_override        applier: set-cluster-alias-manual-override                    authoritative
+//	cluster_domain_name           local: discovery (ReadTopologyInstance), local expiry         additive
+//	access_token                  node control data (process.Control), not tenant data; in a    additive (NEVER
+//	                              legacy setup it shares the backend of the default tenant      emptied: it would
+//	                                                                                            wipe this node's
+//	                                                                                            API tokens)
+//	host_attributes               local: HTTP API on the node that receives the call, no        additive
+//	                              Raft command
+//	database_instance_tags        applier: put-/delete-instance-tag                             authoritative
+//	database_instance_pool        applier: submit-pool-instances (+ time based expiry)          authoritative
+//	hostname_resolve              local: hostname resolution of each node                       additive
+//	hostname_unresolve            applier: register-hostname-unresolve (+ time based expiry)    authoritative
+//	database_instance_downtime    applier: begin-/end-downtime (+ time based expiry)            authoritative
+//	candidate_database_instance   applier: register-candidate (+ time based expiry)             authoritative
+//	topology_failure_detection    applier: register-failure-detection, ack-recovery             authoritative
+//	kv_store                      applier: put-key-value                                        authoritative
+//	topology_recovery             applier: write-/resolve-/ack-recovery                         authoritative
+//	topology_recovery_steps       applier: write-recovery-step                                  authoritative
+//	cluster_injected_pseudo_gtid  applier: injected-pseudo-gtid (+ time based expiry)           authoritative
+//
+// database_instance (the instances, MinimalInstances) is also written by the local
+// discovery and is reconciled apart, by the "keys" block of restoreSnapshot (guard of PR #124). The
+// time based expiry runs on every node over rows the leader's snapshot already
+// reflects, so it does not make a table "mixed".
+func (ts *TenantSnapshot) tables() []snapshotTable {
+	return []snapshotTable{
+		{"cluster_alias", &ts.ClusterAlias, false},
+		{"cluster_alias_override", &ts.ClusterAliasOverride, true},
+		{"cluster_domain_name", &ts.ClusterDomainName, false},
+		{"access_token", &ts.AccessToken, false},
+		{"host_attributes", &ts.HostAttributes, false},
+		{"database_instance_tags", &ts.InstanceTags, true},
+		{"database_instance_pool", &ts.PoolInstances, true},
+		{"hostname_resolve", &ts.HostnameResolves, false},
+		{"hostname_unresolve", &ts.HostnameUnresolves, true},
+		{"database_instance_downtime", &ts.DowntimedInstances, true},
+		{"candidate_database_instance", &ts.Candidates, true},
+		{"topology_failure_detection", &ts.Detections, true},
+		{"kv_store", &ts.KVStore, true},
+		{"topology_recovery", &ts.Recovery, true},
+		{"topology_recovery_steps", &ts.RecoverySteps, true},
+		{"cluster_injected_pseudo_gtid", &ts.InjectedPseudoGTIDClusters, true},
 	}
 }
 
@@ -121,14 +160,50 @@ func (t *Tenant) readTableData(tableName string, data *sqlutils.NamedResultData)
 	return log.Errore(err)
 }
 
-// writeTableData writes a table into the tenant's backend.
-func (t *Tenant) writeTableData(tableName string, data *sqlutils.NamedResultData) error {
-	orcdb, err := t.Backend.Open()
-	if err != nil {
-		return log.Errore(err)
+// writeTables writes the tables of a snapshot into the tenant's backend in ONE
+// transaction: if anything fails nothing of it is applied. A table the snapshot
+// does not carry (no columns: e.g. a snapshot of an older version) is left alone.
+func (t *Tenant) writeTables(tables []snapshotTable) error {
+	return t.Store.ExecDBWriteFunc(func() error {
+		orcdb, err := t.Backend.Open()
+		if err != nil {
+			return err
+		}
+		tx, err := orcdb.Begin()
+		if err != nil {
+			return err
+		}
+		for _, table := range tables {
+			if err := writeTableTx(tx, table); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("table %s: %w", table.name, err)
+			}
+		}
+		return tx.Commit()
+	})
+}
+
+func writeTableTx(tx *sql.Tx, table snapshotTable) error {
+	data := table.data
+	if len(data.Columns) == 0 {
+		return nil
 	}
-	err = sqlutils.WriteTable(orcdb, tableName, *data)
-	return log.Errore(err)
+	if table.authoritative {
+		if _, err := tx.Exec(fmt.Sprintf("delete from %s", table.name)); err != nil {
+			return err
+		}
+	}
+	if len(data.Data) == 0 {
+		return nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(data.Columns)), ",")
+	query := fmt.Sprintf("replace into %s (%s) values (%s)", table.name, strings.Join(data.Columns, ","), placeholders)
+	for _, row := range data.Data {
+		if _, err := tx.Exec(query, row.Args()...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // createSnapshot reads the state of the tenant from ITS backend. It fails as a
@@ -154,19 +229,46 @@ func (t *Tenant) createSnapshot() (*TenantSnapshot, error) {
 	return ts, nil
 }
 
+// forEachTenantConcurrently runs f for every tenant, each in its own goroutine (their backends are
+// independent), and waits for all of them.
+func (m *TenantManager) forEachTenantConcurrently(f func(i int, t *Tenant)) {
+	var wg sync.WaitGroup
+	for i, t := range m.tenants {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f(i, t)
+		}()
+	}
+	wg.Wait()
+}
+
+// readSnapshots reads the state of every tenant, concurrently. A tenant whose backend cannot be read
+// has a nil entry (and the error is logged): an empty entry would make the nodes that restore the
+// snapshot forget the instances of the tenant.
+func (m *TenantManager) readSnapshots() []*TenantSnapshot {
+	snapshots := make([]*TenantSnapshot, len(m.tenants))
+	m.forEachTenantConcurrently(func(i int, t *Tenant) {
+		ts, err := t.createSnapshot()
+		if err != nil {
+			_ = log.Errorf("raft snapshot: tenant %s is omitted from the snapshot, its backend could not be read: %+v", t.ID, err)
+			return
+		}
+		snapshots[i] = ts
+	})
+	return snapshots
+}
+
 // CreateSnapshotData reads the state of every tenant. A tenant whose backend
 // cannot be read is left out of the snapshot (and the error logged): an empty
 // entry would make the nodes that restore it forget the instances of the tenant.
 func (m *TenantManager) CreateSnapshotData() *SnapshotData {
 	snapshotData := NewSnapshotData()
 	snapshotData.LeaderURI = orcraft.LeaderURI.Get()
-	for _, t := range m.tenants {
-		ts, err := t.createSnapshot()
-		if err != nil {
-			_ = log.Errorf("raft snapshot: tenant %s is omitted from the snapshot, its backend could not be read: %+v", t.ID, err)
-			continue
+	for i, ts := range m.readSnapshots() {
+		if ts != nil {
+			snapshotData.Tenants[m.tenants[i].ID] = ts
 		}
-		snapshotData.Tenants[t.ID] = ts
 	}
 	log.Debugf("raft snapshot data created")
 	return snapshotData
@@ -190,21 +292,89 @@ func (s *SnapshotDataCreatorApplier) tenants() *TenantManager {
 	return s.manager
 }
 
-func (s *SnapshotDataCreatorApplier) GetData() (data []byte, err error) {
-	snapshotData := s.tenants().CreateSnapshotData()
-	b, err := json.Marshal(snapshotData)
-	if err != nil {
-		return b, err
-	}
+func gzipped(b ...[]byte) ([]byte, error) {
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
-	if _, err := zw.Write(b); err != nil {
-		return b, err
+	for _, chunk := range b {
+		if _, err := zw.Write(chunk); err != nil {
+			return nil, err
+		}
 	}
 	if err := zw.Close(); err != nil {
-		return b, err
+		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// GetData reads the state of every tenant and encodes it (gzip of a SnapshotData in JSON).
+//
+// The FSM is stopped while this runs (the snapshot is the state at a point of the log), so it is
+// concurrent per tenant: the tenants are read and marshalled each in its own goroutine and the
+// pieces are compressed concurrently too, as the members of a multi-member gzip stream, which is
+// still one gzip stream that every reader of a snapshot (decodeSnapshot, older nodes) decodes.
+func (s *SnapshotDataCreatorApplier) GetData() (data []byte, err error) {
+	manager := s.tenants()
+	leaderURI, err := json.Marshal(orcraft.LeaderURI.Get())
+	if err != nil {
+		return nil, err
+	}
+	snapshots := manager.readSnapshots()
+	marshalled := make([][]byte, len(snapshots))
+	errs := make([]error, len(snapshots))
+	manager.forEachTenantConcurrently(func(i int, t *Tenant) {
+		if snapshots[i] == nil {
+			return
+		}
+		body, err := json.Marshal(snapshots[i])
+		if err != nil {
+			errs[i] = err
+			return
+		}
+		id, err := json.Marshal(t.ID)
+		if err != nil {
+			errs[i] = err
+			return
+		}
+		marshalled[i] = append(append(id, ':'), body...)
+	})
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// {"FormatVersion":2,"LeaderURI":...,"Tenants":{<id>:<state>,<id>:<state>}}
+	pieces := [][]byte{[]byte(fmt.Sprintf(`{"FormatVersion":%d,"LeaderURI":%s,"Tenants":{`, SnapshotFormatVersion, leaderURI))}
+	for _, piece := range marshalled {
+		if piece == nil {
+			continue
+		}
+		if len(pieces) > 1 {
+			piece = append([]byte{','}, piece...)
+		}
+		pieces = append(pieces, piece)
+	}
+	pieces = append(pieces, []byte(`}}`))
+
+	members := make([][]byte, len(pieces))
+	memberErrs := make([]error, len(pieces))
+	var wg sync.WaitGroup
+	for i := range pieces {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			members[i], memberErrs[i] = gzipped(pieces[i])
+		}()
+	}
+	wg.Wait()
+	var out bytes.Buffer
+	for i, member := range members {
+		if memberErrs[i] != nil {
+			return nil, memberErrs[i]
+		}
+		out.Write(member)
+	}
+	return out.Bytes(), nil
 }
 
 // decodeSnapshot reads a snapshot of any known format version as SnapshotData.
@@ -275,7 +445,7 @@ func (s *SnapshotDataCreatorApplier) Restore(rc io.ReadCloser) error {
 }
 
 // restoreSnapshot restores the state of the tenant from its part of a snapshot.
-func (t *Tenant) restoreSnapshot(snapshotData *TenantSnapshot) {
+func (t *Tenant) restoreSnapshot(snapshotData *TenantSnapshot) error {
 	// keys
 	{
 		snapshotInstanceKeyMap := inst.NewInstanceKeyMap()
@@ -341,14 +511,16 @@ func (t *Tenant) restoreSnapshot(snapshotData *TenantSnapshot) {
 		}
 		log.Debugf("raft snapshot restore: tenant %s: discovered %+v keys", t.ID, discoveredKeys)
 	}
-	for _, table := range snapshotData.tables() {
-		_ = t.writeTableData(table.name, table.data)
+	tablesErr := t.writeTables(snapshotData.tables())
+	if tablesErr != nil {
+		_ = log.Errorf("raft snapshot restore: tenant %s: the tables were left as they were, restoring them failed: %+v", t.ID, tablesErr)
 	}
 
 	// recovery disable
 	{
 		_ = t.SetRecoveryDisabled(snapshotData.RecoveryDisabled)
 	}
+	return tablesErr
 }
 
 // CreateSnapshotData reads the state of every tenant of the default manager.

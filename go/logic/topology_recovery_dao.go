@@ -17,8 +17,10 @@
 package logic
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
@@ -358,7 +360,14 @@ func (t *Tenant) ExpireBlockedRecoveries() error {
 	return log.Errore(err)
 }
 
-// acknowledgeRecoveries sets acknowledged* details and clears the in_active_period flags from a set of entries
+// acknowledgeRecoveries sets acknowledged* details and clears the in_active_period flags from a set of entries.
+//
+// Closing the active period of a recovery stamps end_active_period_unixtime, which is part of the unique
+// index (hostname, port, in_active_period, end_active_period_unixtime) of topology_recovery. Stamping it
+// with the second of the node's clock made the outcome depend on that clock: two recoveries of an instance
+// acknowledged within the same second collided on the node that applied them in that second, and not on a
+// node that applied them in different seconds. The stamp is now never lower than the last one of the
+// instance plus one, so an acknowledgement does not fail whatever second it is applied in, on any node.
 func (t *Tenant) acknowledgeRecoveries(owner string, comment string, markEndRecovery bool, whereClause string, args []interface{}) (countAcknowledgedEntries int64, err error) {
 	additionalSet := ``
 	if markEndRecovery {
@@ -366,27 +375,113 @@ func (t *Tenant) acknowledgeRecoveries(owner string, comment string, markEndReco
 				end_recovery=IFNULL(end_recovery, NOW()),
 			`
 	}
-	query := fmt.Sprintf(`
+	selectQuery := t.Backend.TranslateStatement(fmt.Sprintf(`
+			select
+				recovery_id, hostname, port, end_active_period_unixtime
+			from
+				topology_recovery
+			where
+				acknowledged = 0
+				and
+				%s
+		`, whereClause))
+	updateQuery := t.Backend.TranslateStatement(fmt.Sprintf(`
 			update topology_recovery set
 				in_active_period = 0,
-				end_active_period_unixtime = case when end_active_period_unixtime = 0 then UNIX_TIMESTAMP() else end_active_period_unixtime end,
+				end_active_period_unixtime = ?,
 				%s
 				acknowledged = 1,
 				acknowledged_at = NOW(),
 				acknowledged_by = ?,
 				acknowledge_comment = ?
 			where
-				acknowledged = 0
-				and
-				%s
-		`, additionalSet, whereClause)
-	args = append(sqlutils.Args(owner, comment), args...)
-	sqlResult, err := t.Backend.Exec(query, args...)
+				recovery_id = ?
+		`, additionalSet))
+	lastEndQuery := `
+			select
+				IFNULL(max(end_active_period_unixtime), 0) as last_end
+			from
+				topology_recovery
+			where
+				hostname = ? and port = ? and in_active_period = 0
+		`
+
+	err = t.Store.ExecDBWriteFunc(func() error {
+		orcdb, err := t.Backend.Open()
+		if err != nil {
+			return err
+		}
+		tx, err := orcdb.Begin()
+		if err != nil {
+			return err
+		}
+		type target struct {
+			id       int64
+			hostname string
+			port     int
+			end      int64
+		}
+		var targets []target
+		rows, err := tx.Query(selectQuery, args...)
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		for rows.Next() {
+			var tg target
+			var end sql.NullInt64
+			if err := rows.Scan(&tg.id, &tg.hostname, &tg.port, &end); err != nil {
+				_ = rows.Close()
+				_ = tx.Rollback()
+				return err
+			}
+			tg.end = end.Int64
+			targets = append(targets, tg)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			_ = tx.Rollback()
+			return err
+		}
+		_ = rows.Close()
+
+		var acknowledged int64
+		now := time.Now().Unix()
+		for _, tg := range targets {
+			end := tg.end
+			if end == 0 {
+				var lastEnd int64
+				if err := tx.QueryRow(lastEndQuery, tg.hostname, tg.port).Scan(&lastEnd); err != nil {
+					_ = tx.Rollback()
+					return err
+				}
+				end = now
+				if end <= lastEnd {
+					end = lastEnd + 1
+				}
+			}
+			result, err := tx.Exec(updateQuery, end, owner, comment, tg.id)
+			if err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+			n, err := result.RowsAffected()
+			if err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+			acknowledged += n
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		countAcknowledgedEntries = acknowledged
+		return nil
+	})
 	if err != nil {
 		return 0, log.Errore(err)
 	}
-	rows, err := sqlResult.RowsAffected()
-	return rows, log.Errore(err)
+	return countAcknowledgedEntries, nil
 }
 
 // AcknowledgeAllRecoveries acknowledges all unacknowledged recoveries.
@@ -806,17 +901,47 @@ func (t *Tenant) ReadBlockedRecoveries(clusterName string) ([]BlockedTopologyRec
 	return res, log.Errore(err)
 }
 
-// writeTopologyRecoveryStep writes down a single step in a recovery process
+// writeTopologyRecoveryStep writes down a single step in a recovery process.
+//
+// A step that comes with its AuditAt (the leader stamps it when it publishes the step) is written
+// at most once: Raft re-applies log entries after a restart over a backend that kept its data, and
+// the same step (recovery, instant, message) is not written again. A step without AuditAt (written
+// without Raft, or an entry of a log of a version that did not stamp it) has no natural key and is
+// always inserted, with the clock of the node.
 func (t *Tenant) writeTopologyRecoveryStep(topologyRecoveryStep *TopologyRecoveryStep) error {
-	sqlResult, err := t.Backend.Exec(`
+	var sqlResult sql.Result
+	var err error
+	if topologyRecoveryStep.AuditAt == "" {
+		sqlResult, err = t.Backend.Exec(`
 			insert ignore
 				into topology_recovery_steps (
 					recovery_step_id, recovery_uid, audit_at, message
 				) values (?, ?, now(), ?)
 			`, sqlutils.NilIfZero(topologyRecoveryStep.Id), topologyRecoveryStep.RecoveryUID, topologyRecoveryStep.Message,
-	)
+		)
+	} else {
+		// (select 1) as d: a SELECT with a WHERE needs a FROM clause in MySQL, and this is valid in SQLite too
+		sqlResult, err = t.Backend.Exec(`
+			insert ignore
+				into topology_recovery_steps (
+					recovery_step_id, recovery_uid, audit_at, message
+				)
+				select ?, ?, ?, ?
+				from (select 1) as d
+				where not exists (
+					select 1
+						from topology_recovery_steps
+						where recovery_uid = ? and audit_at = ? and message = ?
+				)
+			`, sqlutils.NilIfZero(topologyRecoveryStep.Id), topologyRecoveryStep.RecoveryUID, topologyRecoveryStep.AuditAt, topologyRecoveryStep.Message,
+			topologyRecoveryStep.RecoveryUID, topologyRecoveryStep.AuditAt, topologyRecoveryStep.Message,
+		)
+	}
 	if err != nil {
 		return log.Errore(err)
+	}
+	if rows, err := sqlResult.RowsAffected(); err == nil && rows == 0 {
+		return nil // already there
 	}
 	topologyRecoveryStep.Id, err = sqlResult.LastInsertId()
 	return log.Errore(err)

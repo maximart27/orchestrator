@@ -187,6 +187,13 @@ func (t *Tenant) auditTopologyRecoveryDefault(topologyRecovery *TopologyRecovery
 
 	recoveryStep := NewTopologyRecoveryStep(topologyRecovery.UID, message)
 	if orcraft.IsRaftEnabled() {
+		// the leader stamps the step: every node (and every re-application) writes the same instant,
+		// which is what makes the write idempotent. The backend's NOW() is UTC in SQLite, local in MySQL.
+		now := time.Now()
+		if t.Backend.IsSQLite() {
+			now = now.UTC()
+		}
+		recoveryStep.AuditAt = now.Format("2006-01-02 15:04:05")
 		_, err := orcraft.PublishTenantCommand(t.ID, "write-recovery-step", recoveryStep)
 		return err
 	}
