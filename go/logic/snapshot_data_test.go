@@ -70,15 +70,14 @@ func setupSQLiteBackend(t *testing.T) {
 	waitForInstanceDaoInit(t)
 	origBackendDB := config.Config.BackendDB
 	origSQLiteDataFile := config.Config.SQLite3DataFile
-	origHostnameResolveMethod := config.Config.HostnameResolveMethod
 	config.Config.BackendDB = "sqlite"
 	config.Config.SQLite3DataFile = filepath.Join(t.TempDir(), "orchestrator.sqlite3")
-	// avoid asynchronous hostname-resolve writes racing with the backend switch
-	config.Config.HostnameResolveMethod = "none"
+	// TestMain already keeps hostname resolution local-only, so that asynchronous
+	// hostname-resolve writes do not race with the backend switch (and this test
+	// must not write that field again while they read it)
 	t.Cleanup(func() {
 		config.Config.BackendDB = origBackendDB
 		config.Config.SQLite3DataFile = origSQLiteDataFile
-		config.Config.HostnameResolveMethod = origHostnameResolveMethod
 	})
 	_, err := db.OpenOrchestrator()
 	test.S(t).ExpectNil(err)
@@ -161,11 +160,13 @@ func TestSnapshotRestoreRetainsRecentlySeenInstances(t *testing.T) {
 	setInstanceLastSeen(t, "stale", 3306, 300)
 
 	snapshotData := NewSnapshotData()
-	snapshotData.MinimalInstances = []inst.MinimalInstance{
-		{Key: inst.InstanceKey{Hostname: "in-snapshot", Port: 3306}},
+	snapshotData.Tenants[config.DefaultTenantID] = &TenantSnapshot{
+		MinimalInstances: []inst.MinimalInstance{
+			{Key: inst.InstanceKey{Hostname: "in-snapshot", Port: 3306}},
+		},
 	}
 
-	applier := NewSnapshotDataCreatorApplier()
+	applier := NewSnapshotDataCreatorApplier(nil)
 	test.S(t).ExpectNil(applier.Restore(mkSnapshotReader(t, snapshotData)))
 
 	keyMap := readInstanceKeyMap(t)
@@ -192,8 +193,9 @@ func TestSnapshotRestoreForgetsUnseenStaleInstances(t *testing.T) {
 	setInstanceLastSeen(t, "stale-b", 3307, 2)
 
 	snapshotData := NewSnapshotData()
+	snapshotData.Tenants[config.DefaultTenantID] = &TenantSnapshot{}
 
-	applier := NewSnapshotDataCreatorApplier()
+	applier := NewSnapshotDataCreatorApplier(nil)
 	test.S(t).ExpectNil(applier.Restore(mkSnapshotReader(t, snapshotData)))
 
 	keyMap := readInstanceKeyMap(t)

@@ -26,35 +26,40 @@ import (
 	"github.com/proxysql/orchestrator/go/inst"
 )
 
-func stubAuditNoBackend(t *testing.T) {
+// stubAuditNoBackend replaces the recovery audit of the legacy default tenant,
+// whose configuration is the global config.Config these tests change, and returns it.
+func stubAuditNoBackend(t *testing.T) *Tenant {
 	t.Helper()
-	orig := auditTopologyRecoveryFn
-	auditTopologyRecoveryFn = func(tr *TopologyRecovery, message string) error {
+	dt := DefaultTenant()
+	orig := dt.auditTopologyRecoveryFn
+	dt.auditTopologyRecoveryFn = func(tr *TopologyRecovery, message string) error {
 		return nil
 	}
-	t.Cleanup(func() { auditTopologyRecoveryFn = orig })
+	t.Cleanup(func() { dt.auditTopologyRecoveryFn = orig })
+	return dt
 }
 
 func TestFailOnPostFailoverHookErrorFollowsConfig(t *testing.T) {
 	orig := config.Config.FailRecoveryOnFailedPostFailoverProcesses
 	defer func() { config.Config.FailRecoveryOnFailedPostFailoverProcesses = orig }()
 
+	dt := DefaultTenant()
 	config.Config.FailRecoveryOnFailedPostFailoverProcesses = false
-	if failOnPostFailoverHookError() {
+	if dt.failOnPostFailoverHookError() {
 		t.Fatal("expected false when config disabled")
 	}
 	config.Config.FailRecoveryOnFailedPostFailoverProcesses = true
-	if !failOnPostFailoverHookError() {
+	if !dt.failOnPostFailoverHookError() {
 		t.Fatal("expected true when config enabled")
 	}
 }
 
 func TestMarkRecoveryUnsuccessfulDueToHooks(t *testing.T) {
-	stubAuditNoBackend(t)
+	dt := stubAuditNoBackend(t)
 	tr := NewTopologyRecovery(inst.ReplicationAnalysis{})
 	tr.IsSuccessful = true
 
-	markRecoveryUnsuccessfulDueToHooks(tr, errors.New("hook boom"))
+	dt.markRecoveryUnsuccessfulDueToHooks(tr, errors.New("hook boom"))
 	if tr.IsSuccessful {
 		t.Fatal("expected IsSuccessful=false")
 	}
@@ -66,41 +71,41 @@ func TestMarkRecoveryUnsuccessfulDueToHooks(t *testing.T) {
 	}
 
 	// nil-safe
-	markRecoveryUnsuccessfulDueToHooks(nil, errors.New("x"))
-	markRecoveryUnsuccessfulDueToHooks(tr, nil)
+	dt.markRecoveryUnsuccessfulDueToHooks(nil, errors.New("x"))
+	dt.markRecoveryUnsuccessfulDueToHooks(tr, nil)
 }
 
 func TestExecuteProcessesFailOnError(t *testing.T) {
-	stubAuditNoBackend(t)
+	dt := stubAuditNoBackend(t)
 	if _, err := exec.LookPath("false"); err != nil {
 		t.Skip("false binary not available")
 	}
 	tr := NewTopologyRecovery(inst.ReplicationAnalysis{})
 
-	err := executeProcesses([]string{"false"}, "TestHooks", tr, true)
+	err := dt.executeProcesses([]string{"false"}, "TestHooks", tr, true)
 	if err == nil {
 		t.Fatal("expected error when failOnError=true and command fails")
 	}
 
-	err = executeProcesses([]string{"false", "true"}, "TestHooks", tr, false)
+	err = dt.executeProcesses([]string{"false", "true"}, "TestHooks", tr, false)
 	// failOnError=false: returns first error but continues (true still runs)
 	if err == nil {
 		t.Fatal("expected first command error to be returned even when failOnError=false")
 	}
 
-	err = executeProcesses([]string{"true"}, "TestHooks", tr, true)
+	err = dt.executeProcesses([]string{"true"}, "TestHooks", tr, true)
 	if err != nil {
 		t.Fatalf("true should succeed: %v", err)
 	}
 
-	err = executeProcesses(nil, "TestHooks", tr, true)
+	err = dt.executeProcesses(nil, "TestHooks", tr, true)
 	if err != nil {
 		t.Fatalf("empty hooks should succeed: %v", err)
 	}
 }
 
 func TestRunPostSuccessFailoverProcessesPolicyOff(t *testing.T) {
-	stubAuditNoBackend(t)
+	dt := stubAuditNoBackend(t)
 	if _, err := exec.LookPath("false"); err != nil {
 		t.Skip("false binary not available")
 	}
@@ -113,7 +118,7 @@ func TestRunPostSuccessFailoverProcessesPolicyOff(t *testing.T) {
 	key := inst.InstanceKey{Hostname: "successor.example", Port: 3306}
 	tr.SuccessorKey = &key
 
-	err := runPostSuccessFailoverProcesses([]string{"false"}, "PostFailoverProcesses", tr)
+	err := dt.runPostSuccessFailoverProcesses([]string{"false"}, "PostFailoverProcesses", tr)
 	if err != nil {
 		t.Fatalf("policy off should not return error: %v", err)
 	}
@@ -123,7 +128,7 @@ func TestRunPostSuccessFailoverProcessesPolicyOff(t *testing.T) {
 }
 
 func TestRunPostSuccessFailoverProcessesPolicyOn(t *testing.T) {
-	stubAuditNoBackend(t)
+	dt := stubAuditNoBackend(t)
 	if _, err := exec.LookPath("false"); err != nil {
 		t.Skip("false binary not available")
 	}
@@ -131,23 +136,23 @@ func TestRunPostSuccessFailoverProcessesPolicyOn(t *testing.T) {
 	defer func() { config.Config.FailRecoveryOnFailedPostFailoverProcesses = orig }()
 	config.Config.FailRecoveryOnFailedPostFailoverProcesses = true
 
-	origPersist := persistResolvedRecoveryFn
+	origPersist := dt.persistResolvedRecoveryFn
 	persistCalls := 0
-	persistResolvedRecoveryFn = func(tr *TopologyRecovery) error {
+	dt.persistResolvedRecoveryFn = func(tr *TopologyRecovery) error {
 		persistCalls++
 		if tr.IsSuccessful {
 			t.Error("persist should see IsSuccessful=false")
 		}
 		return nil
 	}
-	defer func() { persistResolvedRecoveryFn = origPersist }()
+	defer func() { dt.persistResolvedRecoveryFn = origPersist }()
 
 	tr := NewTopologyRecovery(inst.ReplicationAnalysis{})
 	tr.IsSuccessful = true
 	key := inst.InstanceKey{Hostname: "successor.example", Port: 3306}
 	tr.SuccessorKey = &key
 
-	err := runPostSuccessFailoverProcesses([]string{"false"}, "PostFailoverProcesses", tr)
+	err := dt.runPostSuccessFailoverProcesses([]string{"false"}, "PostFailoverProcesses", tr)
 	if err == nil {
 		t.Fatal("policy on should return hook error")
 	}
@@ -160,7 +165,7 @@ func TestRunPostSuccessFailoverProcessesPolicyOn(t *testing.T) {
 }
 
 func TestRunPostSuccessFailoverProcessesPolicyOnPersistError(t *testing.T) {
-	stubAuditNoBackend(t)
+	dt := stubAuditNoBackend(t)
 	if _, err := exec.LookPath("false"); err != nil {
 		t.Skip("false binary not available")
 	}
@@ -168,16 +173,16 @@ func TestRunPostSuccessFailoverProcessesPolicyOnPersistError(t *testing.T) {
 	defer func() { config.Config.FailRecoveryOnFailedPostFailoverProcesses = orig }()
 	config.Config.FailRecoveryOnFailedPostFailoverProcesses = true
 
-	origPersist := persistResolvedRecoveryFn
-	persistResolvedRecoveryFn = func(tr *TopologyRecovery) error {
+	origPersist := dt.persistResolvedRecoveryFn
+	dt.persistResolvedRecoveryFn = func(tr *TopologyRecovery) error {
 		return errors.New("db down")
 	}
-	defer func() { persistResolvedRecoveryFn = origPersist }()
+	defer func() { dt.persistResolvedRecoveryFn = origPersist }()
 
 	tr := NewTopologyRecovery(inst.ReplicationAnalysis{})
 	tr.IsSuccessful = true
 
-	err := runPostSuccessFailoverProcesses([]string{"false"}, "PostFailoverProcesses", tr)
+	err := dt.runPostSuccessFailoverProcesses([]string{"false"}, "PostFailoverProcesses", tr)
 	if err == nil {
 		t.Fatal("expected combined error")
 	}
@@ -190,7 +195,7 @@ func TestRunPostSuccessFailoverProcessesPolicyOnPersistError(t *testing.T) {
 }
 
 func TestRunPostSuccessFailoverProcessesSuccess(t *testing.T) {
-	stubAuditNoBackend(t)
+	dt := stubAuditNoBackend(t)
 	if _, err := exec.LookPath("true"); err != nil {
 		t.Skip("true binary not available")
 	}
@@ -198,17 +203,17 @@ func TestRunPostSuccessFailoverProcessesSuccess(t *testing.T) {
 	defer func() { config.Config.FailRecoveryOnFailedPostFailoverProcesses = orig }()
 	config.Config.FailRecoveryOnFailedPostFailoverProcesses = true
 
-	origPersist := persistResolvedRecoveryFn
-	persistResolvedRecoveryFn = func(tr *TopologyRecovery) error {
+	origPersist := dt.persistResolvedRecoveryFn
+	dt.persistResolvedRecoveryFn = func(tr *TopologyRecovery) error {
 		t.Fatal("persist should not run on success")
 		return nil
 	}
-	defer func() { persistResolvedRecoveryFn = origPersist }()
+	defer func() { dt.persistResolvedRecoveryFn = origPersist }()
 
 	tr := NewTopologyRecovery(inst.ReplicationAnalysis{})
 	tr.IsSuccessful = true
 
-	if err := runPostSuccessFailoverProcesses([]string{"true"}, "PostFailoverProcesses", tr); err != nil {
+	if err := dt.runPostSuccessFailoverProcesses([]string{"true"}, "PostFailoverProcesses", tr); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !tr.IsSuccessful {
