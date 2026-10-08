@@ -350,11 +350,6 @@ func (this *HttpAPI) ListTenants(w http.ResponseWriter, r *http.Request) {
 	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("%d tenants", len(statuses)), Details: statuses})
 }
 
-// V2Tenants answers GET /api/v2/tenants, the v2 form of ListTenants.
-func V2Tenants(w http.ResponseWriter, r *http.Request) {
-	respondOK(w, tenantStatuses(managerOf(nil)))
-}
-
 // renderTenantHTML renders a page; a page of a tenant workspace gets the
 // template variable tenantId.
 func renderTenantHTML(w http.ResponseWriter, r *http.Request, name string, data map[string]interface{}) {
