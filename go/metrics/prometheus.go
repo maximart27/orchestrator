@@ -17,6 +17,7 @@
 package metrics
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -27,39 +28,183 @@ import (
 	orcraft "github.com/proxysql/orchestrator/go/raft"
 )
 
-// Prometheus metric variables, exported so other packages can update them.
+// DefaultTenant is the value of the "tenant" label in single tenant (legacy) mode.
+const DefaultTenant = "default"
+
+// Tenant-scoped metrics are vectors with a "tenant" label, registered ONCE (see
+// InitPrometheus). Tenants never register anything: they obtain their children
+// through ForTenant. Process-wide metrics (health, raft) have no tenant label.
 var (
-	DiscoveriesTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	discoveriesTotalVec = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "orchestrator_discoveries_total",
 		Help: "Total number of discovery attempts.",
-	})
+	}, []string{"tenant"})
 
-	DiscoveryErrorsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	discoveryErrorsTotalVec = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "orchestrator_discovery_errors_total",
 		Help: "Total number of failed discoveries.",
-	})
+	}, []string{"tenant"})
 
-	InstancesTotal = prometheus.NewGauge(prometheus.GaugeOpts{
+	instancesTotalVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "orchestrator_instances_total",
 		Help: "Total number of known instances.",
-	})
+	}, []string{"tenant"})
 
-	ClustersTotal = prometheus.NewGauge(prometheus.GaugeOpts{
+	clustersTotalVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "orchestrator_clusters_total",
 		Help: "Total number of known clusters.",
-	})
+	}, []string{"tenant"})
 
-	RecoveriesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	recoveriesTotalVec = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "orchestrator_recoveries_total",
 		Help: "Total number of recovery attempts.",
-	}, []string{"type", "result"})
+	}, []string{"tenant", "type", "result"})
 
-	RecoveryDurationSeconds = prometheus.NewHistogram(prometheus.HistogramOpts{
+	recoveryDurationSecondsVec = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "orchestrator_recovery_duration_seconds",
 		Help:    "Duration of recovery operations in seconds.",
 		Buckets: prometheus.ExponentialBuckets(0.5, 2, 12), // 0.5s to ~1024s
-	})
+	}, []string{"tenant"})
 
+	discoveryQueueLengthVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "orchestrator_discovery_queue_length",
+		Help: "Length of the discovery queue.",
+	}, []string{"tenant"})
+
+	deadInstancesDiscoveryQueueLengthVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "orchestrator_dead_instances_discovery_queue_length",
+		Help: "Length of the dead instances discovery queue.",
+	}, []string{"tenant"})
+
+	activeRecoveriesVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "orchestrator_active_recoveries",
+		Help: "Number of active (in-progress) recoveries.",
+	}, []string{"tenant"})
+
+	downtimedInstancesVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "orchestrator_downtimed_instances_total",
+		Help: "Number of instances currently marked as downtimed.",
+	}, []string{"tenant"})
+
+	activeTopologyIssuesVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "orchestrator_active_topology_issues",
+		Help: "Number of active topology issues, broken down by issue type.",
+	}, []string{"tenant", "issue_type"})
+)
+
+// tenantVec is a vector with a "tenant" label.
+type tenantVec interface {
+	prometheus.Collector
+	DeletePartialMatch(labels prometheus.Labels) int
+}
+
+// tenantVecs lists every tenant-labelled vector, for registration and cleanup.
+var tenantVecs = []tenantVec{
+	discoveriesTotalVec,
+	discoveryErrorsTotalVec,
+	instancesTotalVec,
+	clustersTotalVec,
+	recoveriesTotalVec,
+	recoveryDurationSecondsVec,
+	discoveryQueueLengthVec,
+	deadInstancesDiscoveryQueueLengthVec,
+	activeRecoveriesVec,
+	downtimedInstancesVec,
+	activeTopologyIssuesVec,
+}
+
+// TenantMetrics gives one tenant access to its own series of the tenant-scoped
+// Prometheus metrics. Obtain it with ForTenant; it is safe for concurrent use.
+type TenantMetrics struct {
+	TenantID string
+
+	DiscoveriesTotal                  prometheus.Counter
+	DiscoveryErrorsTotal              prometheus.Counter
+	InstancesTotal                    prometheus.Gauge
+	ClustersTotal                     prometheus.Gauge
+	RecoveryDurationSeconds           prometheus.Observer
+	DiscoveryQueueLength              prometheus.Gauge
+	DeadInstancesDiscoveryQueueLength prometheus.Gauge
+	ActiveRecoveries                  prometheus.Gauge
+	DowntimedInstances                prometheus.Gauge
+
+	// RecoveriesTotal has the labels "type" and "result" (the tenant is already bound).
+	RecoveriesTotal *prometheus.CounterVec
+	// ActiveTopologyIssues has the label "issue_type" (the tenant is already bound).
+	// Do NOT call Reset() on it, that clears every tenant: use ResetActiveTopologyIssues.
+	ActiveTopologyIssues *prometheus.GaugeVec
+}
+
+var (
+	tenantMetricsMu sync.Mutex
+	tenantMetrics   = map[string]*TenantMetrics{}
+)
+
+// ForTenant returns the metrics of a tenant, creating its series on first use.
+// It never registers anything with Prometheus, so it can be called any number
+// of times for any tenant.
+func ForTenant(tenantID string) *TenantMetrics {
+	tenantMetricsMu.Lock()
+	defer tenantMetricsMu.Unlock()
+	if m, found := tenantMetrics[tenantID]; found {
+		return m
+	}
+	m := &TenantMetrics{
+		TenantID:                          tenantID,
+		DiscoveriesTotal:                  discoveriesTotalVec.WithLabelValues(tenantID),
+		DiscoveryErrorsTotal:              discoveryErrorsTotalVec.WithLabelValues(tenantID),
+		InstancesTotal:                    instancesTotalVec.WithLabelValues(tenantID),
+		ClustersTotal:                     clustersTotalVec.WithLabelValues(tenantID),
+		RecoveryDurationSeconds:           recoveryDurationSecondsVec.WithLabelValues(tenantID),
+		DiscoveryQueueLength:              discoveryQueueLengthVec.WithLabelValues(tenantID),
+		DeadInstancesDiscoveryQueueLength: deadInstancesDiscoveryQueueLengthVec.WithLabelValues(tenantID),
+		ActiveRecoveries:                  activeRecoveriesVec.WithLabelValues(tenantID),
+		DowntimedInstances:                downtimedInstancesVec.WithLabelValues(tenantID),
+		RecoveriesTotal:                   recoveriesTotalVec.MustCurryWith(prometheus.Labels{"tenant": tenantID}),
+		ActiveTopologyIssues:              activeTopologyIssuesVec.MustCurryWith(prometheus.Labels{"tenant": tenantID}),
+	}
+	tenantMetrics[tenantID] = m
+	return m
+}
+
+// ResetActiveTopologyIssues drops this tenant's topology issue series, leaving other tenants' untouched.
+func (m *TenantMetrics) ResetActiveTopologyIssues() {
+	activeTopologyIssuesVec.DeletePartialMatch(prometheus.Labels{"tenant": m.TenantID})
+}
+
+// Forget removes every series of the tenant (when it is removed from the process) and
+// forgets the TenantMetrics; a later ForTenant call starts from zero.
+func (m *TenantMetrics) Forget() {
+	tenantMetricsMu.Lock()
+	defer tenantMetricsMu.Unlock()
+	for _, v := range tenantVecs {
+		v.DeletePartialMatch(prometheus.Labels{"tenant": m.TenantID})
+	}
+	if tenantMetrics[m.TenantID] == m {
+		delete(tenantMetrics, m.TenantID)
+	}
+}
+
+// Legacy (single tenant) metric variables: the series of the DefaultTenant, exported so
+// other packages can keep updating them. Per-tenant code must use ForTenant instead.
+var (
+	defaultTenantMetrics = ForTenant(DefaultTenant)
+
+	DiscoveriesTotal                  = defaultTenantMetrics.DiscoveriesTotal
+	DiscoveryErrorsTotal              = defaultTenantMetrics.DiscoveryErrorsTotal
+	InstancesTotal                    = defaultTenantMetrics.InstancesTotal
+	ClustersTotal                     = defaultTenantMetrics.ClustersTotal
+	RecoveriesTotal                   = defaultTenantMetrics.RecoveriesTotal
+	RecoveryDurationSeconds           = defaultTenantMetrics.RecoveryDurationSeconds.(prometheus.Histogram)
+	DiscoveryQueueLength              = defaultTenantMetrics.DiscoveryQueueLength
+	DeadInstancesDiscoveryQueueLength = defaultTenantMetrics.DeadInstancesDiscoveryQueueLength
+	ActiveRecoveries                  = defaultTenantMetrics.ActiveRecoveries
+	DowntimedInstances                = defaultTenantMetrics.DowntimedInstances
+	ActiveTopologyIssues              = defaultTenantMetrics.ActiveTopologyIssues
+)
+
+// Process-wide metrics: node health and raft, not tenant-scoped (no tenant label).
+var (
 	HealthIsReady = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "orchestrator_health_is_ready",
 		Help: "1 if the node is ready, 0 otherwise.",
@@ -111,31 +256,6 @@ var (
 		return 0
 	})
 
-	DiscoveryQueueLength = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "orchestrator_discovery_queue_length",
-		Help: "Length of the discovery queue.",
-	})
-
-	DeadInstancesDiscoveryQueueLength = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "orchestrator_dead_instances_discovery_queue_length",
-		Help: "Length of the dead instances discovery queue.",
-	})
-
-	ActiveRecoveries = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "orchestrator_active_recoveries",
-		Help: "Number of active (in-progress) recoveries.",
-	})
-
-	DowntimedInstances = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "orchestrator_downtimed_instances_total",
-		Help: "Number of instances currently marked as downtimed.",
-	})
-
-	ActiveTopologyIssues = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "orchestrator_active_topology_issues",
-		Help: "Number of active topology issues, broken down by issue type.",
-	}, []string{"issue_type"})
-
 	RaftPeersTotal = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "orchestrator_raft_peers_total",
 		Help: "Number of known raft peers.",
@@ -160,28 +280,34 @@ var (
 )
 
 // InitPrometheus registers all Prometheus metrics. Should be called once at
-// startup when PrometheusEnabled is true.
+// startup when PrometheusEnabled is true. Registration happens once for the
+// whole process, never per tenant.
 func InitPrometheus() {
 	if !config.Config.PrometheusEnabled {
 		return
 	}
 	log.Info("Initializing Prometheus metrics")
-	prometheus.MustRegister(
-		DiscoveriesTotal,
-		DiscoveryErrorsTotal,
-		InstancesTotal,
-		ClustersTotal,
-		RecoveriesTotal,
-		RecoveryDurationSeconds,
+	registerPrometheus(prometheus.DefaultRegisterer)
+}
+
+var prometheusRegisterOnce sync.Once
+
+func registerPrometheus(reg prometheus.Registerer) {
+	prometheusRegisterOnce.Do(func() {
+		registerPrometheusUnchecked(reg)
+	})
+}
+
+// registerPrometheusUnchecked registers every collector, panicking on duplicates.
+func registerPrometheusUnchecked(reg prometheus.Registerer) {
+	for _, v := range tenantVecs {
+		reg.MustRegister(v)
+	}
+	reg.MustRegister(
 		HealthIsReady,
 		HealthIsLive,
 		RaftIsHealthy,
 		RaftIsLeader,
-		DiscoveryQueueLength,
-		DeadInstancesDiscoveryQueueLength,
-		ActiveRecoveries,
-		DowntimedInstances,
-		ActiveTopologyIssues,
 		RaftPeersTotal,
 		RaftIsPartOfQuorum,
 	)
