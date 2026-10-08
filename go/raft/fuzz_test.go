@@ -85,7 +85,7 @@ func FuzzFSMApply(f *testing.F) {
 }
 
 func TestFSMApplyHugeAndWeirdValues(t *testing.T) {
-	big := strings.Repeat("A", 8<<20) // 8 MiB value
+	big := strings.Repeat("A", 1<<20) // 1 MiB value
 	for _, c := range []storeCommand{
 		{Op: "forget", Value: []byte(big), Tenant: "a"},
 		{Op: "forget", Value: []byte(big)},

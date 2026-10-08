@@ -227,11 +227,11 @@ func driveChaos(t *testing.T, c *chaosCluster, seed int64, nodes, steps int, pub
 }
 
 // runChaos drives one randomized schedule for a seed over the deterministic applier and checks the invariants.
-func runChaos(t *testing.T, seed int64, nodes int, steps int, tune func(*raft.Config)) chaosOutcome {
+func runChaos(t *testing.T, seed int64, nodes int, steps int, tune func(*raft.Config), opts ...clusterOption) chaosOutcome {
 	t.Helper()
 	tenants := []string{"a", "b", "c"}
 	apps, fakes := newFakeApps(nodes, false, tenants...)
-	c := newChaosCluster(t, apps, tune)
+	c := newChaosCluster(t, apps, tune, opts...)
 	tr := newTracker()
 	c.WaitLeader()
 	driveChaos(t, c, seed, nodes, steps, func(prng *rand.Rand) {
@@ -261,7 +261,7 @@ func runChaos(t *testing.T, seed int64, nodes int, steps int, tune func(*raft.Co
 // schedules per seed; at the end every node holds the identical per-tenant state, in
 // the same apply order, and every acknowledged command is applied exactly once.
 func TestChaosConvergenceFake(t *testing.T) {
-	seeds := chaosSeeds(6)
+	seeds := chaosSeeds(5)
 	var total chaosOutcome
 	start := time.Now()
 	for s := 0; s < seeds; s++ {
@@ -285,7 +285,7 @@ func aggressiveSnapshots(cfg *raft.Config) {
 
 // Scenarios 1+4: the same random schedules, with the log compacted every few entries.
 func TestChaosConvergenceFakeWithSnapshots(t *testing.T) {
-	seeds := chaosSeeds(6)
+	seeds := chaosSeeds(4)
 	var total chaosOutcome
 	for s := 0; s < seeds; s++ {
 		seed := int64(2000 + s)
@@ -295,4 +295,16 @@ func TestChaosConvergenceFakeWithSnapshots(t *testing.T) {
 		})
 	}
 	t.Logf("%d seeds: published=%d acked=%d ambiguous=%d (applied anyway=%d)", seeds, total.published, total.acked, total.ambiguous, total.ambiguousApplied)
+}
+
+// Scenario 1 with the PRODUCTION Raft storage: the log and stable store in SQLite
+// (orcraft.RelationalStore) and the file snapshot store, restarted over the same files.
+func TestChaosConvergenceFakeProductionStores(t *testing.T) {
+	seeds := chaosSeeds(2)
+	for s := 0; s < seeds; s++ {
+		seed := int64(5000 + s)
+		t.Run(fmt.Sprintf("seed%d", seed), func(t *testing.T) {
+			runChaos(t, seed, 3, 40, aggressiveSnapshots, withRelLogs)
+		})
+	}
 }

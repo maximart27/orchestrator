@@ -114,11 +114,15 @@ func TestRealTenantsDifferBetweenNodes(t *testing.T) {
 	for _, withOwnSnapshot := range []bool{false, true} {
 		withOwnSnapshot := withOwnSnapshot
 		t.Run(fmt.Sprintf("node2SnapshotsBeforeBeingFixed=%v", withOwnSnapshot), func(t *testing.T) {
+			start := time.Now()
+			phase := func(name string) { t.Logf("%6.1fs %s", time.Since(start).Seconds(), name) }
 			all := []string{"a", "b", "x"}
 			app0, app1 := newRealApp0(t, all, all, realHosts...), newRealApp0(t, all, all, realHosts...)
 			app2 := newRealApp0(t, all, []string{"a", "b"}, realHosts...)
+			phase("apps built")
 			c := newChaosCluster(t, []nodeApp{app0, app1, app2}, nil)
 			ld := c.WaitLeader()
+			phase("leader elected")
 			for ld == 2 {
 				_ = c.raftOf(2).LeadershipTransfer().Error()
 				ld = c.WaitLeader()
@@ -132,6 +136,7 @@ func TestRealTenantsDifferBetweenNodes(t *testing.T) {
 				}
 			}
 			c.WaitConverged(30 * time.Second)
+			phase("published and converged")
 			if got := orcraft.UnknownTenantCommands() - before; got != rounds {
 				t.Errorf("UnknownTenantCommands rose by %d, want %d", got, rounds)
 			}
@@ -152,11 +157,15 @@ func TestRealTenantsDifferBetweenNodes(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			phase("snapshot step done")
 			c.Stop(2)
+			phase("node2 stopped")
 			app2.rebuild(all)
 			app2.seedInstances(realHosts...) // the new tenant has discovered the same topology as on the other nodes
+			phase("node2 rebuilt")
 			c.Restart(2)
 			c.WaitConverged(60 * time.Second)
+			phase("node2 restarted and converged")
 			healed := false
 			deadline := time.Now().Add(20 * time.Second)
 			if withOwnSnapshot { // nothing will come: just make sure the replay of the tail is over
