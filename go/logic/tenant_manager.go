@@ -211,6 +211,7 @@ func NewTenantManagerFor(base *config.Configuration, tenantConfigs []*config.Ten
 		if err := m.control.AddMirror(t.ID, t.Backend); err != nil {
 			return nil, fmt.Errorf("tenant %q: %w", t.ID, err)
 		}
+		t.control = m.control
 	}
 	return m, nil
 }
@@ -294,6 +295,12 @@ func (m *TenantManager) Start(ctx context.Context) error {
 			m.cancel()
 			return err
 		}
+	}
+	// The first heartbeat reaches every tenant backend (synchronously) before any
+	// tenant starts its maintenance: what that maintenance expires depends on this
+	// node being in the node_health of the backend (see Tenant.nodeHealthMirrored).
+	if hb := m.control.Heartbeat(process.ThisNodeHealth); !hb.Control.OK() {
+		_ = log.Errorf("first heartbeat: the control backend did not register this node: %v", hb.Control.Err)
 	}
 	m.wg.Add(1)
 	go func() {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -503,4 +504,22 @@ func TestHeartbeatSlowMirrorDoesNotRaceWithNextHeartbeat(t *testing.T) {
 		c.Heartbeat(nh)
 		time.Sleep(25 * time.Millisecond)
 	}
+}
+
+// The registration tick and the first heartbeat of the TenantManager heartbeat
+// the same NodeHealth concurrently.
+func TestConcurrentHeartbeatsOfTheSameNodeHealth(t *testing.T) {
+	c, _, _, _ := newControlWithMirrors(t)
+	nh := testNode("h1")
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 5; j++ {
+				c.Heartbeat(nh)
+			}
+		}()
+	}
+	wg.Wait()
 }
