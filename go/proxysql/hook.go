@@ -26,7 +26,23 @@ func NewHook(client *Client, writerHostgroup, readerHostgroup int, preFailoverAc
 }
 
 func (h *Hook) IsConfigured() bool {
-	return h.client != nil && h.writerHostgroup > 0
+	return h != nil && h.client != nil && h.writerHostgroup > 0
+}
+
+// WriterHostgroup returns the writer hostgroup, or 0 if the hook is nil or unconfigured.
+func (h *Hook) WriterHostgroup() int {
+	if h == nil {
+		return 0
+	}
+	return h.writerHostgroup
+}
+
+// ReaderHostgroup returns the reader hostgroup, or 0 if the hook is nil or unset.
+func (h *Hook) ReaderHostgroup() int {
+	if h == nil {
+		return 0
+	}
+	return h.readerHostgroup
 }
 
 // GetClient returns the underlying ProxySQL client, or nil if the hook is not configured.

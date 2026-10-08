@@ -17,35 +17,48 @@ func init() {
 	defaultHook.Store(NewHook(nil, 0, 0, ""))
 }
 
+// NewHookFromConfig builds the ProxySQL hook of one tenant from its configuration.
+// It never returns nil: an unconfigured hook (no admin address or no writer hostgroup)
+// is inactive and all its operations are no-ops. Nothing is stored at package level.
+func NewHookFromConfig(cfg *config.Configuration) *Hook {
+	if cfg == nil {
+		return NewHook(nil, 0, 0, "")
+	}
+	client := NewClient(
+		cfg.ProxySQLAdminAddress,
+		cfg.ProxySQLAdminPort,
+		cfg.ProxySQLAdminUser,
+		cfg.ProxySQLAdminPassword,
+		cfg.ProxySQLAdminUseTLS,
+	)
+	hook := NewHook(
+		client,
+		cfg.ProxySQLWriterHostgroup,
+		cfg.ProxySQLReaderHostgroup,
+		cfg.ProxySQLPreFailoverAction,
+	)
+	if hook.IsConfigured() {
+		log.Infof("ProxySQL hooks enabled: admin=%s:%d writer_hg=%d reader_hg=%d",
+			cfg.ProxySQLAdminAddress,
+			cfg.ProxySQLAdminPort,
+			cfg.ProxySQLWriterHostgroup,
+			cfg.ProxySQLReaderHostgroup,
+		)
+	} else if cfg.ProxySQLAdminAddress != "" && cfg.ProxySQLWriterHostgroup == 0 {
+		_ = log.Warningf("ProxySQL: ProxySQLAdminAddress is set but ProxySQLWriterHostgroup is 0 (unconfigured). ProxySQL hooks will be inactive.")
+	}
+	return hook
+}
+
+// InitHook builds the default hook from config.Config, once in the lifetime of the app
+// (legacy, single tenant shim over NewHookFromConfig).
 func InitHook() {
 	hookOnce.Do(func() {
-		client := NewClient(
-			config.Config.ProxySQLAdminAddress,
-			config.Config.ProxySQLAdminPort,
-			config.Config.ProxySQLAdminUser,
-			config.Config.ProxySQLAdminPassword,
-			config.Config.ProxySQLAdminUseTLS,
-		)
-		hook := NewHook(
-			client,
-			config.Config.ProxySQLWriterHostgroup,
-			config.Config.ProxySQLReaderHostgroup,
-			config.Config.ProxySQLPreFailoverAction,
-		)
-		if hook.IsConfigured() {
-			log.Infof("ProxySQL hooks enabled: admin=%s:%d writer_hg=%d reader_hg=%d",
-				config.Config.ProxySQLAdminAddress,
-				config.Config.ProxySQLAdminPort,
-				config.Config.ProxySQLWriterHostgroup,
-				config.Config.ProxySQLReaderHostgroup,
-			)
-		} else if config.Config.ProxySQLAdminAddress != "" && config.Config.ProxySQLWriterHostgroup == 0 {
-			_ = log.Warningf("ProxySQL: ProxySQLAdminAddress is set but ProxySQLWriterHostgroup is 0 (unconfigured). ProxySQL hooks will be inactive.")
-		}
-		defaultHook.Store(hook)
+		defaultHook.Store(NewHookFromConfig(config.Config))
 	})
 }
 
+// GetHook returns the default hook (legacy, single tenant); unconfigured until InitHook has run.
 func GetHook() *Hook {
 	return defaultHook.Load()
 }
