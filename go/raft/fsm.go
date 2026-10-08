@@ -19,6 +19,7 @@ package orcraft
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync/atomic"
@@ -36,6 +37,15 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 	var c storeCommand
 	if err := json.Unmarshal(l.Data, &c); err != nil {
 		_ = log.Errorf("failed to unmarshal command: %s", err.Error())
+	}
+
+	// Global ops never carry a tenant. Reject it for every one of them -- including the
+	// two yields, which are handled here and never reach routeCommand -- so that all
+	// nodes answer the same to a malformed entry, without acting on it.
+	if tenantID := ResolveTenant(c.Tenant); IsGlobalOp(c.Op) && tenantID != LegacyTenantID {
+		err := fmt.Errorf("%w: op=%s tenant=%s", ErrTenantOnGlobalCommand, c.Op, tenantID)
+		_ = log.Errorf("orchestrator/raft: index=%d: %+v", l.Index, err)
+		return err
 	}
 
 	if c.Op == YieldCommand {
