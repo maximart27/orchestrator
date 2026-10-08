@@ -17,6 +17,7 @@
 package logic
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 
@@ -806,17 +807,47 @@ func (t *Tenant) ReadBlockedRecoveries(clusterName string) ([]BlockedTopologyRec
 	return res, log.Errore(err)
 }
 
-// writeTopologyRecoveryStep writes down a single step in a recovery process
+// writeTopologyRecoveryStep writes down a single step in a recovery process.
+//
+// A step that comes with its AuditAt (the leader stamps it when it publishes the step) is written
+// at most once: Raft re-applies log entries after a restart over a backend that kept its data, and
+// the same step (recovery, instant, message) is not written again. A step without AuditAt (written
+// without Raft, or an entry of a log of a version that did not stamp it) has no natural key and is
+// always inserted, with the clock of the node.
 func (t *Tenant) writeTopologyRecoveryStep(topologyRecoveryStep *TopologyRecoveryStep) error {
-	sqlResult, err := t.Backend.Exec(`
+	var sqlResult sql.Result
+	var err error
+	if topologyRecoveryStep.AuditAt == "" {
+		sqlResult, err = t.Backend.Exec(`
 			insert ignore
 				into topology_recovery_steps (
 					recovery_step_id, recovery_uid, audit_at, message
 				) values (?, ?, now(), ?)
 			`, sqlutils.NilIfZero(topologyRecoveryStep.Id), topologyRecoveryStep.RecoveryUID, topologyRecoveryStep.Message,
-	)
+		)
+	} else {
+		// (select 1) as d: a SELECT with a WHERE needs a FROM clause in MySQL, and this is valid in SQLite too
+		sqlResult, err = t.Backend.Exec(`
+			insert ignore
+				into topology_recovery_steps (
+					recovery_step_id, recovery_uid, audit_at, message
+				)
+				select ?, ?, ?, ?
+				from (select 1) as d
+				where not exists (
+					select 1
+						from topology_recovery_steps
+						where recovery_uid = ? and audit_at = ? and message = ?
+				)
+			`, sqlutils.NilIfZero(topologyRecoveryStep.Id), topologyRecoveryStep.RecoveryUID, topologyRecoveryStep.AuditAt, topologyRecoveryStep.Message,
+			topologyRecoveryStep.RecoveryUID, topologyRecoveryStep.AuditAt, topologyRecoveryStep.Message,
+		)
+	}
 	if err != nil {
 		return log.Errore(err)
+	}
+	if rows, err := sqlResult.RowsAffected(); err == nil && rows == 0 {
+		return nil // already there
 	}
 	topologyRecoveryStep.Id, err = sqlResult.LastInsertId()
 	return log.Errore(err)
