@@ -86,7 +86,7 @@ type Store struct {
 
 	hostnameResolvesLightweightCache                 *cache.Cache
 	hostnameResolvesLightweightCacheInit             sync.Mutex
-	hostnameResolvesLightweightCacheLoadedOnceFromDB bool
+	hostnameResolvesLightweightCacheLoadedOnceFromDB atomic.Bool
 
 	accessDeniedCounter               metrics.Counter
 	readTopologyInstanceCounter       metrics.Counter

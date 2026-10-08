@@ -127,7 +127,7 @@ func (s *Store) ResolveHostname(hostname string) (string, error) {
 		return resolvedHostname.(string), nil
 	}
 
-	if !s.hostnameResolvesLightweightCacheLoadedOnceFromDB {
+	if !s.hostnameResolvesLightweightCacheLoadedOnceFromDB.Load() {
 		// A continuous-discovery will first make sure to load all resolves from DB.
 		// However cli does not do so.
 		// Anyway, it seems like the cache was not loaded from DB. Before doing real resolves,
@@ -196,7 +196,7 @@ func (s *Store) loadHostnameResolveCacheFromDatabase() error {
 	for _, hostnameResolve := range allHostnamesResolves {
 		s.getHostnameResolvesLightweightCache().Set(hostnameResolve.hostname, hostnameResolve.resolvedHostname, 0)
 	}
-	s.hostnameResolvesLightweightCacheLoadedOnceFromDB = true
+	s.hostnameResolvesLightweightCacheLoadedOnceFromDB.Store(true)
 	return nil
 }
 
@@ -217,7 +217,7 @@ func (s *Store) FlushNontrivialResolveCacheToDatabase() error {
 func (s *Store) ResetHostnameResolveCache() error {
 	err := s.deleteHostnameResolves()
 	s.getHostnameResolvesLightweightCache().Flush()
-	s.hostnameResolvesLightweightCacheLoadedOnceFromDB = false
+	s.hostnameResolvesLightweightCacheLoadedOnceFromDB.Store(false)
 	return err
 }
 
