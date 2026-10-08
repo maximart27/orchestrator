@@ -252,20 +252,20 @@ func TestStoreCloseOfOneStoreDoesNotAffectTheOther(t *testing.T) {
 	mustWriteInstance(t, b, key)
 
 	// metrics: A's are gone, B's remain
-	if metrics.Get("tenant.close-a.instance.write") != nil {
+	if metrics.Get("tenants.close-a.instance.write") != nil {
 		t.Errorf("A's metrics still registered after Close")
 	}
-	if metrics.Get("tenant.close-b.instance.write") == nil {
+	if metrics.Get("tenants.close-b.instance.write") == nil {
 		t.Errorf("B's metrics unregistered by A.Close")
 	}
 }
 
 func TestStoreMetricsAreNamedPerTenant(t *testing.T) {
 	a := newTestStore(t, "metric-a", nil)
-	if metrics.Get("tenant.metric-a.instance.read") == nil {
+	if metrics.Get("tenants.metric-a.instance.read") == nil {
 		t.Errorf("tenant metric not registered with its prefix")
 	}
-	if metrics.Get("tenant.metric-a.discoveries.dead_instances") == nil {
+	if metrics.Get("tenants.metric-a.discoveries.dead_instances") == nil {
 		t.Errorf("dead instances counter not registered with the tenant prefix")
 	}
 	// a second store of the same tenant replaces the metric instead of silently leaving the old one
@@ -275,7 +275,7 @@ func TestStoreMetricsAreNamedPerTenant(t *testing.T) {
 		t.Fatalf("NewStore: %v", err)
 	}
 	defer func() { _ = b.Close() }()
-	if metrics.Get("tenant.metric-a.instance.read") != b.readInstanceCounter {
+	if metrics.Get("tenants.metric-a.instance.read") != b.readInstanceCounter {
 		t.Errorf("the registry does not hold the metric of the newest store")
 	}
 	// the legacy default store keeps the historical, un-prefixed names
