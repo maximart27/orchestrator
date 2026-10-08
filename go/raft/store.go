@@ -24,9 +24,21 @@ type Store struct {
 	snapshotCreatorApplier SnapshotCreatorApplier
 }
 
+// storeCommand is the envelope of every raft log entry.
+//
+// Tenant is empty for global commands and for commands of the legacy tenant: the
+// field is omitted from the JSON, so the encoding of those entries is byte for
+// byte the one written before multi-tenancy (old nodes/logs keep interoperating
+// in single-tenant deployments). Entries without tenant decode with Tenant == ""
+// and are applied to LegacyTenantID.
+//
+// Mixed-version hazard: a pre-tenant node ignores the unknown "tenant" field and
+// would apply a non-legacy tenant's command to its only backend. All nodes must run
+// a tenant-aware version before a second tenant is enabled.
 type storeCommand struct {
-	Op    string `json:"op,omitempty"`
-	Value []byte `json:"value,omitempty"`
+	Op     string `json:"op,omitempty"`
+	Value  []byte `json:"value,omitempty"`
+	Tenant string `json:"tenant,omitempty"`
 }
 
 // NewStore inits and returns a new store
@@ -183,11 +195,23 @@ func (store *Store) RemovePeer(addr string) error {
 // genericCommand requests consensus for applying a single command.
 // This is an internal orchestrator implementation
 func (store *Store) genericCommand(op string, bytes []byte) (response interface{}, err error) {
+	return store.tenantCommand("", op, bytes)
+}
+
+// tenantCommand requests consensus for applying a single command of a tenant.
+// The legacy tenant ("" or LegacyTenantID) is written without tenant field.
+func (store *Store) tenantCommand(tenantID string, op string, bytes []byte) (response interface{}, err error) {
+	if tenantID == LegacyTenantID {
+		tenantID = ""
+	}
+	if tenantID != "" && IsGlobalOp(op) {
+		return nil, fmt.Errorf("%w: op=%s tenant=%s", ErrTenantOnGlobalCommand, op, tenantID)
+	}
 	if store.raft.State() != raft.Leader {
 		return nil, fmt.Errorf("not leader")
 	}
 
-	b, err := json.Marshal(&storeCommand{Op: op, Value: bytes})
+	b, err := marshalForTenant(tenantID, op, bytes)
 	if err != nil {
 		return nil, err
 	}
@@ -203,4 +227,12 @@ func (store *Store) genericCommand(op string, bytes []byte) (response interface{
 		return r, err
 	}
 	return r, nil
+}
+
+// marshalForTenant encodes a log entry; the legacy tenant is written without tenant field.
+func marshalForTenant(tenantID, op string, value []byte) ([]byte, error) {
+	if tenantID == LegacyTenantID {
+		tenantID = ""
+	}
+	return json.Marshal(&storeCommand{Op: op, Value: value, Tenant: tenantID})
 }
