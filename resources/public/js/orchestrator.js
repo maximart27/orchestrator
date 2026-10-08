@@ -97,14 +97,13 @@ function anonymizeInstanceId(instanceId) {
 function appUrl(url) {
   // Create an absolute URL that respects URL-rewriting proxies,
   // such as the Kubernetes apiserver proxy.
-  var here = window.location.pathname;
-  var pos = here.lastIndexOf('/web/');
-  if (pos < 0) {
-    return url;
-  }
   // This assumes the Orchestrator UI is accessed as ".../web/...".
   // The part before the "/web/" should be prefixed onto any URLs we write.
-  return here.substr(0, pos) + url;
+  //
+  // This is also the single place where multi-tenancy is applied: on a page served under
+  // /web/tenants/<tenant>/..., "/api/X" becomes "/api/tenants/<tenant>/X" and "/web/X" becomes
+  // "/web/tenants/<tenant>/X" (see tenant.js). On legacy pages (no tenant) URLs are left as they were.
+  return OrchestratorTenant.rewriteUrl(url, window.location.pathname);
 }
 
 function visualizeBrand() {
