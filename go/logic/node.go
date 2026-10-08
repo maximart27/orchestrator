@@ -52,6 +52,8 @@ const (
 	// (there is no fatal threshold for tenants): it keeps serving whatever a
 	// non-leader node serves.
 	tenantYieldAfterUnhealthyDuration = yieldAfterUnhealthyDuration
+	// sigtermStopTimeout bounds the orderly stop of the tenants on SIGTERM.
+	sigtermStopTimeout = 30 * time.Second
 )
 
 var (
@@ -165,10 +167,21 @@ func acceptSignals() {
 				}
 			case syscall.SIGTERM:
 				log.Infof("Received SIGTERM. Shutting down orchestrator")
-				// probably should poke other go routines to stop cleanly here ...
 				for _, t := range m.tenants {
 					t.discoveryMetrics.StopAutoExpiration()
 					_ = t.Store.AuditOperation("shutdown", nil, "Triggered via SIGTERM")
+				}
+				// stop the tenants in an orderly way (flush write buffers, close backends),
+				// but do not let a stuck operation keep the process from exiting
+				stopped := make(chan struct{})
+				go func() {
+					m.Stop()
+					close(stopped)
+				}()
+				select {
+				case <-stopped:
+				case <-time.After(sigtermStopTimeout):
+					log.Warningf("Tenants did not stop within %v; exiting anyway", sigtermStopTimeout)
 				}
 				os.Exit(0)
 			}
