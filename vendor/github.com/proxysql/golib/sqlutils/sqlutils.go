@@ -216,6 +216,31 @@ func GetGenericDB(driverName, dataSourceName string, logger Logger) (*sql.DB, bo
 	return db, exists, nil
 }
 
+// NewDB opens a *sql.DB that is NOT shared through the global knownDBs cache: the
+// caller owns the handle and must release it with CloseDB. The optional logger is
+// registered for error reporting exactly as GetGenericDB does.
+func NewDB(driverName, dataSourceName string, logger Logger) (*sql.DB, error) {
+	db, err := sql.Open(driverName, dataSourceName)
+	if err != nil {
+		return nil, err
+	}
+	knownDBsMutex.Lock()
+	DB2logger[db] = logger
+	knownDBsMutex.Unlock()
+	return db, nil
+}
+
+// CloseDB closes a handle obtained from NewDB and forgets its registered logger.
+func CloseDB(db *sql.DB) error {
+	if db == nil {
+		return nil
+	}
+	knownDBsMutex.Lock()
+	delete(DB2logger, db)
+	knownDBsMutex.Unlock()
+	return db.Close()
+}
+
 // GetDB returns a MySQL DB instance based on uri.
 // logger parameter is optional. If nil, internal logging will be used.
 // bool result indicates whether the DB was returned from cache; err
