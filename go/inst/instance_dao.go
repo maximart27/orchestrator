@@ -144,11 +144,18 @@ var GroupReplicationNotSupportedErrors = map[uint16]bool{
 
 var emptyQuotesRegexp = regexp.MustCompile(`^""$`)
 
-// ExecDBWriteFunc chooses how to execute a write onto the database: whether synchronuously or not
+// ExecDBWriteFunc chooses how to execute a write onto the database: whether synchronuously or not.
+//
+// A failing backend must surface as an error returned by f, never as a panic:
+// runtime errors (nil dereference, index out of range...) are programming bugs
+// and are deliberately NOT converted to errors, so they are not hidden. They are
+// re-panicked, after releasing the write slot so the Store stays usable if a
+// caller recovers.
 func (s *Store) ExecDBWriteFunc(f func() error) error {
 	m := query.NewMetric()
 
 	s.instanceWriteChan <- true
+	defer func() { <-s.instanceWriteChan }() // assume this takes no time
 	m.WaitLatency = time.Since(m.Timestamp)
 
 	// catch the exec time and error if there is one
@@ -166,7 +173,6 @@ func (s *Store) ExecDBWriteFunc(f func() error) error {
 		}
 		m.ExecuteLatency = time.Since(m.Timestamp.Add(m.WaitLatency))
 		_ = s.backendWrites.Append(m)
-		<-s.instanceWriteChan // assume this takes no time
 	}()
 	res := f()
 	return res

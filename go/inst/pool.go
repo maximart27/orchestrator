@@ -72,6 +72,5 @@ func (s *Store) ApplyPoolInstances(submission *PoolInstancesSubmission) error {
 		}
 	}
 	log.Debugf("submitting %d instances in %+v pool", len(instanceKeys), submission.Pool)
-	s.writePoolInstances(submission.Pool, instanceKeys)
-	return nil
+	return s.writePoolInstances(submission.Pool, instanceKeys)
 }
