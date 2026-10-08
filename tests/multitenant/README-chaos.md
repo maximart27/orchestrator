@@ -68,30 +68,70 @@ Snapshot threshold: `store.go` fixes `SnapshotThreshold=1`, `SnapshotInterval=30
 `TrailingLogs=10240`; nothing is configurable, so scenario 6 publishes >10240 real commands and checks that the
 leader's `raft_log` first index moved past 1 before it wipes a node.
 
+## Reference results (this tree, 2026-10-08/09, Docker on a 12-core PC)
+
+| # | Result | Time | Notes |
+|---|---|---|---|
+| 1 | PASS (64 assertions; 3/3 runs) | ~2.5 min | |
+| 2 | PASS (40; 2/2) | ~2.5 min | |
+| 3 | 3a PASS, 3b **FAIL** (3/3 runs), 3c info | ~4-5 min | finding 3 |
+| 4 | **FAIL** in 3 of 4 runs (intermittent) | ~3.5-5 min | findings 2 and 4 |
+| 5 | core PASS (2944/2944 commands accepted during the rolling restart, none lost); 5b untag probe **FAIL** (3/3) | ~2.3 min | finding 5 |
+| 6 | PASS (24; 2/2) | ~3-4 min | snapshot really installed (`installing snapshot on` in the leader log) |
+| 7 | yield/takeover PASS; lost commands **FAIL** (3/3); rebuild PASS | ~2.5 min | finding 6 |
+| 8 | PASS (20; 2/2) | ~1-2 min | |
+| 9 | soak (seed 2026) found findings 1 and 2 | 10 min + | |
+| 10 | **FAIL** (3/3), deterministic | ~4 min | finding 1 |
+
+`run-chaos.sh` (1-8 and 10) takes about 22-25 minutes.
+
 ## Findings
 
-See the report of the run (also summarised in the commit messages). Those that come from the binary and not from the
-scripts are listed here so they are not lost; none was fixed (out of scope). Items marked *pre-existing* exist
-identically in the legacy single-tenant code.
+Found by this suite in the binary of this tree (not by the scripts). None was fixed (out of scope; evidence in
+`$ORCMT_WORK/logs/<scenario>/`). *Pre-existing* = the same code exists in the legacy single-tenant orchestrator.
 
-1. **A recovery in flight is not aborted when the leader loses the term** (scenario 3b, *pre-existing design*).
-   `executeCheckAndRecoverFunction` checks `t.isLeader()` once (`go/logic/topology_recovery.go:1911`); pre hooks,
-   promotion, KV writes and post hooks then run on whatever state the node has. Observed: a leader frozen for 24 s
-   in its pre-failover hook woke up as Follower, promoted the replica and ran the post hook (`state=Follower`); every
-   Raft write it tried failed with `not leader`, so the recovery row was never resolved on any node.
-2. **An orphan recovery is not recognised as crashed** (scenario 4, *pre-existing*). Replicated rows are stamped with the
-   applying node's hostname/token (`topology_recovery_dao.go:180`), so `AcknowledgeCrashedRecoveries`
-   (`topology_recovery_dao.go:471`, joins with `node_health`) never matches: after `kill -9` of the leader the new
-   leader waits the whole `RecoveryPeriodBlockSeconds` before repeating the recovery (pre hook ran 2 times, post hook once).
-3. **`Untag`/`UntagAll` are not replicated** (scenario 5b, *pre-existing*): `go/http/api.go` calls `tenant.Store.Untag`
-   directly; the `delete-instance-tag` op the applier understands (`command_applier.go:150`) is never published.
-4. **Commands a node fails to apply are never retried** (scenario 7): with its tenant backend full the node answers an
-   error to the FSM and moves on; Raft snapshots are published after every recovery (`topology_recovery.go:986`), so the
-   node later restores a snapshot built from the backend that had missed them. Only wiping the node (Raft dir and tenant
-   backends) rebuilds it.
-5. `UnknownTenantCommands()` (`go/raft/tenant.go:78`) is counted but exported nowhere: the only trace of a tenants-file
-   mismatch is the log line.
-6. The `lost-in-recovery` downtime is written by the recovering leader locally, not through Raft (*pre-existing*), so it
-   is excluded from the convergence fingerprint.
-7. A process frozen for longer than `fatalAfterUnhealthyDuration` (30 s) may `log.Fatal` on wake-up (`node is unable to
-   register health`); whether it does is a race between the health tick and the heartbeat goroutine (*pre-existing*).
+1. **Recovery rows restored from a Raft snapshot never leave their active period** (scenario 10; the soak hit it as a
+   failover that did not happen for 4 minutes). A node that restarts restores the latest snapshot, whose
+   `topology_recovery` table is written back with `REPLACE INTO` (`go/logic/snapshot_data.go` `readTableData`/`writeTableData`
+   -> `vendor/github.com/proxysql/golib/sqlutils` `ScanTable`/`WriteTable`) with the timestamps as RFC3339 text
+   (`2026-10-08T23:22:36Z`). `ClearActiveRecoveries` (`go/logic/topology_recovery_dao.go:254`, `start_active_period < NOW() -
+   INTERVAL ? SECOND`) compares strings in SQLite and `'T'` (0x54) sorts after `' '` (0x20): the comparison is false for the
+   rest of the day, the row stays `in_active_period=1`, and if that node becomes the leader it refuses to fail over the cluster
+   (`instance X has recently been promoted ... and is in active period. It will not be failed over`). Workaround:
+   `ack-recovery/cluster/<name>`. *Pre-existing* (shared snapshot code), but fatal for HA.
+2. **A replicated recovery row can be silently dropped on a follower** (scenario 4, 3 runs of 4; scenario 10). The new row is
+   applied with `insert ignore` (`topology_recovery_dao.go:141`) against the unique index
+   `hostname_port_active_period_uidx_topology_recovery` (`go/db/generate_base.go:344`) while the follower has not yet cleared its
+   own previous row (clearing is local, per node). Evidence (scenario 4): n1 cleared row 1 at 23:42:55
+   (`end_active_period_unixtime=1791502975`) and applied `write-recovery` (log index 35) in the same second; n1 never got row 2,
+   n2/n3 did. The nodes then differ in `topology_recovery`. *Pre-existing.*
+3. **A recovery in flight is not aborted when the leader loses the term** (scenario 3b, 3/3). `executeCheckAndRecoverFunction`
+   checks `t.isLeader()` once (`go/logic/topology_recovery.go:1911`). Observed: a leader frozen for 24 s inside its
+   pre-failover hook woke up as Follower, promoted the replica, ran the post hook (`state=Follower`), tried to write KV and
+   every Raft write failed with `not leader`; the recovery row was never resolved on any node (`successor` empty, `is_successful=0`).
+   *Pre-existing design.*
+4. **An orphan recovery is not recognised as crashed** (scenario 4). Replicated rows are stamped with the applying node's
+   hostname and token (`topology_recovery_dao.go:180`), so `AcknowledgeCrashedRecoveries` (`:471`, anti-join with `node_health`)
+   never matches. After `kill -9` of the leader mid-failover the new leader waits the whole `RecoveryPeriodBlockSeconds` and
+   then repeats the recovery from scratch: with a 60 s block and a 20 s pre hook the topology was repaired 86 s after the kill
+   (120 s with 90 s); the pre hook ran twice, the post hook once, the topology ended consistent. Acceptable as anti-flapping,
+   but it is the block period, not a crash detection, that bounds the outage. *Pre-existing.*
+5. **`Untag`/`UntagAll` are not replicated** (scenario 5b, 3/3): `go/http/api.go:2148,2165` call `tenant.Store.Untag` directly;
+   the `delete-instance-tag` op that the applier knows (`command_applier.go:150`) is never published. *Pre-existing.*
+6. **Commands a node fails to apply are never retried** (scenario 7, 3/3). With its tenant backend full, the node answers an
+   error to the FSM and moves on; snapshots are published after every recovery (`topology_recovery.go:986`, `async-snapshot`),
+   so even a restart restores a snapshot built from the backend that had missed them. Only wiping the node (Raft dir and tenant
+   backends) rebuilds it (verified). The yield itself works as specified (5-6 s, exact log line, process alive).
+7. `UnknownTenantCommands()` (`go/raft/tenant.go:78`) counts the commands a node could not apply for an unknown tenant but
+   nothing exports it (no metric, no API); the log line is the only trace (scenario 8).
+8. The `lost-in-recovery` downtime is written by the recovering leader locally, not through Raft (*pre-existing*): excluded
+   from the convergence fingerprint.
+9. A process frozen for longer than `fatalAfterUnhealthyDuration` (30 s) may `log.Fatal("node is unable to register health")` on
+   wake-up (seen once after a 50 s freeze; a 60 s freeze survived in the next run): a race between the health tick and the
+   heartbeat goroutine (`go/logic/node.go`, *pre-existing*).
+
+What held: no panic, nil dereference or stray `unknown tenant` in any run of any scenario; one Leader at every sample of
+the soak; commands of tenant A never landed in B or C (partitions, snapshot install, tenant mismatch); partitioned or
+frozen leaders never ran a recovery or hook after a new term had started (3a, 1, 3c); every accepted command survived a
+rolling restart; snapshot v2 install and restore into populated backends work; a broken tenant backend makes the node yield
+without killing it.

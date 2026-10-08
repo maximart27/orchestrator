@@ -14,8 +14,8 @@ if [ "${1:-}" = cleanup ]; then
 fi
 declare -A SC=( [1]=chaos-01-leader-partition.sh [2]=chaos-02-follower-partition.sh [3]=chaos-03-leader-pause.sh
   [4]=chaos-04-kill-leader-mid-failover.sh [5]=chaos-05-rolling-restart.sh [6]=chaos-06-snapshot-restore.sh
-  [7]=chaos-07-tenant-backend-failure.sh [8]=chaos-08-tenant-mismatch.sh [9]=chaos-09-soak.sh )
-want=("$@"); [ ${#want[@]} -eq 0 ] && want=(1 2 3 4 5 6 7 8)
+  [7]=chaos-07-tenant-backend-failure.sh [8]=chaos-08-tenant-mismatch.sh [9]=chaos-09-soak.sh [10]=chaos-10-restored-recovery-stuck.sh )
+want=("$@"); [ ${#want[@]} -eq 0 ] && want=(1 2 3 4 5 6 7 8 10)
 [ "${CHAOS_SOAK:-0}" = 1 ] && [[ " ${want[*]} " != *" 9 "* ]] && want+=(9)
 export CHAOS_SHARED=1
 T0=$SECONDS; results=()

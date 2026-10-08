@@ -69,15 +69,22 @@ fail_master() { # a|b|c
 }
 settle_master() { # a|b|c : wait for the promotion and re-attach the old master (mariadb)
   local l="$1" m r; [ -f "$ORCMT_WORK/soak-pending-$l" ] || return 0; read -r _ m r < "$ORCMT_WORK/soak-pending-$l"
-  local ok=0
-  if [ "$l" = c ]; then wait_until 240 "c: $r promoted" pg_promoted "$r" && ok=1
-  else wait_until 240 "$l: $r writable" mariadb_writable "$r" && ok=1; fi
+  local ok=0 W="${SOAK_FAILOVER_WAIT:-150}" t ld cl
+  case "$l" in a) t=$TENANT_A;; b) t=$TENANT_B;; c) t=$TENANT_C;; esac
+  waitpromo() { if [ "$l" = c ]; then wait_until "$1" "c: $r promoted" pg_promoted "$r"; else wait_until "$1" "$l: $r writable" mariadb_writable "$r"; fi; }
+  if waitpromo "$W"; then ok=1
+  else
+    violation "failover of tenant $l (master $m) did not complete within ${W}s: $(for n in "${NODES[@]}"; do node_usable "$n" && echo -n "$n:$(node_logs "$n" | grep -c 'in active period\|recently experienced a failover')blocks "; done)"
+    # an operator would acknowledge the stuck recovery; do it so the soak can go on
+    ld="$(single_leader "${NODES[@]}")"; cl="$(sql "$ld" "$(tdb "$t")" "select cluster_name from topology_recovery order by recovery_id desc limit 1")"
+    [ -n "$ld" ] && tapi_ok "$ld" "$t" "ack-recovery/cluster/$cl?comment=soak-operator" && log "SOAK: operator ack of $cl on $ld" && waitpromo 90 && ok=1
+  fi
   if [ $ok = 1 ]; then
     if [ "$l" != c ]; then
       mariadb_rejoin "$m" "$r" >/dev/null 2>&1 && log "SOAK: $m re-attached under $r" || violation "$m could not rejoin under $r"
       if [ "$l" = a ]; then CUR_M_a=$r; CUR_R_a=$m; else CUR_M_b=$r; CUR_R_b=$m; fi
     else CDONE=1; fi
-  else violation "failover of tenant $l (master $m) did not complete within 240s"; fi
+  fi
   rm -f "$ORCMT_WORK/soak-pending-$l"
 }
 T_END=$((SECONDS+SOAK_SECONDS)); cycle=0
@@ -111,7 +118,7 @@ traffic_stop; traffic_stats >&2
 supervise
 cluster_stable "${NODES[@]}" && pass "final: single Leader $LEADER ($(states_line "${NODES[@]}"))" || violation "no stable cluster at the end"
 for t in "${TENANTS[@]}"; do
-  wait_until 120 "$t converged" converged "$t" "${NODES[@]}" && pass "final: $t identical on the three nodes" || violation "tenant $t diverges at the end: $(for n in "${NODES[@]}"; do echo -n "$n=$(tenant_fp $n $t) "; done)"
+  wait_until 60 "$t converged" converged "$t" "${NODES[@]}" && pass "final: $t identical on the three nodes" || violation "tenant $t diverges at the end: $(diverge_report "$t" "${NODES[@]}")"
 done
 check_logs; check_hooks
 log "hook runs per tenant (cluster-wide): $(for t in "${TENANTS[@]}"; do echo -n "$t=$(hooks_total $t) "; done)"
