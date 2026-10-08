@@ -145,10 +145,10 @@ var GroupReplicationNotSupportedErrors = map[uint16]bool{
 var emptyQuotesRegexp = regexp.MustCompile(`^""$`)
 
 // ExecDBWriteFunc chooses how to execute a write onto the database: whether synchronuously or not
-func (st *Store) ExecDBWriteFunc(f func() error) error {
+func (s *Store) ExecDBWriteFunc(f func() error) error {
 	m := query.NewMetric()
 
-	st.instanceWriteChan <- true
+	s.instanceWriteChan <- true
 	m.WaitLatency = time.Since(m.Timestamp)
 
 	// catch the exec time and error if there is one
@@ -165,8 +165,8 @@ func (st *Store) ExecDBWriteFunc(f func() error) error {
 			}
 		}
 		m.ExecuteLatency = time.Since(m.Timestamp.Add(m.WaitLatency))
-		_ = st.backendWrites.Append(m)
-		<-st.instanceWriteChan // assume this takes no time
+		_ = s.backendWrites.Append(m)
+		<-s.instanceWriteChan // assume this takes no time
 	}()
 	res := f()
 	return res
@@ -3033,6 +3033,11 @@ func (a byInstanceKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a byInstanceKey) Less(i, j int) bool { return a[i].Key.SmallerThan(&a[j].Key) }
 
 func (s *Store) enqueueInstanceWrite(instance *Instance, instanceWasActuallyFound bool, lastError error) {
+	if s.closed.Load() {
+		// nobody flushes the buffer of a closed Store any more
+		log.Debugf("enqueueInstanceWrite: store %q is closed; dropping write of %+v", s.id, instance.Key)
+		return
+	}
 	if len(s.instanceWriteBuffer) == s.cfg.InstanceWriteBufferSize {
 		// Signal the "flushing" goroutine that there's work.
 		// We prefer doing all bulk flushes from one goroutine.

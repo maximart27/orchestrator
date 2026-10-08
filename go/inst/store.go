@@ -152,9 +152,6 @@ func NewStore(id string, cfg *config.Configuration, backend *db.Backend, opts ..
 			return nil, fmt.Errorf("inst: store %q: %w", id, err)
 		}
 		s.providerType = providerType
-		if cfg.ExpiryHostnameResolvesMinutes < 1 {
-			cfg.ExpiryHostnameResolvesMinutes = 1
-		}
 	} else if providerType, err := config.NormalizeProvider(s.providerType); err == nil {
 		s.providerType = providerType
 	} else {
@@ -332,8 +329,10 @@ func (s *Store) registerMetric(name string, m interface{}) {
 
 func (s *Store) newCollection(name string) *collection.Collection {
 	c := collection.CreateOrReturnCollection(s.scopedName(name))
-	if s.id != db.DefaultBackendID {
-		c.SetExpirePeriod(time.Duration(s.cfg.DiscoveryCollectionRetentionSeconds) * time.Second)
+	if retention := time.Duration(s.cfg.DiscoveryCollectionRetentionSeconds) * time.Second; s.id != db.DefaultBackendID && c.ExpirePeriod() != retention {
+		// the collection package sizes a new collection from the global
+		// configuration; a tenant may retain its metrics for a different time
+		c.SetExpirePeriod(retention)
 	}
 	return c
 }

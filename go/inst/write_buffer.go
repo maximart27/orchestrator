@@ -65,7 +65,7 @@ type AggregatedWriteBufferMetric struct {
 
 // AggregatedSince returns the aggregated query metrics for the period
 // given from the values provided.
-func (st *Store) AggregatedSince(c *collection.Collection, t time.Time) AggregatedWriteBufferMetric {
+func (s *Store) AggregatedSince(c *collection.Collection, t time.Time) AggregatedWriteBufferMetric {
 
 	// Initialise timing metrics
 	var instancesCounter []float64
@@ -75,8 +75,8 @@ func (st *Store) AggregatedSince(c *collection.Collection, t time.Time) Aggregat
 	// Retrieve values since the time specified
 	values, err := c.Since(t)
 	a := AggregatedWriteBufferMetric{
-		InstanceWriteBufferSize:           st.cfg.InstanceWriteBufferSize,
-		InstanceFlushIntervalMilliseconds: st.cfg.InstanceFlushIntervalMilliseconds,
+		InstanceWriteBufferSize:           s.cfg.InstanceWriteBufferSize,
+		InstanceFlushIntervalMilliseconds: s.cfg.InstanceFlushIntervalMilliseconds,
 	}
 	if err != nil {
 		return a // empty data
