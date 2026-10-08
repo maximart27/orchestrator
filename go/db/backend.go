@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +24,10 @@ const DefaultBackendID = "default"
 
 // ErrBackendClosed is returned by a Backend that has been Close()d.
 var ErrBackendClosed = errors.New("db: backend is closed")
+
+// ErrDefaultBackendDisabled is returned by the Backend that DefaultBackend()
+// hands out in a multi-tenant process (see DisableDefaultBackend).
+var ErrDefaultBackendDisabled = errors.New("db: the legacy default backend is disabled in a multi-tenant process; use the backend of the tenant")
 
 // Backend is the orchestrator backend database (SQLite or MySQL) of ONE tenant,
 // plus the connections to the topology servers that tenant monitors.
@@ -52,6 +58,10 @@ type Backend struct {
 	// legacyTLSNames: register the TLS configs as "topology"/"orchestrator"
 	// instead of "topology-<id>"/"orchestrator-<id>".
 	legacyTLSNames bool
+	// disabled: the stand-in DefaultBackend() returns in a multi-tenant process.
+	// It never touches the configuration or a database: every operation fails
+	// with ErrDefaultBackendDisabled.
+	disabled bool
 
 	closed atomic.Bool
 
@@ -119,14 +129,44 @@ func newBackend(id string, cfg *config.Configuration) *Backend {
 var (
 	defaultBackend     *Backend
 	defaultBackendOnce sync.Once
+
+	defaultBackendDisabled atomic.Bool
+	disabledBackend        = sync.OnceValue(func() *Backend {
+		b := newBackend(DefaultBackendID, config.Config)
+		b.disabled = true
+		return b
+	})
 )
+
+// DisableDefaultBackend makes DefaultBackend() return a Backend whose every
+// operation fails with ErrDefaultBackendDisabled, instead of the legacy backend
+// driven by the global config.Config. The TenantManager calls it when the
+// process runs from a tenants file: there the base configuration describes no
+// tenant, so code that still reaches the legacy backend (a call that was not
+// migrated to its tenant's Backend) must fail with an error -- it would
+// otherwise create and migrate a schema on the base backend, and exit the
+// process if that fails. In the legacy single-tenant setup nothing changes.
+func DisableDefaultBackend() { defaultBackendDisabled.Store(true) }
+
+// DisabledBackend returns the inert Backend that DefaultBackend() hands out once
+// disabled: every operation fails with ErrDefaultBackendDisabled.
+func DisabledBackend() *Backend { return disabledBackend() }
+
+// EnableDefaultBackend undoes DisableDefaultBackend (the TenantManager that
+// disabled it was stopped).
+func EnableDefaultBackend() { defaultBackendDisabled.Store(false) }
 
 // DefaultBackend returns the legacy single-tenant backend, driven by the global
 // config.Config. It is built lazily (nothing is read from the config until the
 // first query, so it is safe to call before the config is loaded) and is live:
 // changes to config.Config are honoured, as with the former package functions.
 // A schema failure on this backend exits the process, as it always did.
+// After DisableDefaultBackend it returns an inert Backend that only returns
+// ErrDefaultBackendDisabled.
 func DefaultBackend() *Backend {
+	if defaultBackendDisabled.Load() {
+		return disabledBackend()
+	}
 	defaultBackendOnce.Do(func() {
 		b := newBackend(DefaultBackendID, config.Config)
 		b.live = true
@@ -185,6 +225,9 @@ func (b *Backend) Open() (*sql.DB, error) {
 }
 
 func (b *Backend) connection() (*backendConn, error) {
+	if b.disabled {
+		return nil, ErrDefaultBackendDisabled
+	}
 	if b.closed.Load() {
 		return nil, ErrBackendClosed
 	}
@@ -248,6 +291,9 @@ func (b *Backend) connect(key string) (*backendConn, error) {
 	var db *sql.DB
 	var err error
 	if cfg.IsSQLite() {
+		if err = createSQLiteFile(cfg.SQLite3DataFile); err != nil {
+			return nil, fmt.Errorf("cannot create sqlite backend %q: %w", cfg.SQLite3DataFile, err)
+		}
 		if db, err = sqlutils.NewDB("sqlite3", cfg.SQLite3DataFile, nil); err != nil {
 			return nil, err
 		}
@@ -314,6 +360,29 @@ func (b *Backend) connect(key string) (*backendConn, error) {
 	return c, nil
 }
 
+// createSQLiteFile creates the data file of a SQLite backend that does not exist
+// yet, readable by its owner only: it holds host names, aliases and access
+// tokens, and SQLite would otherwise create it with the umask's 0644. The WAL
+// and shared-memory files SQLite adds next to it inherit its permissions. An
+// existing file is left alone (a too permissive one is only reported). The
+// directory is not created: a missing one is an error, as before.
+func createSQLiteFile(path string) error {
+	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file:") {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err == nil {
+		return f.Close()
+	}
+	if !errors.Is(err, fs.ErrExist) {
+		return err
+	}
+	if info, statErr := os.Stat(path); statErr == nil && info.Mode().Perm()&0o077 != 0 {
+		log.Warningf("sqlite backend %q is accessible by users other than its owner (mode %v); it holds access tokens: consider chmod 600", path, info.Mode().Perm())
+	}
+	return nil
+}
+
 // createMySQLDatabase issues "create database if not exists" on a short-lived
 // connection that is not tied to a database.
 func (b *Backend) createMySQLDatabase() error {
@@ -332,6 +401,9 @@ func (b *Backend) createMySQLDatabase() error {
 }
 
 func (b *Backend) mysqlGenericDSN() (string, error) {
+	if b.disabled {
+		return "", ErrDefaultBackendDisabled
+	}
 	cfg := b.cfg
 	uri := fmt.Sprintf("%s:%s@tcp(%s:%d)/?timeout=%ds&readTimeout=%ds&interpolateParams=true",
 		cfg.MySQLOrchestratorUser,
@@ -348,6 +420,9 @@ func (b *Backend) mysqlGenericDSN() (string, error) {
 }
 
 func (b *Backend) mysqlDSN() (string, error) {
+	if b.disabled {
+		return "", ErrDefaultBackendDisabled
+	}
 	cfg := b.cfg
 	uri := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?timeout=%ds&readTimeout=%ds&rejectReadOnly=%t&interpolateParams=true",
 		cfg.MySQLOrchestratorUser,
@@ -513,6 +588,9 @@ func (b *Backend) OpenTopology(host string, port int) (*sql.DB, error) {
 }
 
 func (b *Backend) openTopology(host string, port int, readTimeout int) (*sql.DB, error) {
+	if b.disabled {
+		return nil, ErrDefaultBackendDisabled
+	}
 	cfg := b.cfg
 	mysql_uri := fmt.Sprintf("%s:%s@tcp(%s:%d)/?timeout=%ds&readTimeout=%ds&interpolateParams=true",
 		cfg.MySQLTopologyUser,

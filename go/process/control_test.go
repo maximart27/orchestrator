@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -483,4 +484,42 @@ func TestSetDefaultControl(t *testing.T) {
 	if n := count(t, custom.Backend(), "node_health"); n != 1 {
 		t.Errorf("custom control node_health = %d", n)
 	}
+}
+
+// A mirror write that outlives Heartbeat (timeout) must not share mutable
+// state with the next Heartbeat, which rewrites nodeHealth.LastReported.
+func TestHeartbeatSlowMirrorDoesNotRaceWithNextHeartbeat(t *testing.T) {
+	c, _, _, _ := newControlWithMirrors(t)
+	c.SetMirrorTimeout(20 * time.Millisecond)
+	c.writeMirror = func(tg *target, nh *NodeHealth) (bool, error) {
+		deadline := time.Now().Add(200 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			_ = nh.LastReported // what writeRegisterNode reads
+			time.Sleep(time.Millisecond)
+		}
+		return true, nil
+	}
+	nh := NewNodeHealth()
+	for i := 0; i < 10; i++ {
+		c.Heartbeat(nh)
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// The registration tick and the first heartbeat of the TenantManager heartbeat
+// the same NodeHealth concurrently.
+func TestConcurrentHeartbeatsOfTheSameNodeHealth(t *testing.T) {
+	c, _, _, _ := newControlWithMirrors(t)
+	nh := testNode("h1")
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 5; j++ {
+				c.Heartbeat(nh)
+			}
+		}()
+	}
+	wg.Wait()
 }

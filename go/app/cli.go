@@ -782,7 +782,7 @@ func cliRun(session *cliSession, command string, strict bool, instance string, d
 			}
 			otherInstance := validateInstanceIsFound(tenant, destinationKey)
 
-			if canReplicate, _ := instance.CanReplicateFromEx(otherInstance, "CLI: can-replicate-from"); canReplicate {
+			if canReplicate, _ := tenant.Store.InstanceCanReplicateFromEx(instance, otherInstance, "CLI: can-replicate-from"); canReplicate {
 				fmt.Println(destinationKey.DisplayString())
 			}
 		}
@@ -1280,7 +1280,7 @@ func cliRun(session *cliSession, command string, strict bool, instance string, d
 				log.Fatalf("Unable to get status: unresolved instance")
 			}
 			instance := validateInstanceIsFound(tenant, instanceKey)
-			fmt.Println(instance.HumanReadableDescription())
+			fmt.Println(tenant.Store.InstanceHumanReadableDescription(instance))
 		}
 	case registerCliCommand("get-cluster-heuristic-lag", "Information", `For a given cluster (indicated by an instance or alias), output a heuristic "representative" lag of that cluster`):
 		{
@@ -1620,7 +1620,7 @@ func cliRun(session *cliSession, command string, strict bool, instance string, d
 			if err != nil {
 				log.Fatale(err)
 			}
-			err = tenant.Store.RegisterCandidateInstance(inst.NewCandidateDatabaseInstance(instanceKey, promotionRule).WithCurrentTime())
+			err = tenant.Store.RegisterCandidateInstance(tenant.Store.CandidateDatabaseInstanceWithCurrentTime(inst.NewCandidateDatabaseInstance(instanceKey, promotionRule)))
 			if err != nil {
 				log.Fatale(err)
 			}

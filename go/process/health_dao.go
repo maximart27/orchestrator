@@ -120,16 +120,37 @@ func writeRegisterNode(t *target, nodeHealth *NodeHealth) (healthy bool, err err
 	return false, nil
 }
 
+// heartbeatMu serialises the update of the NodeHealth a heartbeat reports: the
+// node registration tick and the first heartbeat of the TenantManager may run
+// together on the same (process-wide) NodeHealth.
+var heartbeatMu sync.Mutex
+
 // Heartbeat writes this node into node_health: first, synchronously, in the
 // control backend, whose outcome is the node health; then in every tenant
 // mirror, concurrently. A mirror that fails, is still busy with the previous
 // heartbeat or does not answer within the mirror timeout is reported in the
 // result under its tenant; it never affects the control outcome.
 func (c *Control) Heartbeat(nodeHealth *NodeHealth) *HeartbeatResult {
+	heartbeatMu.Lock()
 	nodeHealth.Update()
+	// A mirror write can outlive this call (timeout) while the next Heartbeat
+	// calls nodeHealth.Update(): the goroutines get an immutable copy. The
+	// struct cannot be copied as a whole (it holds a sync.Once).
+	snapshot := &NodeHealth{
+		Hostname:        nodeHealth.Hostname,
+		Token:           nodeHealth.Token,
+		AppVersion:      nodeHealth.AppVersion,
+		FirstSeenActive: nodeHealth.FirstSeenActive,
+		LastSeenActive:  nodeHealth.LastSeenActive,
+		ExtraInfo:       nodeHealth.ExtraInfo,
+		Command:         nodeHealth.Command,
+		DBBackend:       nodeHealth.DBBackend,
+		LastReported:    nodeHealth.LastReported,
+	}
+	heartbeatMu.Unlock()
 	res := &HeartbeatResult{At: time.Now(), Tenants: make(map[string]BackendHeartbeat)}
 
-	healthy, err := writeRegisterNode(c.control, nodeHealth)
+	healthy, err := writeRegisterNode(c.control, snapshot)
 	res.Control = BackendHeartbeat{Healthy: healthy, Err: err}
 	c.control.record(res.Control)
 	markHealthCheck(healthy)
@@ -155,7 +176,7 @@ func (c *Control) Heartbeat(nodeHealth *NodeHealth) *HeartbeatResult {
 		}
 		pending[t.id] = t
 		go func(t *target) {
-			healthy, err := c.writeMirror(t, nodeHealth)
+			healthy, err := c.writeMirror(t, snapshot)
 			hb := BackendHeartbeat{Healthy: healthy, Err: err}
 			t.record(hb)
 			t.finish()

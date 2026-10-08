@@ -27,8 +27,43 @@ import (
 
 	"github.com/proxysql/orchestrator/go/config"
 	"github.com/proxysql/orchestrator/go/db"
+	"github.com/proxysql/orchestrator/go/inst"
+	ometrics "github.com/proxysql/orchestrator/go/metrics"
 	"github.com/proxysql/orchestrator/go/process"
 )
+
+// The legacy defaults -- db.DefaultBackend() and inst.DefaultStore(), driven by
+// the global config.Config -- belong to the legacy single-tenant setup. A manager
+// built from a tenants file never uses them (even its tenant "default" has its
+// own backend and Store), so while one is alive they are disabled: a call that
+// was not migrated to its tenant fails with an error instead of creating a
+// schema on, or exiting the process because of, the base backend. The disabling
+// is reference counted, since several managers can coexist in a process (tests,
+// CLI helpers).
+var legacyDefaults struct {
+	mu   sync.Mutex
+	held int
+}
+
+func disableLegacyDefaults() {
+	legacyDefaults.mu.Lock()
+	defer legacyDefaults.mu.Unlock()
+	if legacyDefaults.held == 0 {
+		db.DisableDefaultBackend()
+		inst.DisableDefaultStore()
+	}
+	legacyDefaults.held++
+}
+
+func enableLegacyDefaults() {
+	legacyDefaults.mu.Lock()
+	defer legacyDefaults.mu.Unlock()
+	legacyDefaults.held--
+	if legacyDefaults.held == 0 {
+		db.EnableDefaultBackend()
+		inst.EnableDefaultStore()
+	}
+}
 
 // controlBackendID names the dedicated control backend of a multi-tenant node
 // that has no "default" tenant. It starts with an underscore, which no tenant
@@ -91,6 +126,8 @@ type TenantManager struct {
 	leader           Leadership
 	processBootstrap bool
 	legacy           bool
+	// defaultsDisabled is true while this manager holds the legacy defaults disabled.
+	defaultsDisabled bool
 
 	mu      sync.Mutex
 	started bool
@@ -150,6 +187,16 @@ func NewTenantManagerFor(base *config.Configuration, tenantConfigs []*config.Ten
 			m.release()
 		}
 	}()
+	if !m.legacy {
+		disableLegacyDefaults()
+		m.defaultsDisabled = true
+		if _, hasDefault := tenantIDs(tenantConfigs)[config.DefaultTenantID]; !hasDefault {
+			// The legacy metric variables of package metrics are the series of the
+			// tenant "default", created when the package loads. Without such a
+			// tenant they would be exported (at 0) for nothing.
+			ometrics.ForTenant(ometrics.DefaultTenant).Forget()
+		}
+	}
 
 	for _, tc := range tenantConfigs {
 		if _, dup := m.byID[tc.ID]; dup {
@@ -171,8 +218,17 @@ func NewTenantManagerFor(base *config.Configuration, tenantConfigs []*config.Ten
 		if err := m.control.AddMirror(t.ID, t.Backend); err != nil {
 			return nil, fmt.Errorf("tenant %q: %w", t.ID, err)
 		}
+		t.control = m.control
 	}
 	return m, nil
+}
+
+func tenantIDs(tenantConfigs []*config.TenantConfig) map[string]struct{} {
+	ids := make(map[string]struct{}, len(tenantConfigs))
+	for _, tc := range tenantConfigs {
+		ids[tc.ID] = struct{}{}
+	}
+	return ids
 }
 
 // setupControl decides the control backend (see TenantManager.control) and builds the control.
@@ -255,6 +311,12 @@ func (m *TenantManager) Start(ctx context.Context) error {
 			return err
 		}
 	}
+	// The first heartbeat reaches every tenant backend (synchronously) before any
+	// tenant starts its maintenance: what that maintenance expires depends on this
+	// node being in the node_health of the backend (see Tenant.nodeHealthMirrored).
+	if hb := m.control.Heartbeat(process.ThisNodeHealth); !hb.Control.OK() {
+		_ = log.Errorf("first heartbeat: the control backend did not register this node: %v", hb.Control.Err)
+	}
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
@@ -312,5 +374,9 @@ func (m *TenantManager) release() {
 			_ = log.Errorf("closing the control backend: %v", err)
 		}
 		m.ownedControlBackend = nil
+	}
+	if m.defaultsDisabled {
+		enableLegacyDefaults()
+		m.defaultsDisabled = false
 	}
 }

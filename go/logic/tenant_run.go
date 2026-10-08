@@ -210,7 +210,7 @@ func (t *Tenant) onHealthTick() {
 
 	if !wasAlreadyElected {
 		// Just turned to be leader!
-		go func() { _ = t.Store.ExpireMaintenance() }()
+		go func() { _ = t.expireMaintenance() }()
 	}
 
 	func() {
@@ -281,7 +281,7 @@ func (t *Tenant) onCaretakingTick(ctx context.Context, checkAndRecoverTimeRipe b
 		{"forget-expired-hostname-resolves", t.Store.ForgetExpiredHostnameResolves},
 		{"delete-invalid-hostname-resolves", t.Store.DeleteInvalidHostnameResolves},
 		{"resolve-unknown-master-hostname-resolves", t.Store.ResolveUnknownMasterHostnameResolves},
-		{"expire-maintenance", t.Store.ExpireMaintenance},
+		{"expire-maintenance", t.expireMaintenance},
 		{"expire-candidate-instances", t.Store.ExpireCandidateInstances},
 		{"expire-hostname-unresolve", t.Store.ExpireHostnameUnresolve},
 		{"expire-cluster-domain-name", t.Store.ExpireClusterDomainName},
@@ -316,7 +316,7 @@ func (t *Tenant) onRecoveryTick(ctx context.Context, timeRipe func() bool) {
 	t.launch(ctx, "clear-active-failure-detections", func() { _ = t.ClearActiveFailureDetections() })
 	t.launch(ctx, "clear-active-recoveries", func() { _ = t.ClearActiveRecoveries() })
 	t.launch(ctx, "expire-blocked-recoveries", func() { _ = t.ExpireBlockedRecoveries() })
-	t.launch(ctx, "acknowledge-crashed-recoveries", func() { _, _ = t.AcknowledgeCrashedRecoveries() })
+	t.launch(ctx, "acknowledge-crashed-recoveries", func() { _, _ = t.acknowledgeCrashedRecoveries() })
 	t.launch(ctx, "expire-instance-analysis-changelog", func() { _ = t.Store.ExpireInstanceAnalysisChangelog() })
 
 	t.launch(ctx, "check-and-recover", func() {
@@ -338,6 +338,49 @@ func (t *Tenant) onSnapshotTopologiesTick(ctx context.Context) {
 	if t.isLeaderOrActive() {
 		t.launch(ctx, "snapshot-topologies", func() { _ = t.Store.SnapshotTopologies() })
 	}
+}
+
+// mirrorFreshness is how recent the heartbeat of this node in a tenant backend
+// must be for the operations that rely on node_health. Rows older than
+// 5*HealthPollSeconds are purged, so this stays under that.
+var mirrorFreshness = 3 * config.HealthPollSeconds * time.Second
+
+// nodeHealthMirrored tells whether this node's heartbeat in the backend of the
+// tenant (its node_health mirror) is recent. ExpireMaintenance and
+// AcknowledgeCrashedRecoveries treat whatever is owned by a node that is NOT in
+// node_health as owned by a dead node and delete / acknowledge it: with a
+// lagging or failing mirror that would wipe the live maintenances and recoveries
+// of this very node, so they only run while the mirror is known to be fresh.
+func (t *Tenant) nodeHealthMirrored() bool {
+	if t.control == nil {
+		return true // a tenant outside a TenantManager has no mirror to wait for
+	}
+	for _, h := range t.control.TenantsHealth() {
+		if h.TenantID == t.ID {
+			return h.Healthy && !h.LastGood.IsZero() && time.Since(h.LastGood) <= mirrorFreshness
+		}
+	}
+	return false
+}
+
+// expireMaintenance is Store.ExpireMaintenance, deferred while the node_health
+// mirror of the tenant is not fresh (see nodeHealthMirrored).
+func (t *Tenant) expireMaintenance() error {
+	if !t.nodeHealthMirrored() {
+		log.Warningf("tenant %s: not expiring maintenances: this node's heartbeat in the tenant backend is not recent", t.ID)
+		return nil
+	}
+	return t.Store.ExpireMaintenance()
+}
+
+// acknowledgeCrashedRecoveries is AcknowledgeCrashedRecoveries, deferred while
+// the node_health mirror of the tenant is not fresh (see nodeHealthMirrored).
+func (t *Tenant) acknowledgeCrashedRecoveries() (int64, error) {
+	if !t.nodeHealthMirrored() {
+		log.Debugf("tenant %s: not acknowledging crashed recoveries: this node's heartbeat in the tenant backend is not recent", t.ID)
+		return 0, nil
+	}
+	return t.AcknowledgeCrashedRecoveries()
 }
 
 // handleDiscoveryRequests starts the pools of workers that take instance keys

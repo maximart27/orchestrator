@@ -36,6 +36,7 @@ import (
 	"github.com/proxysql/orchestrator/go/inst"
 	"github.com/proxysql/orchestrator/go/kv"
 	ometrics "github.com/proxysql/orchestrator/go/metrics"
+	"github.com/proxysql/orchestrator/go/process"
 	"github.com/proxysql/orchestrator/go/proxysql"
 )
 
@@ -98,6 +99,9 @@ type Tenant struct {
 	ownsBackend bool
 
 	leader Leadership
+	// control is the node control whose heartbeat is mirrored into the backend of
+	// the tenant; nil for a tenant that is not run by a TenantManager.
+	control *process.Control
 
 	// discovery
 	discoveryQueue              *discovery.Queue

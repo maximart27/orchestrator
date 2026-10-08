@@ -3,9 +3,11 @@ package db
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/proxysql/golib/sqlutils"
@@ -348,5 +350,110 @@ func TestDefaultBackendIsSingleton(t *testing.T) {
 	}
 	if got[0].ID() != DefaultBackendID {
 		t.Errorf("unexpected default id %q", got[0].ID())
+	}
+}
+
+func TestDisabledDefaultBackendFailsWithoutTouchingAnything(t *testing.T) {
+	// the base configuration points at a MySQL backend that does not exist: if the
+	// disabled backend ever tried to use it, this would hang, create a schema or
+	// exit the process
+	prev := *config.Config
+	config.Config.BackendDB = "mysql"
+	config.Config.MySQLOrchestratorHost = "203.0.113.1"
+	defer func() { *config.Config = prev }()
+
+	DisableDefaultBackend()
+	defer EnableDefaultBackend()
+
+	b := DefaultBackend()
+	if _, err := b.Exec("select 1"); !errors.Is(err, ErrDefaultBackendDisabled) {
+		t.Errorf("Exec: expected ErrDefaultBackendDisabled, got %v", err)
+	}
+	if _, err := b.Open(); !errors.Is(err, ErrDefaultBackendDisabled) {
+		t.Errorf("Open: %v", err)
+	}
+	if err := b.EnsureSchema(); !errors.Is(err, ErrDefaultBackendDisabled) {
+		t.Errorf("EnsureSchema: %v", err)
+	}
+	if _, err := b.ReadTimeNow(); !errors.Is(err, ErrDefaultBackendDisabled) {
+		t.Errorf("ReadTimeNow: %v", err)
+	}
+	if _, err := b.OpenTopology("127.0.0.1", 3306); !errors.Is(err, ErrDefaultBackendDisabled) {
+		t.Errorf("OpenTopology: %v", err)
+	}
+	if _, err := b.OpenDiscovery("127.0.0.1", 3306); !errors.Is(err, ErrDefaultBackendDisabled) {
+		t.Errorf("OpenDiscovery: %v", err)
+	}
+	// the package-level legacy shims land on it too
+	if _, err := ExecOrchestrator("select 1"); !errors.Is(err, ErrDefaultBackendDisabled) {
+		t.Errorf("ExecOrchestrator: %v", err)
+	}
+	if _, err := OpenTopology("127.0.0.1", 3306); !errors.Is(err, ErrDefaultBackendDisabled) {
+		t.Errorf("package OpenTopology: %v", err)
+	}
+	if err := b.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+}
+
+func TestDisableDefaultBackendIsReversible(t *testing.T) {
+	DisableDefaultBackend()
+	disabled := DefaultBackend()
+	EnableDefaultBackend()
+	if enabled := DefaultBackend(); enabled == disabled || enabled.disabled {
+		t.Errorf("EnableDefaultBackend must bring the legacy backend back")
+	}
+}
+
+func TestSQLiteFileIsCreatedPrivate(t *testing.T) {
+	prevMask := syscall.Umask(0)
+	defer syscall.Umask(prevMask)
+	file := filepath.Join(t.TempDir(), "private.sqlite3")
+	b, err := NewBackend("p", sqliteConfig(t, file))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.EnsureSchema(); err != nil {
+		t.Fatal(err)
+	}
+	// with a umask of 0 any 0644 would show: the files must be owner-only anyway
+	matches, err := filepath.Glob(file + "*")
+	if err != nil || len(matches) == 0 {
+		t.Fatalf("no sqlite files found: %v", err)
+	}
+	for _, m := range matches {
+		info, err := os.Stat(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			t.Errorf("%s has mode %v: group/other must have no access", m, perm)
+		}
+	}
+}
+
+func TestExistingSQLiteFileIsNotChmodded(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "existing.sqlite3")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(file, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewBackend("e", sqliteConfig(t, file))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	info, _ := os.Stat(file)
+	if info.Mode().Perm() != 0o644 {
+		t.Errorf("an existing file must keep its mode, got %v", info.Mode().Perm())
+	}
+}
+
+func TestSQLiteInMissingDirectoryFails(t *testing.T) {
+	if _, err := NewBackend("m", sqliteConfig(t, filepath.Join(t.TempDir(), "nope", "x.sqlite3"))); err == nil {
+		t.Error("a SQLite file in a missing directory must be an error")
 	}
 }
