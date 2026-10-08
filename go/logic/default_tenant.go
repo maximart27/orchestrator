@@ -18,6 +18,7 @@ package logic
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -67,7 +68,8 @@ func DefaultManager() *TenantManager {
 		{ID: config.DefaultTenantID, Provider: provider, Cfg: config.Config},
 	}, WithoutProcessBootstrap())
 	if err != nil {
-		log.Fatalf("logic: cannot build the default tenant: %v", err)
+		// the legacy API has no way to report it, and a half built default tenant is worse than none
+		panic(fmt.Sprintf("logic: cannot build the default tenant: %v", err))
 	}
 	defaultManager.Store(m)
 	return m
@@ -81,7 +83,7 @@ func DefaultManager() *TenantManager {
 func DefaultTenant() *Tenant {
 	t := DefaultManager().Default()
 	if t == nil {
-		log.Fatalf("logic: the legacy API was used in a multi-tenant process without a %q tenant; resolve the tenant in the TenantManager", config.DefaultTenantID)
+		panic(fmt.Sprintf("logic: the legacy API was used in a multi-tenant process without a %q tenant; resolve the tenant in the TenantManager", config.DefaultTenantID))
 	}
 	return t
 }
