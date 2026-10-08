@@ -1,5 +1,3 @@
-//go:build rtbugs
-
 package orcraft
 
 import (
@@ -13,15 +11,13 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// BUG (rt-prop): the snapshot is not a point-in-time image of the FSM at the Raft
-// index it is labelled with. fsm.Snapshot() (fsm.go) returns immediately and
-// fsmSnapshot.Persist (fsm_snapshot.go) reads the state LATER, while Apply keeps
-// running (hashicorp/raft: "Persist should write the state as of the time Snapshot
-// was called"). A node that restores such a snapshot and then replays the log from
-// the labelled index applies the entries between the two points TWICE: harmless for
-// idempotent upserts, a divergence for any op that is not idempotent.
-//
-// Run: go test -tags rtbugs -run TestBugSnapshotIsNotPointInTime ./go/raft/
+// Regression test (rt-prop): the snapshot must be a point-in-time image of the FSM at
+// the Raft index it is labelled with. fsm.Snapshot() used to return immediately and
+// fsmSnapshot.Persist to read the state LATER, while Apply kept running (hashicorp/raft:
+// "Persist should write the state as of the time Snapshot was called"). A node that
+// restored such a snapshot and replayed the log from the labelled index applied the
+// entries between the two points TWICE: harmless for idempotent upserts, a divergence
+// for any op that is not idempotent.
 
 type countingApplier struct {
 	mu    sync.Mutex
@@ -58,7 +54,7 @@ func (*bytesSink) Close() error  { return nil }
 func (*bytesSink) ID() string    { return "test" }
 func (*bytesSink) Cancel() error { return nil }
 
-func TestBugSnapshotIsNotPointInTime(t *testing.T) {
+func TestSnapshotIsPointInTime(t *testing.T) {
 	leaderApp, followerApp := &countingApplier{}, &countingApplier{}
 	leader := (*fsm)(NewStore("", "", "", leaderApp, leaderApp))
 	follower := (*fsm)(NewStore("", "", "", followerApp, followerApp))

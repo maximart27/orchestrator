@@ -20,24 +20,20 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// fsmSnapshot handles raft persisting of snapshots
+// fsmSnapshot handles raft persisting of snapshots. It holds the state of the FSM
+// as it was when Raft took the snapshot (see fsm.Snapshot), not a way to read it later.
 type fsmSnapshot struct {
-	snapshotCreatorApplier SnapshotCreatorApplier
+	data []byte
 }
 
-func newFsmSnapshot(snapshotCreatorApplier SnapshotCreatorApplier) *fsmSnapshot {
-	return &fsmSnapshot{
-		snapshotCreatorApplier: snapshotCreatorApplier,
-	}
+func newFsmSnapshot(data []byte) *fsmSnapshot {
+	return &fsmSnapshot{data: data}
 }
 
 // Persist
 func (f *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
-	data, err := f.snapshotCreatorApplier.GetData()
-	if err != nil {
-		return err
-	}
-	if _, err := sink.Write(data); err != nil {
+	if _, err := sink.Write(f.data); err != nil {
+		_ = sink.Cancel()
 		return err
 	}
 	return sink.Close()

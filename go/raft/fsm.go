@@ -94,10 +94,18 @@ func (f *fsm) yieldByHint(hint string) interface{} {
 	return Yield()
 }
 
-// Snapshot returns a snapshot object of freno's state
+// Snapshot returns a snapshot object of the state of the FSM. Raft labels the snapshot
+// with the index of the last applied entry and, after restoring it, replays the log from
+// the next one: the state must therefore be read NOW, while Raft guarantees that no
+// entry is being applied (Apply and Snapshot run on the same goroutine), and not later in
+// Persist, which runs concurrently with Apply. Reading it lazily would put the effect of
+// entries beyond the labelled index in the snapshot, and the replay would apply them twice.
 func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
-	snapshot := newFsmSnapshot(f.snapshotCreatorApplier)
-	return snapshot, nil
+	data, err := f.snapshotCreatorApplier.GetData()
+	if err != nil {
+		return nil, err
+	}
+	return newFsmSnapshot(data), nil
 }
 
 // Restore restores freno state
