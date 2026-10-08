@@ -3048,7 +3048,13 @@ func (s *Store) enqueueInstanceWrite(instance *Instance, instanceWasActuallyFoun
 		default:
 		}
 	}
-	s.instanceWriteBuffer <- instanceUpdateObject{instance, instanceWasActuallyFound, lastError}
+	select {
+	case s.instanceWriteBuffer <- instanceUpdateObject{instance, instanceWasActuallyFound, lastError}:
+	case <-s.stop:
+		// Close() raced with a producer blocked on a full buffer: nobody will
+		// drain it any more, so the write is dropped instead of blocking forever.
+		log.Debugf("enqueueInstanceWrite: store %q closed while waiting; dropping write of %+v", s.id, instance.Key)
+	}
 }
 
 // flushInstanceWriteBuffer saves enqueued instances to Orchestrator Db
