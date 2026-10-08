@@ -36,14 +36,23 @@ func raftReverseProxyMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		r.Header.Del("Accept-Encoding")
-		proxy := httputil.NewSingleHostReverseProxy(u)
-		proxy.Transport, err = orcraft.GetRaftHttpTransport()
+		transport, err := orcraft.GetRaftHttpTransport()
 		if err != nil {
 			_ = log.Errore(err)
 			next.ServeHTTP(w, r)
 			return
 		}
-		proxy.ServeHTTP(w, r)
+		forwardToLeader(w, r, u, transport)
 	})
+}
+
+// forwardToLeader proxies r to the leader as it came: path, query string and
+// headers -- hence the tenant of the request, whether it is in the path, in the
+// X-Orchestrator-Tenant header or in the tenant query parameter -- travel
+// untouched. The tenant is resolved again by the leader.
+func forwardToLeader(w http.ResponseWriter, r *http.Request, leader *url.URL, transport http.RoundTripper) {
+	r.Header.Del("Accept-Encoding")
+	proxy := httputil.NewSingleHostReverseProxy(leader)
+	proxy.Transport = transport
+	proxy.ServeHTTP(w, r)
 }

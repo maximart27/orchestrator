@@ -103,6 +103,7 @@ type Store struct {
 	readAllResolvedHostnamesCounter   metrics.Counter
 
 	registeredMetrics map[string]interface{}
+	ownedCollections  []*collection.Collection // non-default tenants only; closed with the Store
 
 	closed      atomic.Bool
 	stop        chan struct{}
@@ -131,7 +132,7 @@ func withLegacyMixedProviders() StoreOption {
 // WithProviderType says otherwise. The flusher goroutine of the instance write
 // buffer starts here and stops in Close. No process-wide state is touched
 // except the metrics registry, where the tenant's metrics are registered as
-// "tenant.<id>.<name>".
+// "tenants.<id>.<name>".
 func NewStore(id string, cfg *config.Configuration, backend *db.Backend, opts ...StoreOption) (*Store, error) {
 	if id == "" {
 		return nil, errors.New("inst: store id must not be empty")
@@ -252,6 +253,9 @@ func (s *Store) Close() error {
 		close(s.stop)
 		<-s.flusherDone
 		s.flushInstanceWriteBuffer()
+		for _, c := range s.ownedCollections {
+			c.Close()
+		}
 		for name, m := range s.registeredMetrics {
 			if metrics.Get(name) == m {
 				metrics.Unregister(name)
@@ -303,7 +307,7 @@ func (s *Store) scopedName(name string) string {
 	if s.id == db.DefaultBackendID {
 		return name
 	}
-	return "tenant." + s.id + "." + name
+	return "tenants." + s.id + "." + name
 }
 
 // newCounter creates a counter and registers it in the metrics registry. A
@@ -328,11 +332,13 @@ func (s *Store) registerMetric(name string, m interface{}) {
 }
 
 func (s *Store) newCollection(name string) *collection.Collection {
-	c := collection.CreateOrReturnCollection(s.scopedName(name))
-	if retention := time.Duration(s.cfg.DiscoveryCollectionRetentionSeconds) * time.Second; s.id != db.DefaultBackendID && c.ExpirePeriod() != retention {
-		// the collection package sizes a new collection from the global
-		// configuration; a tenant may retain its metrics for a different time
-		c.SetExpirePeriod(retention)
+	if s.id == db.DefaultBackendID {
+		// the legacy API reads the named collections of the default tenant
+		return collection.CreateOrReturnCollection(name)
 	}
+	// a tenant owns its collections: they are not in the global registry and are
+	// stopped with the Store
+	c := collection.New(time.Duration(s.cfg.DiscoveryCollectionRetentionSeconds) * time.Second)
+	s.ownedCollections = append(s.ownedCollections, c)
 	return c
 }

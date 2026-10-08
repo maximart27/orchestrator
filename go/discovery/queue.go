@@ -26,6 +26,7 @@ push() operation never blocks while pop() blocks on an empty queue.
 package discovery
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -209,8 +210,22 @@ func (q *Queue) Push(key inst.InstanceKey) {
 // Release must be called once after Consume.
 func (q *Queue) Consume() inst.InstanceKey {
 	// q.queue is never reassigned, so it can be read without the lock
-	key := <-q.queue
+	return q.consumed(<-q.queue)
+}
 
+// ConsumeContext is Consume that gives up when ctx is done: it returns ok=false
+// without consuming anything. When ok is true, Release must be called once.
+func (q *Queue) ConsumeContext(ctx context.Context) (key inst.InstanceKey, ok bool) {
+	select {
+	case <-ctx.Done():
+		return inst.InstanceKey{}, false
+	case key = <-q.queue:
+		return q.consumed(key), true
+	}
+}
+
+// consumed registers key, just taken off the channel, as being processed.
+func (q *Queue) consumed(key inst.InstanceKey) inst.InstanceKey {
 	q.Lock()
 	defer q.Unlock()
 

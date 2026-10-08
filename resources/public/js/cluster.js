@@ -1436,7 +1436,7 @@ function Cluster() {
         if (recovery.IsSuccessful === false) {
           glyph = '<i class="bi text-danger bi-x-circle-fill" aria-hidden="true"></i>';
         }
-        var content = '<a href="/web/audit-recovery/uid/'+recovery.UID+'">' + recovery.RecoveryStartTimestamp + '</a>: ' + glyph + ' ' + recovery.AnalysisEntry.Analysis
+        var content = '<a href="' + appUrl('/web/audit-recovery/uid/' + recovery.UID) + '">' + recovery.RecoveryStartTimestamp + '</a>: ' + glyph + ' ' + recovery.AnalysisEntry.Analysis
         addSidebarInfoPopoverContent(content, "audit-recovery", true);
       });
     });

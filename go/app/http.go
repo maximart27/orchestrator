@@ -26,7 +26,6 @@ import (
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
 	"github.com/proxysql/orchestrator/go/agent"
-	"github.com/proxysql/orchestrator/go/collection"
 	"github.com/proxysql/orchestrator/go/config"
 	"github.com/proxysql/orchestrator/go/http"
 	"github.com/proxysql/orchestrator/go/inst"
@@ -38,11 +37,8 @@ import (
 	"github.com/proxysql/golib/log"
 )
 
-const discoveryMetricsName = "DISCOVERY_METRICS"
-
 var sslPEMPassword []byte
 var agentSSLPEMPassword []byte
-var discoveryMetrics *collection.Collection
 
 func revalidateStaticAssets(next nethttp.Handler) nethttp.Handler {
 	return nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
@@ -55,12 +51,24 @@ func revalidateStaticAssets(next nethttp.Handler) nethttp.Handler {
 func Http(continuousDiscovery bool) {
 	promptForSSLPasswords()
 	ometrics.InitPrometheus()
-	process.ContinuousRegistration(string(process.OrchestratorExecutionHttpMode), "")
+
+	if err := checkAgentsSupport(config.Config); err != nil {
+		_ = log.Fatale(err)
+	}
+	// One TenantManager per process. It is built before the node registers itself
+	// (ContinuousRegistration uses the control of the manager) and, without a
+	// tenants file, it is the legacy single tenant "default" over config.Config.
+	manager, err := buildProcessManager(config.Config)
+	if err != nil {
+		_ = log.Fatale(err)
+	}
+	logic.SetDefaultManager(manager)
+	manager.Control().ContinuousRegistration(string(process.OrchestratorExecutionHttpMode), "")
 
 	if config.Config.ServeAgentsHttp {
 		go agentsHttp()
 	}
-	standardHttp(continuousDiscovery)
+	standardHttp(manager, continuousDiscovery)
 }
 
 // Iterate over the private keys and get passwords for them
@@ -79,7 +87,7 @@ func promptForSSLPasswords() {
 }
 
 // standardHttp starts serving HTTP or HTTPS (api/web) requests, to be used by normal clients
-func standardHttp(continuousDiscovery bool) {
+func standardHttp(manager *logic.TenantManager, continuousDiscovery bool) {
 	router := chi.NewRouter()
 
 	// Middleware
@@ -128,11 +136,16 @@ func standardHttp(continuousDiscovery bool) {
 
 	if continuousDiscovery {
 		// start to expire metric collection info
-		discoveryMetrics = collection.CreateOrReturnCollection(discoveryMetricsName)
-		discoveryMetrics.SetExpirePeriod(time.Duration(config.Config.DiscoveryCollectionRetentionSeconds) * time.Second)
+		for _, t := range manager.All() {
+			t.DiscoveryMetrics().SetExpirePeriod(time.Duration(t.Cfg.DiscoveryCollectionRetentionSeconds) * time.Second)
+		}
 
 		log.Info("Starting Discovery")
-		go logic.ContinuousDiscovery()
+		stop, err := startManager(manager)
+		if err != nil {
+			_ = log.Fatale(err)
+		}
+		shutdownOnInterrupt(manager, stop)
 	}
 
 	log.Info("Registering endpoints")
