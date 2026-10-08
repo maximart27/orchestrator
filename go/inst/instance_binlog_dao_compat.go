@@ -1,0 +1,58 @@
+// Transitional: package-level wrappers around DefaultStore(), the legacy single-tenant
+// store, so the packages that still use the pre-multi-tenant API keep compiling.
+// They are removed once those packages use their tenant's Store.
+
+package inst
+
+import (
+	"regexp"
+)
+
+// ReadBinlogEventAtRelayLogCoordinates runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).ReadBinlogEventAtRelayLogCoordinates on the tenant's Store.
+func ReadBinlogEventAtRelayLogCoordinates(instanceKey *InstanceKey, relaylogCoordinates *BinlogCoordinates) (binlogEvent *BinlogEvent, err error) {
+	return DefaultStore().ReadBinlogEventAtRelayLogCoordinates(instanceKey, relaylogCoordinates)
+}
+
+// GetLastExecutedEntryInRelayLogs runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).GetLastExecutedEntryInRelayLogs on the tenant's Store.
+func GetLastExecutedEntryInRelayLogs(instance *Instance, minBinlogCoordinates *BinlogCoordinates, recordedInstanceRelayLogCoordinates BinlogCoordinates) (binlogEvent *BinlogEvent, err error) {
+	return DefaultStore().GetLastExecutedEntryInRelayLogs(instance, minBinlogCoordinates, recordedInstanceRelayLogCoordinates)
+}
+
+// SearchEventInRelayLogs runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).SearchEventInRelayLogs on the tenant's Store.
+func SearchEventInRelayLogs(searchEvent *BinlogEvent, instance *Instance, minBinlogCoordinates *BinlogCoordinates, recordedInstanceRelayLogCoordinates BinlogCoordinates) (binlogCoordinates, nextCoordinates *BinlogCoordinates, found bool, err error) {
+	return DefaultStore().SearchEventInRelayLogs(searchEvent, instance, minBinlogCoordinates, recordedInstanceRelayLogCoordinates)
+}
+
+// SearchEntryInBinlog runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).SearchEntryInBinlog on the tenant's Store.
+func SearchEntryInBinlog(pseudoGTIDRegexp *regexp.Regexp, instanceKey *InstanceKey, binlog string, entryText string, monotonicPseudoGTIDEntries bool, minBinlogCoordinates *BinlogCoordinates) (BinlogCoordinates, bool, error) {
+	return DefaultStore().SearchEntryInBinlog(pseudoGTIDRegexp, instanceKey, binlog, entryText, monotonicPseudoGTIDEntries, minBinlogCoordinates)
+}
+
+// SearchEntryInInstanceBinlogs runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).SearchEntryInInstanceBinlogs on the tenant's Store.
+func SearchEntryInInstanceBinlogs(instance *Instance, entryText string, monotonicPseudoGTIDEntries bool, minBinlogCoordinates *BinlogCoordinates) (*BinlogCoordinates, error) {
+	return DefaultStore().SearchEntryInInstanceBinlogs(instance, entryText, monotonicPseudoGTIDEntries, minBinlogCoordinates)
+}
+
+// GetNextBinlogCoordinatesToMatch runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).GetNextBinlogCoordinatesToMatch on the tenant's Store.
+func GetNextBinlogCoordinatesToMatch(instance *Instance, instanceCoordinates BinlogCoordinates, recordedInstanceRelayLogCoordinates BinlogCoordinates, maxBinlogCoordinates *BinlogCoordinates, other *Instance, otherCoordinates BinlogCoordinates) (*BinlogCoordinates, int, error) {
+	return DefaultStore().GetNextBinlogCoordinatesToMatch(instance, instanceCoordinates, recordedInstanceRelayLogCoordinates, maxBinlogCoordinates, other, otherCoordinates)
+}
+
+// GetPreviousGTIDs runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).GetPreviousGTIDs on the tenant's Store.
+func GetPreviousGTIDs(instanceKey *InstanceKey, binlog string) (previousGTIDs *OracleGtidSet, err error) {
+	return DefaultStore().GetPreviousGTIDs(instanceKey, binlog)
+}

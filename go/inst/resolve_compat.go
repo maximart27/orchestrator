@@ -1,0 +1,79 @@
+// Transitional: package-level wrappers around DefaultStore(), the legacy single-tenant
+// store, so the packages that still use the pre-multi-tenant API keep compiling.
+// They are removed once those packages use their tenant's Store.
+
+package inst
+
+import (
+	cache "github.com/patrickmn/go-cache"
+)
+
+// HostnameResolveMethodIsNone runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).HostnameResolveMethodIsNone on the tenant's Store.
+func HostnameResolveMethodIsNone() bool {
+	return DefaultStore().HostnameResolveMethodIsNone()
+}
+
+// ResolveHostname runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).ResolveHostname on the tenant's Store.
+func ResolveHostname(hostname string) (string, error) {
+	return DefaultStore().ResolveHostname(hostname)
+}
+
+// UpdateResolvedHostname runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).UpdateResolvedHostname on the tenant's Store.
+func UpdateResolvedHostname(hostname string, resolvedHostname string) bool {
+	return DefaultStore().UpdateResolvedHostname(hostname, resolvedHostname)
+}
+
+// LoadHostnameResolveCache runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).LoadHostnameResolveCache on the tenant's Store.
+func LoadHostnameResolveCache() error {
+	return DefaultStore().LoadHostnameResolveCache()
+}
+
+// FlushNontrivialResolveCacheToDatabase runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).FlushNontrivialResolveCacheToDatabase on the tenant's Store.
+func FlushNontrivialResolveCacheToDatabase() error {
+	return DefaultStore().FlushNontrivialResolveCacheToDatabase()
+}
+
+// ResetHostnameResolveCache runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).ResetHostnameResolveCache on the tenant's Store.
+func ResetHostnameResolveCache() error {
+	return DefaultStore().ResetHostnameResolveCache()
+}
+
+// HostnameResolveCache runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).HostnameResolveCache on the tenant's Store.
+func HostnameResolveCache() (map[string]cache.Item, error) {
+	return DefaultStore().HostnameResolveCache()
+}
+
+// UnresolveHostname runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).UnresolveHostname on the tenant's Store.
+func UnresolveHostname(instanceKey *InstanceKey) (InstanceKey, bool, error) {
+	return DefaultStore().UnresolveHostname(instanceKey)
+}
+
+// RegisterHostnameUnresolve runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).RegisterHostnameUnresolve on the tenant's Store.
+func RegisterHostnameUnresolve(registration *HostnameRegistration) (err error) {
+	return DefaultStore().RegisterHostnameUnresolve(registration)
+}
+
+// ResolveHostnameIPs runs against DefaultStore(), the legacy single-tenant store.
+//
+// Deprecated: use (*Store).ResolveHostnameIPs on the tenant's Store.
+func ResolveHostnameIPs(hostname string) error {
+	return DefaultStore().ResolveHostnameIPs(hostname)
+}

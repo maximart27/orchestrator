@@ -35,19 +35,20 @@ type deadInstance struct {
 	TryCnt        int
 }
 
+// deadInstancesFilter is the dead instances cache of ONE tenant (see Store.DeadInstancesFilter).
 type deadInstancesFilter struct {
+	cfg                *config.Configuration
+	counter            metrics.Counter
 	deadInstances      map[InstanceKey]deadInstance
 	deadInstancesMutex sync.RWMutex
 }
 
-var DeadInstancesFilter deadInstancesFilter
-
-var deadInstancesCounter = metrics.NewCounter()
-
-func init() {
-	_ = metrics.Register("discoveries.dead_instances", deadInstancesCounter)
-	DeadInstancesFilter.deadInstances = make(map[InstanceKey]deadInstance)
-	DeadInstancesFilter.deadInstancesMutex = sync.RWMutex{}
+func newDeadInstancesFilter(cfg *config.Configuration, counter metrics.Counter) *deadInstancesFilter {
+	return &deadInstancesFilter{
+		cfg:           cfg,
+		counter:       counter,
+		deadInstances: make(map[InstanceKey]deadInstance),
+	}
 }
 
 // RegisterInstance registers a given instance in a dead instances cache.
@@ -65,14 +66,14 @@ func (f *deadInstancesFilter) RegisterInstance(instanceKey *InstanceKey) {
 
 	instance, exists := f.deadInstances[*instanceKey]
 	if exists {
-		delayFactor = config.Config.DeadInstancePollSecondsMultiplyFactor * instance.DelayFactor
+		delayFactor = f.cfg.DeadInstancePollSecondsMultiplyFactor * instance.DelayFactor
 		previousTry = instance.TryCnt
 	} else {
-		deadInstancesCounter.Inc(1)
+		f.counter.Inc(1)
 	}
 
-	maxDelay := time.Duration(config.Config.DeadInstancePollSecondsMax) * time.Second
-	currentDelay := time.Duration(delayFactor*float32(config.Config.InstancePollSeconds)) * time.Second
+	maxDelay := time.Duration(f.cfg.DeadInstancePollSecondsMax) * time.Second
+	currentDelay := time.Duration(delayFactor*float32(f.cfg.InstancePollSeconds)) * time.Second
 
 	// needed only for the debug log below
 	delayFactorTmp := delayFactor
@@ -91,7 +92,7 @@ func (f *deadInstancesFilter) RegisterInstance(instanceKey *InstanceKey) {
 	}
 	f.deadInstances[*instanceKey] = instance
 
-	if config.Config.DeadInstanceDiscoveryLogsEnabled {
+	if f.cfg.DeadInstanceDiscoveryLogsEnabled {
 		log.Debugf("Dead instance registered %v:%v. Iteration: %v. Current delay factor: %v (next check in %v (on %v))",
 			instanceKey.Hostname, instanceKey.Port, instance.TryCnt, delayFactorTmp, currentDelay, instance.NextCheckTime)
 	}
@@ -104,11 +105,11 @@ func (f *deadInstancesFilter) UnregisterInstance(instanceKey *InstanceKey) {
 
 	instance, exists := f.deadInstances[*instanceKey]
 	if exists {
-		if config.Config.DeadInstanceDiscoveryLogsEnabled {
+		if f.cfg.DeadInstanceDiscoveryLogsEnabled {
 			log.Debugf("Dead instance unregistered: %v:%v after iteration: %v",
 				instanceKey.Hostname, instanceKey.Port, instance.TryCnt)
 		}
-		deadInstancesCounter.Dec(1)
+		f.counter.Dec(1)
 		delete(f.deadInstances, *instanceKey)
 	}
 }
@@ -133,7 +134,7 @@ func (f *deadInstancesFilter) InstanceRecheckNeeded(instanceKey *InstanceKey) (b
 		return exists, false
 	}
 
-	if config.Config.DeadInstanceDiscoveryLogsEnabled {
+	if f.cfg.DeadInstanceDiscoveryLogsEnabled {
 		log.Debugf("Dead instance recheck: %v:%v. Iteration: %v",
 			instanceKey.Hostname, instanceKey.Port, instance.TryCnt)
 	}

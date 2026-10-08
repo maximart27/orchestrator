@@ -19,18 +19,16 @@ package inst
 import (
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
-	"github.com/proxysql/orchestrator/go/config"
-	"github.com/proxysql/orchestrator/go/db"
 )
 
-func WriteMasterPositionEquivalence(master1Key *InstanceKey, master1BinlogCoordinates *BinlogCoordinates,
+func (s *Store) WriteMasterPositionEquivalence(master1Key *InstanceKey, master1BinlogCoordinates *BinlogCoordinates,
 	master2Key *InstanceKey, master2BinlogCoordinates *BinlogCoordinates) error {
 	if master1Key.Equals(master2Key) {
 		// Not interesting
 		return nil
 	}
 	writeFunc := func() error {
-		_, err := db.ExecOrchestrator(`
+		_, err := s.backend.Exec(`
         	insert into master_position_equivalence (
         			master1_hostname, master1_port, master1_binary_log_file, master1_binary_log_pos,
         			master2_hostname, master2_port, master2_binary_log_file, master2_binary_log_pos,
@@ -43,10 +41,10 @@ func WriteMasterPositionEquivalence(master1Key *InstanceKey, master1BinlogCoordi
 		)
 		return log.Errore(err)
 	}
-	return ExecDBWriteFunc(writeFunc)
+	return s.ExecDBWriteFunc(writeFunc)
 }
 
-func GetEquivalentMasterCoordinates(instanceCoordinates *InstanceBinlogCoordinates) (result [](*InstanceBinlogCoordinates), err error) {
+func (s *Store) GetEquivalentMasterCoordinates(instanceCoordinates *InstanceBinlogCoordinates) (result [](*InstanceBinlogCoordinates), err error) {
 	query := `
 		select 
 				master1_hostname as hostname,
@@ -85,7 +83,7 @@ func GetEquivalentMasterCoordinates(instanceCoordinates *InstanceBinlogCoordinat
 		instanceCoordinates.Coordinates.LogPos,
 	)
 
-	err = db.QueryOrchestrator(query, args, func(m sqlutils.RowMap) error {
+	err = s.backend.Query(query, args, func(m sqlutils.RowMap) error {
 		equivalentCoordinates := InstanceBinlogCoordinates{}
 		equivalentCoordinates.Key.Hostname = m.GetString("hostname")
 		equivalentCoordinates.Key.Port = m.GetInt("port")
@@ -103,8 +101,8 @@ func GetEquivalentMasterCoordinates(instanceCoordinates *InstanceBinlogCoordinat
 	return result, nil
 }
 
-func GetEquivalentBinlogCoordinatesFor(instanceCoordinates *InstanceBinlogCoordinates, belowKey *InstanceKey) (*BinlogCoordinates, error) {
-	possibleCoordinates, err := GetEquivalentMasterCoordinates(instanceCoordinates)
+func (s *Store) GetEquivalentBinlogCoordinatesFor(instanceCoordinates *InstanceBinlogCoordinates, belowKey *InstanceKey) (*BinlogCoordinates, error) {
+	possibleCoordinates, err := s.GetEquivalentMasterCoordinates(instanceCoordinates)
 	if err != nil {
 		return nil, err
 	}
@@ -117,14 +115,14 @@ func GetEquivalentBinlogCoordinatesFor(instanceCoordinates *InstanceBinlogCoordi
 }
 
 // ExpireMasterPositionEquivalence expires old master_position_equivalence
-func ExpireMasterPositionEquivalence() error {
+func (s *Store) ExpireMasterPositionEquivalence() error {
 	writeFunc := func() error {
-		_, err := db.ExecOrchestrator(`
+		_, err := s.backend.Exec(`
         	delete from master_position_equivalence 
 				where last_suggested < NOW() - INTERVAL ? HOUR
-				`, config.Config.UnseenInstanceForgetHours,
+				`, s.cfg.UnseenInstanceForgetHours,
 		)
 		return log.Errore(err)
 	}
-	return ExecDBWriteFunc(writeFunc)
+	return s.ExecDBWriteFunc(writeFunc)
 }

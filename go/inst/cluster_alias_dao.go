@@ -21,16 +21,14 @@ import (
 
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
-	"github.com/proxysql/orchestrator/go/config"
-	"github.com/proxysql/orchestrator/go/db"
 )
 
-func IsSQLite() bool {
-	return config.Config.IsSQLite()
+func (s *Store) IsSQLite() bool {
+	return s.cfg.IsSQLite()
 }
 
 // ReadClusterNameByAlias
-func ReadClusterNameByAlias(alias string) (clusterName string, err error) {
+func (s *Store) ReadClusterNameByAlias(alias string) (clusterName string, err error) {
 	query := `
 		select
 			cluster_name
@@ -40,7 +38,7 @@ func ReadClusterNameByAlias(alias string) (clusterName string, err error) {
 			alias = ?
 			or cluster_name = ?
 		`
-	err = db.QueryOrchestrator(query, sqlutils.Args(alias, alias), func(m sqlutils.RowMap) error {
+	err = s.backend.Query(query, sqlutils.Args(alias, alias), func(m sqlutils.RowMap) error {
 		clusterName = m.GetString("cluster_name")
 		return nil
 	})
@@ -55,11 +53,11 @@ func ReadClusterNameByAlias(alias string) (clusterName string, err error) {
 
 // DeduceClusterName attempts to resolve a cluster name given a name or alias.
 // If unsuccessful to match by alias, the function returns the same given string
-func DeduceClusterName(nameOrAlias string) (clusterName string, err error) {
+func (s *Store) DeduceClusterName(nameOrAlias string) (clusterName string, err error) {
 	if nameOrAlias == "" {
 		return "", fmt.Errorf("empty cluster name")
 	}
-	if name, err := ReadClusterNameByAlias(nameOrAlias); err == nil {
+	if name, err := s.ReadClusterNameByAlias(nameOrAlias); err == nil {
 		return name, nil
 	}
 	return nameOrAlias, nil
@@ -67,7 +65,7 @@ func DeduceClusterName(nameOrAlias string) (clusterName string, err error) {
 
 // ReadAliasByClusterName returns the cluster alias for the given cluster name,
 // or the cluster name itself if not explicit alias found
-func ReadAliasByClusterName(clusterName string) (alias string, err error) {
+func (s *Store) ReadAliasByClusterName(clusterName string) (alias string, err error) {
 	alias = clusterName // default return value
 	query := `
 		select
@@ -77,7 +75,7 @@ func ReadAliasByClusterName(clusterName string) (alias string, err error) {
 		where
 			cluster_name = ?
 		`
-	err = db.QueryOrchestrator(query, sqlutils.Args(clusterName), func(m sqlutils.RowMap) error {
+	err = s.backend.Query(query, sqlutils.Args(clusterName), func(m sqlutils.RowMap) error {
 		alias = m.GetString("alias")
 		return nil
 	})
@@ -85,9 +83,9 @@ func ReadAliasByClusterName(clusterName string) (alias string, err error) {
 }
 
 // WriteClusterAlias will write (and override) a single cluster name mapping
-func writeClusterAlias(clusterName string, alias string) error {
+func (s *Store) writeClusterAlias(clusterName string, alias string) error {
 	writeFunc := func() error {
-		_, err := db.ExecOrchestrator(`
+		_, err := s.backend.Exec(`
 			replace into
 					cluster_alias (cluster_name, alias, last_registered)
 				values
@@ -96,13 +94,13 @@ func writeClusterAlias(clusterName string, alias string) error {
 			clusterName, alias)
 		return log.Errore(err)
 	}
-	return ExecDBWriteFunc(writeFunc)
+	return s.ExecDBWriteFunc(writeFunc)
 }
 
 // writeClusterAliasManualOverride will write (and override) a single cluster name mapping
-func writeClusterAliasManualOverride(clusterName string, alias string) error {
+func (s *Store) writeClusterAliasManualOverride(clusterName string, alias string) error {
 	writeFunc := func() error {
-		_, err := db.ExecOrchestrator(`
+		_, err := s.backend.Exec(`
 			replace into
 					cluster_alias_override (cluster_name, alias)
 				values
@@ -111,12 +109,12 @@ func writeClusterAliasManualOverride(clusterName string, alias string) error {
 			clusterName, alias)
 		return log.Errore(err)
 	}
-	return ExecDBWriteFunc(writeFunc)
+	return s.ExecDBWriteFunc(writeFunc)
 }
 
 // Original, safe approach, which uses REPLACE INTO
-func updateClusterAliasesUsingReplace() error {
-	_, err := db.ExecOrchestrator(`
+func (s *Store) updateClusterAliasesUsingReplace() error {
+	_, err := s.backend.Exec(`
 	replace into
 			cluster_alias (alias, cluster_name, last_registered)
 		select
@@ -163,8 +161,8 @@ func updateClusterAliasesUsingReplace() error {
 // insert into t1 values (1, 2);
 // insert into t1 values (0, 2) on duplicate key update a=0, b=2;
 // ERROR 1062 (23000): Duplicate entry '2' for key 't1.b'
-func updateClusterAliasesUsingInsert() error {
-	_, err := db.ExecOrchestrator(`
+func (s *Store) updateClusterAliasesUsingInsert() error {
+	_, err := s.backend.Exec(`
 	INSERT INTO cluster_alias
 	(
 		alias,
@@ -196,29 +194,29 @@ func updateClusterAliasesUsingInsert() error {
 
 // UpdateClusterAliases writes down the cluster_alias table based on information
 // gained from database_instance
-func UpdateClusterAliases() error {
+func (s *Store) UpdateClusterAliases() error {
 	writeFunc := func() error {
 		var err error
-		if IsSQLite() {
+		if s.IsSQLite() {
 			// Sql lite backend
-			err = updateClusterAliasesUsingReplace()
+			err = s.updateClusterAliasesUsingReplace()
 		} else {
 			// MySQL backend (Orchestrator supports only SQLite and MySQL backends)
 			// INSERT ON DUPLICATE KEY UPDATE is more performant than REPLACE in MySQL
-			err = updateClusterAliasesUsingInsert()
+			err = s.updateClusterAliasesUsingInsert()
 			if err != nil {
 				// Fallback to the original, safe implementation
-				err = updateClusterAliasesUsingReplace()
+				err = s.updateClusterAliasesUsingReplace()
 			}
 		}
 		return log.Errore(err)
 	}
-	if err := ExecDBWriteFunc(writeFunc); err != nil {
+	if err := s.ExecDBWriteFunc(writeFunc); err != nil {
 		return err
 	}
 	writeFunc = func() error {
 		// Handling the case where no cluster alias exists: we write a dummy alias in the form of the real cluster name.
-		_, err := db.ExecOrchestrator(`
+		_, err := s.backend.Exec(`
 			replace into
 					cluster_alias (alias, cluster_name, last_registered)
 				select
@@ -232,7 +230,7 @@ func UpdateClusterAliases() error {
 			`)
 		return log.Errore(err)
 	}
-	if err := ExecDBWriteFunc(writeFunc); err != nil {
+	if err := s.ExecDBWriteFunc(writeFunc); err != nil {
 		return err
 	}
 	return nil
@@ -240,13 +238,13 @@ func UpdateClusterAliases() error {
 
 // ForgetLongUnseenClusterAliases will remove entries of cluster_aliases that have long since been last seen.
 // This function is compatible with ForgetLongUnseenInstances
-func ForgetLongUnseenClusterAliases() error {
-	sqlResult, err := db.ExecOrchestrator(`
+func (s *Store) ForgetLongUnseenClusterAliases() error {
+	sqlResult, err := s.backend.Exec(`
 			delete
 				from cluster_alias
 			where
 			last_registered < NOW() - interval ? hour`,
-		config.Config.UnseenInstanceForgetHours,
+		s.cfg.UnseenInstanceForgetHours,
 	)
 	if err != nil {
 		return log.Errore(err)
@@ -255,16 +253,16 @@ func ForgetLongUnseenClusterAliases() error {
 	if err != nil {
 		return log.Errore(err)
 	}
-	_ = AuditOperation("forget-clustr-aliases", nil, fmt.Sprintf("Forgotten aliases: %d", rows))
+	_ = s.AuditOperation("forget-clustr-aliases", nil, fmt.Sprintf("Forgotten aliases: %d", rows))
 	return err
 }
 
 // ReplaceAliasClusterName replaces alis mapping of one cluster name onto a new cluster name.
 // Used in topology failover/recovery
-func ReplaceAliasClusterName(oldClusterName string, newClusterName string) (err error) {
+func (s *Store) ReplaceAliasClusterName(oldClusterName string, newClusterName string) (err error) {
 	{
 		writeFunc := func() error {
-			_, err := db.ExecOrchestrator(`
+			_, err := s.backend.Exec(`
 			update cluster_alias
 				set cluster_name = ?
 				where cluster_name = ?
@@ -272,11 +270,11 @@ func ReplaceAliasClusterName(oldClusterName string, newClusterName string) (err 
 				newClusterName, oldClusterName)
 			return log.Errore(err)
 		}
-		err = ExecDBWriteFunc(writeFunc)
+		err = s.ExecDBWriteFunc(writeFunc)
 	}
 	{
 		writeFunc := func() error {
-			_, err := db.ExecOrchestrator(`
+			_, err := s.backend.Exec(`
 			update cluster_alias_override
 				set cluster_name = ?
 				where cluster_name = ?
@@ -284,7 +282,7 @@ func ReplaceAliasClusterName(oldClusterName string, newClusterName string) (err 
 				newClusterName, oldClusterName)
 			return log.Errore(err)
 		}
-		if ferr := ExecDBWriteFunc(writeFunc); ferr != nil {
+		if ferr := s.ExecDBWriteFunc(writeFunc); ferr != nil {
 			err = ferr
 		}
 	}
@@ -294,7 +292,7 @@ func ReplaceAliasClusterName(oldClusterName string, newClusterName string) (err 
 // ReadUnambiguousSuggestedClusterAliases reads potential master hostname:port who have suggested cluster aliases,
 // where no one else shares said suggested cluster alias. Such hostname:port are likely true owners
 // of the alias.
-func ReadUnambiguousSuggestedClusterAliases() (result map[string]InstanceKey, err error) {
+func (s *Store) ReadUnambiguousSuggestedClusterAliases() (result map[string]InstanceKey, err error) {
 	result = map[string]InstanceKey{}
 
 	query := `
@@ -312,7 +310,7 @@ func ReadUnambiguousSuggestedClusterAliases() (result map[string]InstanceKey, er
 		having
 			count(*) = 1
 		`
-	err = db.QueryOrchestrator(query, sqlutils.Args(), func(m sqlutils.RowMap) error {
+	err = s.backend.Query(query, sqlutils.Args(), func(m sqlutils.RowMap) error {
 		key := InstanceKey{Hostname: m.GetString("hostname"), Port: m.GetInt("port")}
 		suggestedAlias := m.GetString("suggested_cluster_alias")
 		result[suggestedAlias] = key

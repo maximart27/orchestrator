@@ -21,11 +21,10 @@ import (
 
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
-	"github.com/proxysql/orchestrator/go/db"
 )
 
-func PutInstanceTag(instanceKey *InstanceKey, tag *Tag) (err error) {
-	_, err = db.ExecOrchestrator(`
+func (s *Store) PutInstanceTag(instanceKey *InstanceKey, tag *Tag) (err error) {
+	_, err = s.backend.Exec(`
 			insert
 				into database_instance_tags (
 					hostname, port, tag_name, tag_value, last_updated
@@ -44,7 +43,7 @@ func PutInstanceTag(instanceKey *InstanceKey, tag *Tag) (err error) {
 	return err
 }
 
-func Untag(instanceKey *InstanceKey, tag *Tag) (tagged *InstanceKeyMap, err error) {
+func (s *Store) Untag(instanceKey *InstanceKey, tag *Tag) (tagged *InstanceKeyMap, err error) {
 	if tag == nil {
 		return nil, log.Errorf("Untag: tag is nil")
 	}
@@ -79,8 +78,8 @@ func Untag(instanceKey *InstanceKey, tag *Tag) (tagged *InstanceKeyMap, err erro
 		order by hostname, port
 		`, clause,
 	)
-	err = db.QueryOrchestrator(query, args, func(m sqlutils.RowMap) error {
-		key, _ := NewResolveInstanceKey(m.GetString("hostname"), m.GetInt("port"))
+	err = s.backend.Query(query, args, func(m sqlutils.RowMap) error {
+		key, _ := s.NewResolveInstanceKey(m.GetString("hostname"), m.GetInt("port"))
 		tagged.AddKey(*key)
 		return nil
 	})
@@ -92,14 +91,14 @@ func Untag(instanceKey *InstanceKey, tag *Tag) (tagged *InstanceKeyMap, err erro
 				%s
 			`, clause,
 	)
-	if _, err = db.ExecOrchestrator(query, args...); err != nil {
+	if _, err = s.backend.Exec(query, args...); err != nil {
 		return tagged, log.Errore(err)
 	}
-	AuditOperation("delete-instance-tag", instanceKey, tag.String())
+	s.AuditOperation("delete-instance-tag", instanceKey, tag.String())
 	return tagged, nil
 }
 
-func ReadInstanceTag(instanceKey *InstanceKey, tag *Tag) (tagExists bool, err error) {
+func (s *Store) ReadInstanceTag(instanceKey *InstanceKey, tag *Tag) (tagExists bool, err error) {
 	query := `
 		select
 			tag_value
@@ -111,7 +110,7 @@ func ReadInstanceTag(instanceKey *InstanceKey, tag *Tag) (tagExists bool, err er
 			and tag_name = ?
 			`
 	args := sqlutils.Args(instanceKey.Hostname, instanceKey.Port, tag.TagName)
-	err = db.QueryOrchestrator(query, args, func(m sqlutils.RowMap) error {
+	err = s.backend.Query(query, args, func(m sqlutils.RowMap) error {
 		tag.TagValue = m.GetString("tag_value")
 		tagExists = true
 		return nil
@@ -120,11 +119,11 @@ func ReadInstanceTag(instanceKey *InstanceKey, tag *Tag) (tagExists bool, err er
 	return tagExists, log.Errore(err)
 }
 
-func InstanceTagExists(instanceKey *InstanceKey, tag *Tag) (tagExists bool, err error) {
-	return ReadInstanceTag(instanceKey, &Tag{TagName: tag.TagName})
+func (s *Store) InstanceTagExists(instanceKey *InstanceKey, tag *Tag) (tagExists bool, err error) {
+	return s.ReadInstanceTag(instanceKey, &Tag{TagName: tag.TagName})
 }
 
-func ReadInstanceTags(instanceKey *InstanceKey) (tags [](*Tag), err error) {
+func (s *Store) ReadInstanceTags(instanceKey *InstanceKey) (tags [](*Tag), err error) {
 	tags = [](*Tag){}
 	query := `
 		select
@@ -137,7 +136,7 @@ func ReadInstanceTags(instanceKey *InstanceKey) (tags [](*Tag), err error) {
 		order by tag_name
 			`
 	args := sqlutils.Args(instanceKey.Hostname, instanceKey.Port)
-	err = db.QueryOrchestrator(query, args, func(m sqlutils.RowMap) error {
+	err = s.backend.Query(query, args, func(m sqlutils.RowMap) error {
 		tag := &Tag{
 			TagName:  m.GetString("tag_name"),
 			TagValue: m.GetString("tag_value"),
@@ -149,7 +148,7 @@ func ReadInstanceTags(instanceKey *InstanceKey) (tags [](*Tag), err error) {
 	return tags, log.Errore(err)
 }
 
-func GetInstanceKeysByTag(tag *Tag) (tagged *InstanceKeyMap, err error) {
+func (s *Store) GetInstanceKeysByTag(tag *Tag) (tagged *InstanceKeyMap, err error) {
 	if tag == nil {
 		return nil, log.Errorf("GetInstanceKeysByTag: tag is nil")
 	}
@@ -183,8 +182,8 @@ func GetInstanceKeysByTag(tag *Tag) (tagged *InstanceKeyMap, err error) {
 			%s
 		order by hostname, port
 		`, clause)
-	err = db.QueryOrchestrator(query, args, func(m sqlutils.RowMap) error {
-		key, _ := NewResolveInstanceKey(m.GetString("hostname"), m.GetInt("port"))
+	err = s.backend.Query(query, args, func(m sqlutils.RowMap) error {
+		key, _ := s.NewResolveInstanceKey(m.GetString("hostname"), m.GetInt("port"))
 		tagged.AddKey(*key)
 		return nil
 	})

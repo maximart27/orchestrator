@@ -26,7 +26,6 @@ import (
 
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/math"
-	"github.com/proxysql/orchestrator/go/config"
 )
 
 const ReasonableDiscoveryLatency = 500 * time.Millisecond
@@ -481,7 +480,7 @@ func (this *Instance) IsDescendantOf(other *Instance) bool {
 
 // CanReplicateFrom uses heuristics to decide whether this instacne can practically replicate from other instance.
 // Checks are made to binlog format, version number, binary logs etc.
-func (this *Instance) CanReplicateFrom(other *Instance) (bool, error) {
+func (s *Store) InstanceCanReplicateFrom(this *Instance, other *Instance) (bool, error) {
 	var warningMsg error = nil
 
 	if this.Key.Equals(&other.Key) {
@@ -499,7 +498,7 @@ func (this *Instance) CanReplicateFrom(other *Instance) (bool, error) {
 	}
 	if this.IsSmallerMajorVersion(other) && !this.IsBinlogServer() {
 		warningMsg = fmt.Errorf("instance %+v has version %s, which is lower than %s on %+v ", this.Key, this.Version, other.Version, other.Key)
-		if !config.Config.LowerReplicaVersionAllowed {
+		if !s.cfg.LowerReplicaVersionAllowed {
 			return false, warningMsg
 		}
 	}
@@ -508,7 +507,7 @@ func (this *Instance) CanReplicateFrom(other *Instance) (bool, error) {
 			return false, fmt.Errorf("Cannot replicate from %+v binlog format on %+v to %+v on %+v", other.Binlog_format, other.Key, this.Binlog_format, this.Key)
 		}
 	}
-	if config.Config.VerifyReplicationFilters {
+	if s.cfg.VerifyReplicationFilters {
 		if other.HasReplicationFilters && !this.HasReplicationFilters {
 			return false, fmt.Errorf("%+v has replication filters", other.Key)
 		}
@@ -519,7 +518,7 @@ func (this *Instance) CanReplicateFrom(other *Instance) (bool, error) {
 	if this.ServerUUID == other.ServerUUID && this.ServerUUID != "" && !this.IsBinlogServer() {
 		return false, fmt.Errorf("Identical server UUID: %+v, %+v both have %s", other.Key, this.Key, this.ServerUUID)
 	}
-	if this.SQLDelay < other.SQLDelay && int64(other.SQLDelay) > int64(config.Config.ReasonableMaintenanceReplicationLagSeconds) {
+	if this.SQLDelay < other.SQLDelay && int64(other.SQLDelay) > int64(s.cfg.ReasonableMaintenanceReplicationLagSeconds) {
 		return false, fmt.Errorf("%+v has higher SQL_Delay (%+v seconds) than %+v does (%+v seconds)", other.Key, other.SQLDelay, this.Key, this.SQLDelay)
 	}
 	return true, warningMsg
@@ -528,10 +527,10 @@ func (this *Instance) CanReplicateFrom(other *Instance) (bool, error) {
 const logPrefix = "Replicating from higher version source is enabled by LowerReplicaVersionAllowed config parameter. " +
 	"Note that such a configuration is not officially supported by MySQL."
 
-func (this *Instance) CanReplicateFromEx(other *Instance, logContext string) (bool, error) {
-	canReplicate, err := this.CanReplicateFrom(other)
+func (s *Store) InstanceCanReplicateFromEx(this *Instance, other *Instance, logContext string) (bool, error) {
+	canReplicate, err := s.InstanceCanReplicateFrom(this, other)
 
-	if config.Config.LowerReplicaVersionAllowed && canReplicate && err != nil {
+	if s.cfg.LowerReplicaVersionAllowed && canReplicate && err != nil {
 		_ = log.Warningf("%v: %v Details: %v", logContext, logPrefix, err)
 		err = nil
 	}
@@ -539,17 +538,17 @@ func (this *Instance) CanReplicateFromEx(other *Instance, logContext string) (bo
 }
 
 // HasReasonableMaintenanceReplicationLag returns true when the replica lag is reasonable, and maintenance operations should have a green light to go.
-func (this *Instance) HasReasonableMaintenanceReplicationLag() bool {
+func (s *Store) InstanceHasReasonableMaintenanceReplicationLag(this *Instance) bool {
 	// replicas with SQLDelay are a special case
 	if this.SQLDelay > 0 {
-		return math.AbsInt64(this.SecondsBehindMaster.Int64-int64(this.SQLDelay)) <= int64(config.Config.ReasonableMaintenanceReplicationLagSeconds)
+		return math.AbsInt64(this.SecondsBehindMaster.Int64-int64(this.SQLDelay)) <= int64(s.cfg.ReasonableMaintenanceReplicationLagSeconds)
 	}
-	return this.SecondsBehindMaster.Int64 <= int64(config.Config.ReasonableMaintenanceReplicationLagSeconds)
+	return this.SecondsBehindMaster.Int64 <= int64(s.cfg.ReasonableMaintenanceReplicationLagSeconds)
 }
 
 // CanMove returns true if this instance's state allows it to be repositioned. For example,
 // if this instance lags too much, it will not be moveable.
-func (this *Instance) CanMove() (bool, error) {
+func (s *Store) InstanceCanMove(this *Instance) (bool, error) {
 	if !this.IsLastCheckValid {
 		return false, fmt.Errorf("%+v: last check invalid", this.Key)
 	}
@@ -565,7 +564,7 @@ func (this *Instance) CanMove() (bool, error) {
 	if !this.SecondsBehindMaster.Valid {
 		return false, fmt.Errorf("%+v: cannot determine replication lag", this.Key)
 	}
-	if !this.HasReasonableMaintenanceReplicationLag() {
+	if !s.InstanceHasReasonableMaintenanceReplicationLag(this) {
 		return false, fmt.Errorf("%+v: lags too much", this.Key)
 	}
 	return true, nil
@@ -594,7 +593,7 @@ func (this *Instance) CanMoveViaMatch() (bool, error) {
 }
 
 // StatusString returns a human readable description of this instance's status
-func (this *Instance) StatusString() string {
+func (s *Store) InstanceStatusString(this *Instance) string {
 	if !this.IsLastCheckValid {
 		return "invalid"
 	}
@@ -604,14 +603,14 @@ func (this *Instance) StatusString() string {
 	if this.IsReplica() && !this.ReplicaRunning() {
 		return "nonreplicating"
 	}
-	if this.IsReplica() && !this.HasReasonableMaintenanceReplicationLag() {
+	if this.IsReplica() && !s.InstanceHasReasonableMaintenanceReplicationLag(this) {
 		return "lag"
 	}
 	return "ok"
 }
 
 // LagStatusString returns a human readable representation of current lag
-func (this *Instance) LagStatusString() string {
+func (s *Store) InstanceLagStatusString(this *Instance) string {
 	if this.IsDetached {
 		return "detached"
 	}
@@ -627,15 +626,15 @@ func (this *Instance) LagStatusString() string {
 	if this.IsReplica() && !this.SecondsBehindMaster.Valid {
 		return "null"
 	}
-	if this.IsReplica() && this.ReplicationLagSeconds.Int64 > int64(config.Config.ReasonableMaintenanceReplicationLagSeconds) {
+	if this.IsReplica() && this.ReplicationLagSeconds.Int64 > int64(s.cfg.ReasonableMaintenanceReplicationLagSeconds) {
 		return fmt.Sprintf("%+vs", this.ReplicationLagSeconds.Int64)
 	}
 	return fmt.Sprintf("%+vs", this.ReplicationLagSeconds.Int64)
 }
 
-func (this *Instance) descriptionTokens() (tokens []string) {
-	tokens = append(tokens, this.LagStatusString())
-	tokens = append(tokens, this.StatusString())
+func (s *Store) instanceDescriptionTokens(this *Instance) (tokens []string) {
+	tokens = append(tokens, s.InstanceLagStatusString(this))
+	tokens = append(tokens, s.InstanceStatusString(this))
 	tokens = append(tokens, this.Version)
 	if this.ReadOnly {
 		tokens = append(tokens, "ro")
@@ -678,8 +677,8 @@ func (this *Instance) descriptionTokens() (tokens []string) {
 
 // HumanReadableDescription returns a simple readable string describing the status, version,
 // etc. properties of this instance
-func (this *Instance) HumanReadableDescription() string {
-	tokens := this.descriptionTokens()
+func (s *Store) InstanceHumanReadableDescription(this *Instance) string {
+	tokens := s.instanceDescriptionTokens(this)
 	nonEmptyTokens := []string{}
 	for _, token := range tokens {
 		if token != "" {
@@ -691,8 +690,8 @@ func (this *Instance) HumanReadableDescription() string {
 }
 
 // TabulatedDescription returns a simple tabulated string of various properties
-func (this *Instance) TabulatedDescription(separator string) string {
-	tokens := this.descriptionTokens()
+func (s *Store) InstanceTabulatedDescription(this *Instance, separator string) string {
+	tokens := s.instanceDescriptionTokens(this)
 	description := strings.Join(tokens, separator)
 	return description
 }

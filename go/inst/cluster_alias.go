@@ -17,19 +17,19 @@
 package inst
 
 // SetClusterAlias will write (and override) a single cluster name mapping
-func SetClusterAlias(clusterName string, alias string) error {
-	return writeClusterAlias(clusterName, alias)
+func (s *Store) SetClusterAlias(clusterName string, alias string) error {
+	return s.writeClusterAlias(clusterName, alias)
 }
 
 // SetClusterAliasManualOverride will write (and override) a single cluster name mapping
-func SetClusterAliasManualOverride(clusterName string, alias string) error {
-	return writeClusterAliasManualOverride(clusterName, alias)
+func (s *Store) SetClusterAliasManualOverride(clusterName string, alias string) error {
+	return s.writeClusterAliasManualOverride(clusterName, alias)
 }
 
 // GetClusterByAlias returns the cluster name associated with given alias.
 // The function returns with error when:
 // - No cluster is associated with the alias
 // - More than one cluster is associated with the alias
-func GetClusterByAlias(alias string) (string, error) {
-	return ReadClusterNameByAlias(alias)
+func (s *Store) GetClusterByAlias(alias string) (string, error) {
+	return s.ReadClusterNameByAlias(alias)
 }

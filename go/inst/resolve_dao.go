@@ -19,29 +19,12 @@ package inst
 import (
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
-	"github.com/proxysql/orchestrator/go/config"
-	"github.com/proxysql/orchestrator/go/db"
-	"github.com/rcrowley/go-metrics"
 )
 
-var writeResolvedHostnameCounter = metrics.NewCounter()
-var writeUnresolvedHostnameCounter = metrics.NewCounter()
-var readResolvedHostnameCounter = metrics.NewCounter()
-var readUnresolvedHostnameCounter = metrics.NewCounter()
-var readAllResolvedHostnamesCounter = metrics.NewCounter()
-
-func init() {
-	_ = metrics.Register("resolve.write_resolved", writeResolvedHostnameCounter)
-	_ = metrics.Register("resolve.write_unresolved", writeUnresolvedHostnameCounter)
-	_ = metrics.Register("resolve.read_resolved", readResolvedHostnameCounter)
-	_ = metrics.Register("resolve.read_unresolved", readUnresolvedHostnameCounter)
-	_ = metrics.Register("resolve.read_resolved_all", readAllResolvedHostnamesCounter)
-}
-
 // WriteResolvedHostname stores a hostname and the resolved hostname to backend database
-func WriteResolvedHostname(hostname string, resolvedHostname string) error {
+func (s *Store) WriteResolvedHostname(hostname string, resolvedHostname string) error {
 	writeFunc := func() error {
-		_, err := db.ExecOrchestrator(`
+		_, err := s.backend.Exec(`
 			insert into
 					hostname_resolve (hostname, resolved_hostname, resolved_timestamp)
 				values
@@ -57,7 +40,7 @@ func WriteResolvedHostname(hostname string, resolvedHostname string) error {
 		}
 		if hostname != resolvedHostname {
 			// history is only interesting when there's actually something to resolve...
-			_, err = db.ExecOrchestrator(`
+			_, err = s.backend.Exec(`
 			insert into
 					hostname_resolve_history (hostname, resolved_hostname, resolved_timestamp)
 				values
@@ -69,14 +52,14 @@ func WriteResolvedHostname(hostname string, resolvedHostname string) error {
 				hostname,
 				resolvedHostname)
 		}
-		writeResolvedHostnameCounter.Inc(1)
+		s.writeResolvedHostnameCounter.Inc(1)
 		return nil
 	}
-	return ExecDBWriteFunc(writeFunc)
+	return s.ExecDBWriteFunc(writeFunc)
 }
 
 // ReadResolvedHostname returns the resolved hostname given a hostname, or empty if not exists
-func ReadResolvedHostname(hostname string) (string, error) {
+func (s *Store) ReadResolvedHostname(hostname string) (string, error) {
 	var resolvedHostname = ""
 
 	query := `
@@ -88,11 +71,11 @@ func ReadResolvedHostname(hostname string) (string, error) {
 			hostname = ?
 		`
 
-	err := db.QueryOrchestrator(query, sqlutils.Args(hostname), func(m sqlutils.RowMap) error {
+	err := s.backend.Query(query, sqlutils.Args(hostname), func(m sqlutils.RowMap) error {
 		resolvedHostname = m.GetString("resolved_hostname")
 		return nil
 	})
-	readResolvedHostnameCounter.Inc(1)
+	s.readResolvedHostnameCounter.Inc(1)
 
 	if err != nil {
 		log.Errore(err)
@@ -100,7 +83,7 @@ func ReadResolvedHostname(hostname string) (string, error) {
 	return resolvedHostname, err
 }
 
-func ReadAllHostnameResolves() ([]HostnameResolve, error) {
+func (s *Store) ReadAllHostnameResolves() ([]HostnameResolve, error) {
 	res := []HostnameResolve{}
 	query := `
 		select
@@ -109,13 +92,13 @@ func ReadAllHostnameResolves() ([]HostnameResolve, error) {
 		from
 			hostname_resolve
 		`
-	err := db.QueryOrchestratorRowsMap(query, func(m sqlutils.RowMap) error {
+	err := s.backend.QueryRowsMap(query, func(m sqlutils.RowMap) error {
 		hostnameResolve := HostnameResolve{hostname: m.GetString("hostname"), resolvedHostname: m.GetString("resolved_hostname")}
 
 		res = append(res, hostnameResolve)
 		return nil
 	})
-	readAllResolvedHostnamesCounter.Inc(1)
+	s.readAllResolvedHostnamesCounter.Inc(1)
 
 	if err != nil {
 		log.Errore(err)
@@ -124,7 +107,7 @@ func ReadAllHostnameResolves() ([]HostnameResolve, error) {
 }
 
 // ReadAllHostnameUnresolves returns the content of the hostname_unresolve table
-func ReadAllHostnameUnresolves() ([]HostnameUnresolve, error) {
+func (s *Store) ReadAllHostnameUnresolves() ([]HostnameUnresolve, error) {
 	unres := []HostnameUnresolve{}
 	query := `
 		select
@@ -133,7 +116,7 @@ func ReadAllHostnameUnresolves() ([]HostnameUnresolve, error) {
 		from
 			hostname_unresolve
 		`
-	err := db.QueryOrchestratorRowsMap(query, func(m sqlutils.RowMap) error {
+	err := s.backend.QueryRowsMap(query, func(m sqlutils.RowMap) error {
 		hostnameUnresolve := HostnameUnresolve{hostname: m.GetString("hostname"), unresolvedHostname: m.GetString("unresolved_hostname")}
 
 		unres = append(unres, hostnameUnresolve)
@@ -144,8 +127,8 @@ func ReadAllHostnameUnresolves() ([]HostnameUnresolve, error) {
 }
 
 // ReadAllHostnameUnresolves returns the content of the hostname_unresolve table
-func ReadAllHostnameUnresolvesRegistrations() (registrations []HostnameRegistration, err error) {
-	unresolves, err := ReadAllHostnameUnresolves()
+func (s *Store) ReadAllHostnameUnresolvesRegistrations() (registrations []HostnameRegistration, err error) {
+	unresolves, err := s.ReadAllHostnameUnresolves()
 	if err != nil {
 		return registrations, err
 	}
@@ -158,7 +141,7 @@ func ReadAllHostnameUnresolvesRegistrations() (registrations []HostnameRegistrat
 
 // readUnresolvedHostname reverse-reads hostname resolve. It returns a hostname which matches given pattern and resovles to resolvedHostname,
 // or, in the event no such hostname is found, the given resolvedHostname, unchanged.
-func readUnresolvedHostname(hostname string) (string, error) {
+func (s *Store) readUnresolvedHostname(hostname string) (string, error) {
 	unresolvedHostname := hostname
 
 	query := `
@@ -170,11 +153,11 @@ func readUnresolvedHostname(hostname string) (string, error) {
 	   			hostname = ?
 	   		`
 
-	err := db.QueryOrchestrator(query, sqlutils.Args(hostname), func(m sqlutils.RowMap) error {
+	err := s.backend.Query(query, sqlutils.Args(hostname), func(m sqlutils.RowMap) error {
 		unresolvedHostname = m.GetString("unresolved_hostname")
 		return nil
 	})
-	readUnresolvedHostnameCounter.Inc(1)
+	s.readUnresolvedHostnameCounter.Inc(1)
 
 	if err != nil {
 		log.Errore(err)
@@ -183,9 +166,9 @@ func readUnresolvedHostname(hostname string) (string, error) {
 }
 
 // WriteHostnameUnresolve upserts an entry in hostname_unresolve
-func WriteHostnameUnresolve(instanceKey *InstanceKey, unresolvedHostname string) error {
+func (s *Store) WriteHostnameUnresolve(instanceKey *InstanceKey, unresolvedHostname string) error {
 	writeFunc := func() error {
-		_, err := db.ExecOrchestrator(`
+		_, err := s.backend.Exec(`
         	insert into hostname_unresolve (
         		hostname,
         		unresolved_hostname,
@@ -199,7 +182,7 @@ func WriteHostnameUnresolve(instanceKey *InstanceKey, unresolvedHostname string)
 		if err != nil {
 			return log.Errore(err)
 		}
-		_, err = db.ExecOrchestrator(`
+		_, err = s.backend.Exec(`
         	replace into hostname_unresolve_history (
         		hostname,
         		unresolved_hostname,
@@ -207,53 +190,53 @@ func WriteHostnameUnresolve(instanceKey *InstanceKey, unresolvedHostname string)
         	values (?, ?, NOW())
 				`, instanceKey.Hostname, unresolvedHostname,
 		)
-		writeUnresolvedHostnameCounter.Inc(1)
+		s.writeUnresolvedHostnameCounter.Inc(1)
 		return nil
 	}
-	return ExecDBWriteFunc(writeFunc)
+	return s.ExecDBWriteFunc(writeFunc)
 }
 
 // DeleteHostnameUnresolve removes an unresolve entry
-func DeleteHostnameUnresolve(instanceKey *InstanceKey) error {
+func (s *Store) DeleteHostnameUnresolve(instanceKey *InstanceKey) error {
 	writeFunc := func() error {
-		_, err := db.ExecOrchestrator(`
+		_, err := s.backend.Exec(`
       	delete from hostname_unresolve
 				where hostname=?
 				`, instanceKey.Hostname,
 		)
 		return log.Errore(err)
 	}
-	return ExecDBWriteFunc(writeFunc)
+	return s.ExecDBWriteFunc(writeFunc)
 }
 
 // ExpireHostnameUnresolve expires hostname_unresolve entries that haven't been updated recently.
-func ExpireHostnameUnresolve() error {
+func (s *Store) ExpireHostnameUnresolve() error {
 	writeFunc := func() error {
-		_, err := db.ExecOrchestrator(`
+		_, err := s.backend.Exec(`
       	delete from hostname_unresolve
 				where last_registered < NOW() - INTERVAL ? MINUTE
-				`, config.Config.ExpiryHostnameResolvesMinutes,
+				`, s.cfg.ExpiryHostnameResolvesMinutes,
 		)
 		return log.Errore(err)
 	}
-	return ExecDBWriteFunc(writeFunc)
+	return s.ExecDBWriteFunc(writeFunc)
 }
 
 // ForgetExpiredHostnameResolves
-func ForgetExpiredHostnameResolves() error {
-	_, err := db.ExecOrchestrator(`
+func (s *Store) ForgetExpiredHostnameResolves() error {
+	_, err := s.backend.Exec(`
 			delete
 				from hostname_resolve
 			where
 				resolved_timestamp < NOW() - interval ? minute`,
-		2*config.Config.ExpiryHostnameResolvesMinutes,
+		2*s.cfg.ExpiryHostnameResolvesMinutes,
 	)
 	return err
 }
 
 // DeleteInvalidHostnameResolves removes invalid resolves. At this time these are:
 // - infinite loop resolves (A->B and B->A), remove earlier mapping
-func DeleteInvalidHostnameResolves() error {
+func (s *Store) DeleteInvalidHostnameResolves() error {
 	var invalidHostnames []string
 
 	query := `
@@ -267,7 +250,7 @@ func DeleteInvalidHostnameResolves() error {
 		    and latest.resolved_timestamp > early.resolved_timestamp
 	   	`
 
-	err := db.QueryOrchestratorRowsMap(query, func(m sqlutils.RowMap) error {
+	err := s.backend.QueryRowsMap(query, func(m sqlutils.RowMap) error {
 		invalidHostnames = append(invalidHostnames, m.GetString("hostname"))
 		return nil
 	})
@@ -276,7 +259,7 @@ func DeleteInvalidHostnameResolves() error {
 	}
 
 	for _, invalidHostname := range invalidHostnames {
-		_, err = db.ExecOrchestrator(`
+		_, err = s.backend.Exec(`
 			delete
 				from hostname_resolve
 			where
@@ -289,8 +272,8 @@ func DeleteInvalidHostnameResolves() error {
 }
 
 // deleteHostnameResolves compeltely erases the database cache
-func deleteHostnameResolves() error {
-	_, err := db.ExecOrchestrator(`
+func (s *Store) deleteHostnameResolves() error {
+	_, err := s.backend.Exec(`
 			delete
 				from hostname_resolve`,
 	)
@@ -298,9 +281,9 @@ func deleteHostnameResolves() error {
 }
 
 // writeHostnameIPs stroes an ipv4 and ipv6 associated witha hostname, if available
-func writeHostnameIPs(hostname string, ipv4String string, ipv6String string) error {
+func (s *Store) writeHostnameIPs(hostname string, ipv4String string, ipv6String string) error {
 	writeFunc := func() error {
-		_, err := db.ExecOrchestrator(`
+		_, err := s.backend.Exec(`
 			insert into
 					hostname_ips (hostname, ipv4, ipv6, last_updated)
 				values
@@ -316,12 +299,12 @@ func writeHostnameIPs(hostname string, ipv4String string, ipv6String string) err
 		)
 		return log.Errore(err)
 	}
-	return ExecDBWriteFunc(writeFunc)
+	return s.ExecDBWriteFunc(writeFunc)
 }
 
 // readUnresolvedHostname reverse-reads hostname resolve. It returns a hostname which matches given pattern and resovles to resolvedHostname,
 // or, in the event no such hostname is found, the given resolvedHostname, unchanged.
-func readHostnameIPs(hostname string) (ipv4 string, ipv6 string, err error) {
+func (s *Store) readHostnameIPs(hostname string) (ipv4 string, ipv6 string, err error) {
 	query := `
 		select
 			ipv4, ipv6
@@ -330,7 +313,7 @@ func readHostnameIPs(hostname string) (ipv4 string, ipv6 string, err error) {
 		where
 			hostname = ?
 	`
-	err = db.QueryOrchestrator(query, sqlutils.Args(hostname), func(m sqlutils.RowMap) error {
+	err = s.backend.Query(query, sqlutils.Args(hostname), func(m sqlutils.RowMap) error {
 		ipv4 = m.GetString("ipv4")
 		ipv6 = m.GetString("ipv6")
 		return nil

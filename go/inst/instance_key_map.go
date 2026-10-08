@@ -128,10 +128,10 @@ func (this *InstanceKeyMap) ReadJson(jsonString string) error {
 }
 
 // ReadJson unmarshalls a json into this map
-func (this *InstanceKeyMap) ReadCommaDelimitedList(list string) error {
+func (s *Store) InstanceKeyMapReadCommaDelimitedList(this *InstanceKeyMap, list string) error {
 	tokens := strings.Split(list, ",")
 	for _, token := range tokens {
-		key, err := ParseResolveInstanceKey(token)
+		key, err := s.ParseResolveInstanceKey(token)
 		if err != nil {
 			return err
 		}

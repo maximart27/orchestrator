@@ -20,8 +20,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-
-	"github.com/proxysql/orchestrator/go/config"
 )
 
 type AnalysisCode string
@@ -203,9 +201,9 @@ func (this *ReplicationAnalysis) MarshalJSON() ([]byte, error) {
 }
 
 // ReadReplicaHostsFromString parses and reads replica keys from comma delimited string
-func (this *ReplicationAnalysis) ReadReplicaHostsFromString(replicaHostsString string) error {
+func (s *Store) ReplicationAnalysisReadReplicaHostsFromString(this *ReplicationAnalysis, replicaHostsString string) error {
 	this.Replicas = *NewInstanceKeyMap()
-	return this.Replicas.ReadCommaDelimitedList(replicaHostsString)
+	return s.InstanceKeyMapReadCommaDelimitedList(&this.Replicas, replicaHostsString)
 }
 
 // AnalysisString returns a human friendly description of all analysis issues
@@ -236,6 +234,6 @@ func (this *ReplicationAnalysis) GetAnalysisInstanceType() AnalysisInstanceType 
 
 // ValidSecondsFromSeenToLastAttemptedCheck returns the maximum allowed elapsed time
 // between last_attempted_check to last_checked before we consider the instance as invalid.
-func ValidSecondsFromSeenToLastAttemptedCheck() uint {
-	return config.Config.InstancePollSeconds + config.Config.ReasonableInstanceCheckSeconds
+func (s *Store) ValidSecondsFromSeenToLastAttemptedCheck() uint {
+	return s.cfg.InstancePollSeconds + s.cfg.ReasonableInstanceCheckSeconds
 }

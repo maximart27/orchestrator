@@ -18,14 +18,12 @@ package inst
 
 import (
 	"github.com/proxysql/golib/log"
-	"github.com/proxysql/orchestrator/go/config"
-	"github.com/proxysql/orchestrator/go/db"
 )
 
 // WriteClusterDomainName will write (and override) the domain name of a cluster
-func WriteClusterDomainName(clusterName string, domainName string) error {
+func (s *Store) WriteClusterDomainName(clusterName string, domainName string) error {
 	writeFunc := func() error {
-		_, err := db.ExecOrchestrator(`
+		_, err := s.backend.Exec(`
 			insert into
 					cluster_domain_name (cluster_name, domain_name, last_registered)
 				values
@@ -37,18 +35,18 @@ func WriteClusterDomainName(clusterName string, domainName string) error {
 			clusterName, domainName)
 		return log.Errore(err)
 	}
-	return ExecDBWriteFunc(writeFunc)
+	return s.ExecDBWriteFunc(writeFunc)
 }
 
 // ExpireClusterDomainName expires cluster_domain_name entries that haven't been updated recently.
-func ExpireClusterDomainName() error {
+func (s *Store) ExpireClusterDomainName() error {
 	writeFunc := func() error {
-		_, err := db.ExecOrchestrator(`
+		_, err := s.backend.Exec(`
     	delete from cluster_domain_name
 				where last_registered < NOW() - INTERVAL ? MINUTE
-				`, config.Config.ExpiryHostnameResolvesMinutes,
+				`, s.cfg.ExpiryHostnameResolvesMinutes,
 		)
 		return log.Errore(err)
 	}
-	return ExecDBWriteFunc(writeFunc)
+	return s.ExecDBWriteFunc(writeFunc)
 }

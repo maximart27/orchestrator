@@ -21,7 +21,6 @@ import (
 
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
-	"github.com/proxysql/orchestrator/go/db"
 )
 
 // GetPostgreSQLReplicationAnalysis analyzes PostgreSQL streaming replication
@@ -31,7 +30,7 @@ import (
 //
 // This mirrors the MySQL GetReplicationAnalysis but with PostgreSQL-appropriate
 // failure scenarios (no intermediate masters, no co-masters, no binlog servers).
-func GetPostgreSQLReplicationAnalysis(clusterName string, hints *ReplicationAnalysisHints) ([]ReplicationAnalysis, error) {
+func (s *Store) GetPostgreSQLReplicationAnalysis(clusterName string, hints *ReplicationAnalysisHints) ([]ReplicationAnalysis, error) {
 	result := []ReplicationAnalysis{}
 
 	// Query the orchestrator backend for primary instances and their standbys.
@@ -98,7 +97,7 @@ func GetPostgreSQLReplicationAnalysis(clusterName string, hints *ReplicationAnal
 	`
 	args := sqlutils.Args(clusterName)
 
-	err := db.QueryOrchestrator(query, args, func(m sqlutils.RowMap) error {
+	err := s.backend.Query(query, args, func(m sqlutils.RowMap) error {
 		a := ReplicationAnalysis{
 			Analysis:   NoProblem,
 			IsMaster:   true,
@@ -110,7 +109,7 @@ func GetPostgreSQLReplicationAnalysis(clusterName string, hints *ReplicationAnal
 			Port:     m.GetInt("port"),
 		}
 		a.ClusterDetails.ClusterName = m.GetString("cluster_name")
-		a.ClusterDetails.ReadRecoveryInfo()
+		s.ClusterInfoReadRecoveryInfo(&a.ClusterDetails)
 		a.AnalyzedInstanceDataCenter = m.GetString("data_center")
 		a.AnalyzedInstanceRegion = m.GetString("region")
 		a.AnalyzedInstancePhysicalEnvironment = m.GetString("physical_environment")
@@ -129,7 +128,7 @@ func GetPostgreSQLReplicationAnalysis(clusterName string, hints *ReplicationAnal
 		a.IsDowntimed = m.GetBool("is_downtimed")
 		a.GTIDMode = "ON" // PG always uses WAL
 		a.Replicas = *NewInstanceKeyMap()
-		_ = a.ReadReplicaHostsFromString(m.GetString("slave_hosts"))
+		_ = s.ReplicationAnalysisReadReplicaHostsFromString(&a, m.GetString("slave_hosts"))
 
 		masterHost := m.GetString("master_host")
 		masterPort := m.GetInt("master_port")
@@ -187,7 +186,7 @@ func GetPostgreSQLReplicationAnalysis(clusterName string, hints *ReplicationAnal
 		result = append(result, a)
 
 		if a.CountReplicas > 0 && hints.AuditAnalysis {
-			go func() { _ = auditInstanceAnalysisInChangelog(&a.AnalyzedInstanceKey, a.Analysis) }()
+			go func() { _ = s.auditInstanceAnalysisInChangelog(&a.AnalyzedInstanceKey, a.Analysis) }()
 		}
 		return nil
 	})

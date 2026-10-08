@@ -22,13 +22,12 @@ import (
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
 	"github.com/proxysql/orchestrator/go/config"
-	"github.com/proxysql/orchestrator/go/db"
 	"github.com/proxysql/orchestrator/go/process"
 	"github.com/proxysql/orchestrator/go/util"
 )
 
 // ReadActiveMaintenance returns the list of currently active maintenance entries
-func ReadActiveMaintenance() ([]Maintenance, error) {
+func (s *Store) ReadActiveMaintenance() ([]Maintenance, error) {
 	res := []Maintenance{}
 	query := `
 		select
@@ -47,7 +46,7 @@ func ReadActiveMaintenance() ([]Maintenance, error) {
 		order by
 			database_instance_maintenance_id
 		`
-	err := db.QueryOrchestratorRowsMap(query, func(m sqlutils.RowMap) error {
+	err := s.backend.QueryRowsMap(query, func(m sqlutils.RowMap) error {
 		maintenance := Maintenance{}
 		maintenance.MaintenanceId = m.GetUint("database_instance_maintenance_id")
 		maintenance.Key.Hostname = m.GetString("hostname")
@@ -70,12 +69,12 @@ func ReadActiveMaintenance() ([]Maintenance, error) {
 }
 
 // BeginBoundedMaintenance will make new maintenance entry for given instanceKey.
-func BeginBoundedMaintenance(instanceKey *InstanceKey, owner string, reason string, durationSeconds uint, explicitlyBounded bool) (int64, error) {
+func (s *Store) BeginBoundedMaintenance(instanceKey *InstanceKey, owner string, reason string, durationSeconds uint, explicitlyBounded bool) (int64, error) {
 	var maintenanceToken int64 = 0
 	if durationSeconds == 0 {
 		durationSeconds = config.MaintenanceExpireMinutes * 60
 	}
-	res, err := db.ExecOrchestrator(`
+	res, err := s.backend.Exec(`
 			insert ignore
 				into database_instance_maintenance (
 					hostname, port, maintenance_active, begin_timestamp, end_timestamp, owner, reason,
@@ -103,19 +102,19 @@ func BeginBoundedMaintenance(instanceKey *InstanceKey, owner string, reason stri
 	} else {
 		// success
 		maintenanceToken, _ = res.LastInsertId()
-		AuditOperation("begin-maintenance", instanceKey, fmt.Sprintf("maintenanceToken: %d, owner: %s, reason: %s", maintenanceToken, owner, reason))
+		s.AuditOperation("begin-maintenance", instanceKey, fmt.Sprintf("maintenanceToken: %d, owner: %s, reason: %s", maintenanceToken, owner, reason))
 	}
 	return maintenanceToken, err
 }
 
 // BeginMaintenance will make new maintenance entry for given instanceKey. Maintenance time is unbounded
-func BeginMaintenance(instanceKey *InstanceKey, owner string, reason string) (int64, error) {
-	return BeginBoundedMaintenance(instanceKey, owner, reason, 0, false)
+func (s *Store) BeginMaintenance(instanceKey *InstanceKey, owner string, reason string) (int64, error) {
+	return s.BeginBoundedMaintenance(instanceKey, owner, reason, 0, false)
 }
 
 // EndMaintenanceByInstanceKey will terminate an active maintenance using given instanceKey as hint
-func EndMaintenanceByInstanceKey(instanceKey *InstanceKey) (wasMaintenance bool, err error) {
-	res, err := db.ExecOrchestrator(`
+func (s *Store) EndMaintenanceByInstanceKey(instanceKey *InstanceKey) (wasMaintenance bool, err error) {
+	res, err := s.backend.Exec(`
 			update
 				database_instance_maintenance
 			set
@@ -136,13 +135,13 @@ func EndMaintenanceByInstanceKey(instanceKey *InstanceKey) (wasMaintenance bool,
 	if affected, _ := res.RowsAffected(); affected > 0 {
 		// success
 		wasMaintenance = true
-		AuditOperation("end-maintenance", instanceKey, "")
+		s.AuditOperation("end-maintenance", instanceKey, "")
 	}
 	return wasMaintenance, err
 }
 
 // InMaintenance checks whether a given instance is under maintenacne
-func InMaintenance(instanceKey *InstanceKey) (inMaintenance bool, err error) {
+func (s *Store) InMaintenance(instanceKey *InstanceKey) (inMaintenance bool, err error) {
 	query := `
 		select
 			count(*) > 0 as in_maintenance
@@ -155,7 +154,7 @@ func InMaintenance(instanceKey *InstanceKey) (inMaintenance bool, err error) {
 			and end_timestamp > NOW()
 			`
 	args := sqlutils.Args(instanceKey.Hostname, instanceKey.Port)
-	err = db.QueryOrchestrator(query, args, func(m sqlutils.RowMap) error {
+	err = s.backend.Query(query, args, func(m sqlutils.RowMap) error {
 		inMaintenance = m.GetBool("in_maintenance")
 		return nil
 	})
@@ -164,7 +163,7 @@ func InMaintenance(instanceKey *InstanceKey) (inMaintenance bool, err error) {
 }
 
 // ReadMaintenanceInstanceKey will return the instanceKey for active maintenance by maintenanceToken
-func ReadMaintenanceInstanceKey(maintenanceToken int64) (*InstanceKey, error) {
+func (s *Store) ReadMaintenanceInstanceKey(maintenanceToken int64) (*InstanceKey, error) {
 	var res *InstanceKey
 	query := `
 		select
@@ -175,8 +174,8 @@ func ReadMaintenanceInstanceKey(maintenanceToken int64) (*InstanceKey, error) {
 			database_instance_maintenance_id = ?
 			`
 
-	err := db.QueryOrchestrator(query, sqlutils.Args(maintenanceToken), func(m sqlutils.RowMap) error {
-		instanceKey, merr := NewResolveInstanceKey(m.GetString("hostname"), m.GetInt("port"))
+	err := s.backend.Query(query, sqlutils.Args(maintenanceToken), func(m sqlutils.RowMap) error {
+		instanceKey, merr := s.NewResolveInstanceKey(m.GetString("hostname"), m.GetInt("port"))
 		if merr != nil {
 			return merr
 		}
@@ -189,8 +188,8 @@ func ReadMaintenanceInstanceKey(maintenanceToken int64) (*InstanceKey, error) {
 }
 
 // EndMaintenance will terminate an active maintenance via maintenanceToken
-func EndMaintenance(maintenanceToken int64) (wasMaintenance bool, err error) {
-	res, err := db.ExecOrchestrator(`
+func (s *Store) EndMaintenance(maintenanceToken int64) (wasMaintenance bool, err error) {
+	res, err := s.backend.Exec(`
 			update
 				database_instance_maintenance
 			set
@@ -207,16 +206,16 @@ func EndMaintenance(maintenanceToken int64) (wasMaintenance bool, err error) {
 	if affected, _ := res.RowsAffected(); affected > 0 {
 		// success
 		wasMaintenance = true
-		instanceKey, _ := ReadMaintenanceInstanceKey(maintenanceToken)
-		AuditOperation("end-maintenance", instanceKey, fmt.Sprintf("maintenanceToken: %d", maintenanceToken))
+		instanceKey, _ := s.ReadMaintenanceInstanceKey(maintenanceToken)
+		s.AuditOperation("end-maintenance", instanceKey, fmt.Sprintf("maintenanceToken: %d", maintenanceToken))
 	}
 	return wasMaintenance, err
 }
 
 // ExpireMaintenance will remove the maintenance flag on old maintenances and on bounded maintenances
-func ExpireMaintenance() error {
+func (s *Store) ExpireMaintenance() error {
 	{
-		res, err := db.ExecOrchestrator(`
+		res, err := s.backend.Exec(`
 			delete from
 				database_instance_maintenance
 			where
@@ -229,11 +228,11 @@ func ExpireMaintenance() error {
 			return log.Errore(err)
 		}
 		if rowsAffected, _ := res.RowsAffected(); rowsAffected > 0 {
-			AuditOperation("expire-maintenance", nil, fmt.Sprintf("Purged historical entries: %d", rowsAffected))
+			s.AuditOperation("expire-maintenance", nil, fmt.Sprintf("Purged historical entries: %d", rowsAffected))
 		}
 	}
 	{
-		res, err := db.ExecOrchestrator(`
+		res, err := s.backend.Exec(`
 			delete from
 				database_instance_maintenance
 			where
@@ -245,11 +244,11 @@ func ExpireMaintenance() error {
 			return log.Errore(err)
 		}
 		if rowsAffected, _ := res.RowsAffected(); rowsAffected > 0 {
-			AuditOperation("expire-maintenance", nil, fmt.Sprintf("Expired bounded: %d", rowsAffected))
+			s.AuditOperation("expire-maintenance", nil, fmt.Sprintf("Expired bounded: %d", rowsAffected))
 		}
 	}
 	{
-		res, err := db.ExecOrchestrator(`
+		res, err := s.backend.Exec(`
 			delete from
 				database_instance_maintenance
 			where
@@ -263,7 +262,7 @@ func ExpireMaintenance() error {
 			return log.Errore(err)
 		}
 		if rowsAffected, _ := res.RowsAffected(); rowsAffected > 0 {
-			AuditOperation("expire-maintenance", nil, fmt.Sprintf("Expired dead: %d", rowsAffected))
+			s.AuditOperation("expire-maintenance", nil, fmt.Sprintf("Expired dead: %d", rowsAffected))
 		}
 	}
 

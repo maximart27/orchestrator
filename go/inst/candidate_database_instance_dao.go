@@ -19,15 +19,12 @@ package inst
 import (
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
-
-	"github.com/proxysql/orchestrator/go/config"
-	"github.com/proxysql/orchestrator/go/db"
 )
 
 // RegisterCandidateInstance markes a given instance as suggested for successoring a master in the event of failover.
-func RegisterCandidateInstance(candidate *CandidateDatabaseInstance) error {
+func (s *Store) RegisterCandidateInstance(candidate *CandidateDatabaseInstance) error {
 	if candidate.LastSuggestedString == "" {
-		candidate = candidate.WithCurrentTime()
+		candidate = s.CandidateDatabaseInstanceWithCurrentTime(candidate)
 	}
 	args := sqlutils.Args(candidate.Hostname, candidate.Port, string(candidate.PromotionRule), candidate.LastSuggestedString)
 
@@ -44,24 +41,24 @@ func RegisterCandidateInstance(candidate *CandidateDatabaseInstance) error {
 					promotion_rule=values(promotion_rule)
 			`
 	writeFunc := func() error {
-		_, err := db.ExecOrchestrator(query, args...)
-		_ = AuditOperation("register-candidate", candidate.Key(), string(candidate.PromotionRule))
+		_, err := s.backend.Exec(query, args...)
+		_ = s.AuditOperation("register-candidate", candidate.Key(), string(candidate.PromotionRule))
 		return log.Errore(err)
 	}
-	return ExecDBWriteFunc(writeFunc)
+	return s.ExecDBWriteFunc(writeFunc)
 }
 
 // ExpireCandidateInstances removes stale master candidate suggestions.
-func ExpireCandidateInstances() error {
+func (s *Store) ExpireCandidateInstances() error {
 	writeFunc := func() error {
-		_, err := db.ExecOrchestrator(`
+		_, err := s.backend.Exec(`
 				delete from candidate_database_instance
 				where last_suggested < NOW() - INTERVAL ? MINUTE
-				`, config.Config.CandidateInstanceExpireMinutes,
+				`, s.cfg.CandidateInstanceExpireMinutes,
 		)
 		return log.Errore(err)
 	}
-	return ExecDBWriteFunc(writeFunc)
+	return s.ExecDBWriteFunc(writeFunc)
 }
 
 // BulkReadCandidateDatabaseInstance returns a slice of
@@ -76,7 +73,7 @@ root@myorchestrator [orchestrator]> select * from candidate_database_instance;
 +-------------------+------+---------------------+----------+----------------+
 2 rows in set (0.00 sec)
 */
-func BulkReadCandidateDatabaseInstance() ([]CandidateDatabaseInstance, error) {
+func (s *Store) BulkReadCandidateDatabaseInstance() ([]CandidateDatabaseInstance, error) {
 	var candidateDatabaseInstances []CandidateDatabaseInstance
 
 	// Read all promotion rules from the table
@@ -90,7 +87,7 @@ func BulkReadCandidateDatabaseInstance() ([]CandidateDatabaseInstance, error) {
 		FROM
 			candidate_database_instance
 	`
-	err := db.QueryOrchestrator(query, sqlutils.Args(config.Config.CandidateInstanceExpireMinutes), func(m sqlutils.RowMap) error {
+	err := s.backend.Query(query, sqlutils.Args(s.cfg.CandidateInstanceExpireMinutes), func(m sqlutils.RowMap) error {
 		cdi := CandidateDatabaseInstance{
 			Hostname:            m.GetString("hostname"),
 			Port:                m.GetInt("port"),

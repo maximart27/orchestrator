@@ -22,7 +22,6 @@ import (
 	"net"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/patrickmn/go-cache"
@@ -70,28 +69,17 @@ func NewHostnameDeregistration(instanceKey *InstanceKey) *HostnameRegistration {
 	}
 }
 
-var hostnameResolvesLightweightCache *cache.Cache
-var hostnameResolvesLightweightCacheInit = &sync.Mutex{}
-var hostnameResolvesLightweightCacheLoadedOnceFromDB bool = false
-var hostnameIPsCache = cache.New(10*time.Minute, time.Minute)
-
-func init() {
-	if config.Config.ExpiryHostnameResolvesMinutes < 1 {
-		config.Config.ExpiryHostnameResolvesMinutes = 1
+func (s *Store) getHostnameResolvesLightweightCache() *cache.Cache {
+	s.hostnameResolvesLightweightCacheInit.Lock()
+	defer s.hostnameResolvesLightweightCacheInit.Unlock()
+	if s.hostnameResolvesLightweightCache == nil {
+		s.hostnameResolvesLightweightCache = cache.New(time.Duration(s.cfg.ExpiryHostnameResolvesMinutes)*time.Minute, time.Minute)
 	}
+	return s.hostnameResolvesLightweightCache
 }
 
-func getHostnameResolvesLightweightCache() *cache.Cache {
-	hostnameResolvesLightweightCacheInit.Lock()
-	defer hostnameResolvesLightweightCacheInit.Unlock()
-	if hostnameResolvesLightweightCache == nil {
-		hostnameResolvesLightweightCache = cache.New(time.Duration(config.Config.ExpiryHostnameResolvesMinutes)*time.Minute, time.Minute)
-	}
-	return hostnameResolvesLightweightCache
-}
-
-func HostnameResolveMethodIsNone() bool {
-	return strings.ToLower(config.Config.HostnameResolveMethod) == "none"
+func (s *Store) HostnameResolveMethodIsNone() bool {
+	return strings.ToLower(s.cfg.HostnameResolveMethod) == "none"
 }
 
 // GetCNAME resolves an IP or hostname into a normalized valid CNAME
@@ -104,8 +92,8 @@ func GetCNAME(hostname string) (string, error) {
 	return res, nil
 }
 
-func resolveHostname(hostname string) (string, error) {
-	switch strings.ToLower(config.Config.HostnameResolveMethod) {
+func (s *Store) resolveHostname(hostname string) (string, error) {
+	switch strings.ToLower(s.cfg.HostnameResolveMethod) {
 	case "none":
 		return hostname, nil
 	case "default":
@@ -113,14 +101,14 @@ func resolveHostname(hostname string) (string, error) {
 	case "cname":
 		return GetCNAME(hostname)
 	case "ip":
-		return getHostnameIP(hostname)
+		return s.getHostnameIP(hostname)
 	}
 	return hostname, nil
 }
 
 // Attempt to resolve a hostname. This may return a database cached hostname or otherwise
 // it may resolve the hostname via CNAME
-func ResolveHostname(hostname string) (string, error) {
+func (s *Store) ResolveHostname(hostname string) (string, error) {
 	hostname = strings.TrimSpace(hostname)
 	if hostname == "" {
 		return hostname, errors.New("Will not resolve empty hostname")
@@ -135,19 +123,19 @@ func ResolveHostname(hostname string) (string, error) {
 	}
 
 	// First go to lightweight cache
-	if resolvedHostname, found := getHostnameResolvesLightweightCache().Get(hostname); found {
+	if resolvedHostname, found := s.getHostnameResolvesLightweightCache().Get(hostname); found {
 		return resolvedHostname.(string), nil
 	}
 
-	if !hostnameResolvesLightweightCacheLoadedOnceFromDB {
+	if !s.hostnameResolvesLightweightCacheLoadedOnceFromDB {
 		// A continuous-discovery will first make sure to load all resolves from DB.
 		// However cli does not do so.
 		// Anyway, it seems like the cache was not loaded from DB. Before doing real resolves,
 		// let's try and get the resolved hostname from database.
-		if !HostnameResolveMethodIsNone() {
+		if !s.HostnameResolveMethodIsNone() {
 			go func() {
-				if resolvedHostname, err := ReadResolvedHostname(hostname); err == nil && resolvedHostname != "" {
-					getHostnameResolvesLightweightCache().Set(hostname, resolvedHostname, 0)
+				if resolvedHostname, err := s.ReadResolvedHostname(hostname); err == nil && resolvedHostname != "" {
+					s.getHostnameResolvesLightweightCache().Set(hostname, resolvedHostname, 0)
 				}
 			}()
 		}
@@ -155,11 +143,11 @@ func ResolveHostname(hostname string) (string, error) {
 
 	// Unfound: resolve!
 	log.Debugf("Hostname unresolved yet: %s", hostname)
-	resolvedHostname, err := resolveHostname(hostname)
-	if config.Config.RejectHostnameResolvePattern != "" {
+	resolvedHostname, err := s.resolveHostname(hostname)
+	if s.cfg.RejectHostnameResolvePattern != "" {
 		// Reject, don't even cache
-		if matched, _ := regexp.MatchString(config.Config.RejectHostnameResolvePattern, resolvedHostname); matched {
-			_ = log.Warningf("ResolveHostname: %+v resolved to %+v but rejected due to RejectHostnameResolvePattern '%+v'", hostname, resolvedHostname, config.Config.RejectHostnameResolvePattern)
+		if matched, _ := regexp.MatchString(s.cfg.RejectHostnameResolvePattern, resolvedHostname); matched {
+			_ = log.Warningf("ResolveHostname: %+v resolved to %+v but rejected due to RejectHostnameResolvePattern '%+v'", hostname, resolvedHostname, s.cfg.RejectHostnameResolvePattern)
 			return hostname, nil
 		}
 	}
@@ -167,81 +155,81 @@ func ResolveHostname(hostname string) (string, error) {
 	if err != nil {
 		// Problem. What we'll do is cache the hostname for just one minute, so as to avoid flooding requests
 		// on one hand, yet make it refresh shortly on the other hand. Anyway do not write to database.
-		getHostnameResolvesLightweightCache().Set(hostname, resolvedHostname, time.Minute)
+		s.getHostnameResolvesLightweightCache().Set(hostname, resolvedHostname, time.Minute)
 		return hostname, err
 	}
 	// Good result! Cache it, also to DB
 	log.Debugf("Cache hostname resolve %s as %s", hostname, resolvedHostname)
-	go UpdateResolvedHostname(hostname, resolvedHostname)
+	go s.UpdateResolvedHostname(hostname, resolvedHostname)
 	return resolvedHostname, nil
 }
 
 // UpdateResolvedHostname will store the given resolved hostname in cache
 // Returns false when the key already existed with same resolved value (similar
 // to AFFECTED_ROWS() in mysql)
-func UpdateResolvedHostname(hostname string, resolvedHostname string) bool {
+func (s *Store) UpdateResolvedHostname(hostname string, resolvedHostname string) bool {
 	if resolvedHostname == "" {
 		return false
 	}
-	if existingResolvedHostname, found := getHostnameResolvesLightweightCache().Get(hostname); found && (existingResolvedHostname == resolvedHostname) {
+	if existingResolvedHostname, found := s.getHostnameResolvesLightweightCache().Get(hostname); found && (existingResolvedHostname == resolvedHostname) {
 		return false
 	}
-	getHostnameResolvesLightweightCache().Set(hostname, resolvedHostname, 0)
-	if !HostnameResolveMethodIsNone() {
-		WriteResolvedHostname(hostname, resolvedHostname)
+	s.getHostnameResolvesLightweightCache().Set(hostname, resolvedHostname, 0)
+	if !s.HostnameResolveMethodIsNone() {
+		s.WriteResolvedHostname(hostname, resolvedHostname)
 	}
 	return true
 }
 
-func LoadHostnameResolveCache() error {
-	if !HostnameResolveMethodIsNone() {
-		return loadHostnameResolveCacheFromDatabase()
+func (s *Store) LoadHostnameResolveCache() error {
+	if !s.HostnameResolveMethodIsNone() {
+		return s.loadHostnameResolveCacheFromDatabase()
 	}
 	return nil
 }
 
-func loadHostnameResolveCacheFromDatabase() error {
-	allHostnamesResolves, err := ReadAllHostnameResolves()
+func (s *Store) loadHostnameResolveCacheFromDatabase() error {
+	allHostnamesResolves, err := s.ReadAllHostnameResolves()
 	if err != nil {
 		return err
 	}
 	for _, hostnameResolve := range allHostnamesResolves {
-		getHostnameResolvesLightweightCache().Set(hostnameResolve.hostname, hostnameResolve.resolvedHostname, 0)
+		s.getHostnameResolvesLightweightCache().Set(hostnameResolve.hostname, hostnameResolve.resolvedHostname, 0)
 	}
-	hostnameResolvesLightweightCacheLoadedOnceFromDB = true
+	s.hostnameResolvesLightweightCacheLoadedOnceFromDB = true
 	return nil
 }
 
-func FlushNontrivialResolveCacheToDatabase() error {
-	if HostnameResolveMethodIsNone() {
+func (s *Store) FlushNontrivialResolveCacheToDatabase() error {
+	if s.HostnameResolveMethodIsNone() {
 		return nil
 	}
-	items, _ := HostnameResolveCache()
+	items, _ := s.HostnameResolveCache()
 	for hostname := range items {
-		resolvedHostname, found := getHostnameResolvesLightweightCache().Get(hostname)
+		resolvedHostname, found := s.getHostnameResolvesLightweightCache().Get(hostname)
 		if found && (resolvedHostname.(string) != hostname) {
-			WriteResolvedHostname(hostname, resolvedHostname.(string))
+			s.WriteResolvedHostname(hostname, resolvedHostname.(string))
 		}
 	}
 	return nil
 }
 
-func ResetHostnameResolveCache() error {
-	err := deleteHostnameResolves()
-	getHostnameResolvesLightweightCache().Flush()
-	hostnameResolvesLightweightCacheLoadedOnceFromDB = false
+func (s *Store) ResetHostnameResolveCache() error {
+	err := s.deleteHostnameResolves()
+	s.getHostnameResolvesLightweightCache().Flush()
+	s.hostnameResolvesLightweightCacheLoadedOnceFromDB = false
 	return err
 }
 
-func HostnameResolveCache() (map[string]cache.Item, error) {
-	return getHostnameResolvesLightweightCache().Items(), nil
+func (s *Store) HostnameResolveCache() (map[string]cache.Item, error) {
+	return s.getHostnameResolvesLightweightCache().Items(), nil
 }
 
-func UnresolveHostname(instanceKey *InstanceKey) (InstanceKey, bool, error) {
+func (s *Store) UnresolveHostname(instanceKey *InstanceKey) (InstanceKey, bool, error) {
 	if *config.RuntimeCLIFlags.SkipUnresolve {
 		return *instanceKey, false, nil
 	}
-	unresolvedHostname, err := readUnresolvedHostname(instanceKey.Hostname)
+	unresolvedHostname, err := s.readUnresolvedHostname(instanceKey.Hostname)
 	if err != nil {
 		return *instanceKey, false, log.Errore(err)
 	}
@@ -252,11 +240,11 @@ func UnresolveHostname(instanceKey *InstanceKey) (InstanceKey, bool, error) {
 	// We unresovled to a different hostname. We will now re-resolve to double-check!
 	unresolvedKey := &InstanceKey{Hostname: unresolvedHostname, Port: instanceKey.Port}
 
-	instance, err := ReadTopologyInstance(unresolvedKey)
+	instance, err := s.ReadTopologyInstance(unresolvedKey)
 	if err != nil {
 		return *instanceKey, false, log.Errore(err)
 	}
-	if instance.IsBinlogServer() && config.Config.SkipBinlogServerUnresolveCheck {
+	if instance.IsBinlogServer() && s.cfg.SkipBinlogServerUnresolveCheck {
 		// Do nothing. Everything is assumed to be fine.
 	} else if instance.Key.Hostname != instanceKey.Hostname {
 		// Resolve(Unresolve(hostname)) != hostname ==> Bad; reject
@@ -268,15 +256,15 @@ func UnresolveHostname(instanceKey *InstanceKey) (InstanceKey, bool, error) {
 	return *unresolvedKey, true, nil
 }
 
-func RegisterHostnameUnresolve(registration *HostnameRegistration) (err error) {
+func (s *Store) RegisterHostnameUnresolve(registration *HostnameRegistration) (err error) {
 	if registration.Hostname == "" {
-		return DeleteHostnameUnresolve(&registration.Key)
+		return s.DeleteHostnameUnresolve(&registration.Key)
 	}
-	if registration.CreatedAt.Add(time.Duration(config.Config.ExpiryHostnameResolvesMinutes) * time.Minute).Before(time.Now()) {
+	if registration.CreatedAt.Add(time.Duration(s.cfg.ExpiryHostnameResolvesMinutes) * time.Minute).Before(time.Now()) {
 		// already expired.
 		return nil
 	}
-	return WriteHostnameUnresolve(&registration.Key, registration.Hostname)
+	return s.WriteHostnameUnresolve(&registration.Key, registration.Hostname)
 }
 
 func extractIPs(ips []net.IP) (ipv4String string, ipv6String string) {
@@ -290,20 +278,20 @@ func extractIPs(ips []net.IP) (ipv4String string, ipv6String string) {
 	return ipv4String, ipv6String
 }
 
-func getHostnameIPs(hostname string) (ips []net.IP, fromCache bool, err error) {
-	if ips, found := hostnameIPsCache.Get(hostname); found {
+func (s *Store) getHostnameIPs(hostname string) (ips []net.IP, fromCache bool, err error) {
+	if ips, found := s.hostnameIPsCache.Get(hostname); found {
 		return ips.([]net.IP), true, nil
 	}
 	ips, err = net.LookupIP(hostname)
 	if err != nil {
 		return ips, false, log.Errore(err)
 	}
-	hostnameIPsCache.Set(hostname, ips, cache.DefaultExpiration)
+	s.hostnameIPsCache.Set(hostname, ips, cache.DefaultExpiration)
 	return ips, false, nil
 }
 
-func getHostnameIP(hostname string) (ipString string, err error) {
-	ips, _, err := getHostnameIPs(hostname)
+func (s *Store) getHostnameIP(hostname string) (ipString string, err error) {
+	ips, _, err := s.getHostnameIPs(hostname)
 	if err != nil {
 		return ipString, err
 	}
@@ -314,8 +302,8 @@ func getHostnameIP(hostname string) (ipString string, err error) {
 	return ipv6String, nil
 }
 
-func ResolveHostnameIPs(hostname string) error {
-	ips, fromCache, err := getHostnameIPs(hostname)
+func (s *Store) ResolveHostnameIPs(hostname string) error {
+	ips, fromCache, err := s.getHostnameIPs(hostname)
 	if err != nil {
 		return err
 	}
@@ -323,5 +311,5 @@ func ResolveHostnameIPs(hostname string) error {
 		return nil
 	}
 	ipv4String, ipv6String := extractIPs(ips)
-	return writeHostnameIPs(hostname, ipv4String, ipv6String)
+	return s.writeHostnameIPs(hostname, ipv4String, ipv6String)
 }

@@ -28,15 +28,11 @@ import (
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
 	"github.com/proxysql/orchestrator/go/config"
-	"github.com/proxysql/orchestrator/go/db"
 	"github.com/proxysql/orchestrator/go/util"
 )
 
 // Max concurrency for bulk topology operations
 const topologyConcurrency = 128
-
-var topologyConcurrencyChan = make(chan bool, topologyConcurrency)
-var supportedAutoPseudoGTIDWriters *cache.Cache = cache.New(config.CheckAutoPseudoGTIDGrantsIntervalSeconds*time.Second, time.Second)
 
 type OperationGTIDHint string
 
@@ -59,8 +55,8 @@ type ReplicationCredentials struct {
 }
 
 // ExecInstance executes a given query on the given MySQL topology instance
-func ExecInstance(instanceKey *InstanceKey, query string, args ...interface{}) (sql.Result, error) {
-	db, err := db.OpenTopology(instanceKey.Hostname, instanceKey.Port)
+func (s *Store) ExecInstance(instanceKey *InstanceKey, query string, args ...interface{}) (sql.Result, error) {
+	db, err := s.backend.OpenTopology(instanceKey.Hostname, instanceKey.Port)
 	if err != nil {
 		return nil, err
 	}
@@ -69,15 +65,15 @@ func ExecInstance(instanceKey *InstanceKey, query string, args ...interface{}) (
 
 // ExecuteOnTopology will execute given function while maintaining concurrency limit
 // on topology servers. It is safe in the sense that we will not leak tokens.
-func ExecuteOnTopology(f func()) {
-	topologyConcurrencyChan <- true
-	defer func() { recover(); <-topologyConcurrencyChan }()
+func (s *Store) ExecuteOnTopology(f func()) {
+	s.topologyConcurrencyChan <- true
+	defer func() { recover(); <-s.topologyConcurrencyChan }()
 	f()
 }
 
 // ScanInstanceRow executes a read-a-single-row query on a given MySQL topology instance
-func ScanInstanceRow(instanceKey *InstanceKey, query string, dest ...interface{}) error {
-	db, err := db.OpenTopology(instanceKey.Hostname, instanceKey.Port)
+func (s *Store) ScanInstanceRow(instanceKey *InstanceKey, query string, dest ...interface{}) error {
+	db, err := s.backend.OpenTopology(instanceKey.Hostname, instanceKey.Port)
 	if err != nil {
 		return err
 	}
@@ -86,8 +82,8 @@ func ScanInstanceRow(instanceKey *InstanceKey, query string, dest ...interface{}
 }
 
 // EmptyCommitInstance issues an empty COMMIT on a given instance
-func EmptyCommitInstance(instanceKey *InstanceKey) error {
-	db, err := db.OpenTopology(instanceKey.Hostname, instanceKey.Port)
+func (s *Store) EmptyCommitInstance(instanceKey *InstanceKey) error {
+	db, err := s.backend.OpenTopology(instanceKey.Hostname, instanceKey.Port)
 	if err != nil {
 		return err
 	}
@@ -103,13 +99,13 @@ func EmptyCommitInstance(instanceKey *InstanceKey) error {
 }
 
 // RefreshTopologyInstance will synchronuously re-read topology instance
-func RefreshTopologyInstance(instanceKey *InstanceKey) (*Instance, error) {
-	_, err := ReadTopologyInstance(instanceKey)
+func (s *Store) RefreshTopologyInstance(instanceKey *InstanceKey) (*Instance, error) {
+	_, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return nil, err
 	}
 
-	inst, found, err := ReadInstance(instanceKey)
+	inst, found, err := s.ReadInstance(instanceKey)
 	if err != nil || !found {
 		return nil, err
 	}
@@ -118,7 +114,7 @@ func RefreshTopologyInstance(instanceKey *InstanceKey) (*Instance, error) {
 }
 
 // RefreshTopologyInstances will do a blocking (though concurrent) refresh of all given instances
-func RefreshTopologyInstances(instances [](*Instance)) {
+func (s *Store) RefreshTopologyInstances(instances [](*Instance)) {
 	// use concurrency but wait for all to complete
 	barrier := make(chan InstanceKey)
 	for _, instance := range instances {
@@ -127,9 +123,9 @@ func RefreshTopologyInstances(instances [](*Instance)) {
 			// Signal completed replica
 			defer func() { barrier <- instance.Key }()
 			// Wait your turn to read a replica
-			ExecuteOnTopology(func() {
+			s.ExecuteOnTopology(func() {
 				log.Debugf("... reading instance: %+v", instance.Key)
-				ReadTopologyInstance(&instance.Key)
+				s.ReadTopologyInstance(&instance.Key)
 			})
 		}()
 	}
@@ -145,8 +141,8 @@ func RefreshTopologyInstances(instances [](*Instance)) {
 // The caller may provide an injected statememt, to be executed while the replica is stopped.
 // This is useful for CHANGE MASTER TO commands, that unfortunately must take place while the replica
 // is completely stopped.
-func GetReplicationRestartPreserveStatements(instanceKey *InstanceKey, injectedStatement string) (statements []string, err error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) GetReplicationRestartPreserveStatements(instanceKey *InstanceKey, injectedStatement string) (statements []string, err error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return statements, err
 	}
@@ -169,27 +165,27 @@ func GetReplicationRestartPreserveStatements(instanceKey *InstanceKey, injectedS
 }
 
 // FlushBinaryLogs attempts a 'FLUSH BINARY LOGS' statement on the given instance.
-func FlushBinaryLogs(instanceKey *InstanceKey, count int) (*Instance, error) {
+func (s *Store) FlushBinaryLogs(instanceKey *InstanceKey, count int) (*Instance, error) {
 	if *config.RuntimeCLIFlags.Noop {
 		return nil, fmt.Errorf("noop: aborting flush-binary-logs operation on %+v; signalling error but nothing went wrong", *instanceKey)
 	}
 
 	for i := 0; i < count; i++ {
-		_, err := ExecInstance(instanceKey, `flush binary logs`)
+		_, err := s.ExecInstance(instanceKey, `flush binary logs`)
 		if err != nil {
 			return nil, log.Errore(err)
 		}
 	}
 
 	log.Infof("flush-binary-logs count=%+v on %+v", count, *instanceKey)
-	AuditOperation("flush-binary-logs", instanceKey, "success")
+	s.AuditOperation("flush-binary-logs", instanceKey, "success")
 
-	return ReadTopologyInstance(instanceKey)
+	return s.ReadTopologyInstance(instanceKey)
 }
 
 // FlushBinaryLogsTo attempts to 'FLUSH BINARY LOGS' until given binary log is reached
-func FlushBinaryLogsTo(instanceKey *InstanceKey, logFile string) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) FlushBinaryLogsTo(instanceKey *InstanceKey, logFile string) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -198,28 +194,28 @@ func FlushBinaryLogsTo(instanceKey *InstanceKey, logFile string) (*Instance, err
 	if distance < 0 {
 		return nil, log.Errorf("FlushBinaryLogsTo: target log file %+v is smaller than current log file %+v", logFile, instance.SelfBinlogCoordinates.LogFile)
 	}
-	return FlushBinaryLogs(instanceKey, distance)
+	return s.FlushBinaryLogs(instanceKey, distance)
 }
 
 // purgeBinaryLogsTo attempts to 'PURGE BINARY LOGS' until given binary log is reached
-func purgeBinaryLogsTo(instanceKey *InstanceKey, logFile string) (*Instance, error) {
+func (s *Store) purgeBinaryLogsTo(instanceKey *InstanceKey, logFile string) (*Instance, error) {
 	if *config.RuntimeCLIFlags.Noop {
 		return nil, fmt.Errorf("noop: aborting purge-binary-logs operation on %+v; signalling error but nothing went wrong", *instanceKey)
 	}
 
-	_, err := ExecInstance(instanceKey, "purge binary logs to ?", logFile)
+	_, err := s.ExecInstance(instanceKey, "purge binary logs to ?", logFile)
 	if err != nil {
 		return nil, log.Errore(err)
 	}
 
 	log.Infof("purge-binary-logs to=%+v on %+v", logFile, *instanceKey)
-	AuditOperation("purge-binary-logs", instanceKey, "success")
+	s.AuditOperation("purge-binary-logs", instanceKey, "success")
 
-	return ReadTopologyInstance(instanceKey)
+	return s.ReadTopologyInstance(instanceKey)
 }
 
-func SetSemiSyncMaster(instanceKey *InstanceKey, enableMaster bool) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) SetSemiSyncMaster(instanceKey *InstanceKey, enableMaster bool) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, err
 	}
@@ -227,14 +223,14 @@ func SetSemiSyncMaster(instanceKey *InstanceKey, enableMaster bool) (*Instance, 
 	if instance.SemiSyncMasterPluginNewVersion {
 		query = "set @@global.rpl_semi_sync_source_enabled=?"
 	}
-	if _, err := ExecInstance(instanceKey, query, enableMaster); err != nil {
+	if _, err := s.ExecInstance(instanceKey, query, enableMaster); err != nil {
 		return instance, log.Errore(err)
 	}
-	return ReadTopologyInstance(instanceKey)
+	return s.ReadTopologyInstance(instanceKey)
 }
 
-func SetSemiSyncReplica(instanceKey *InstanceKey, enableReplica bool) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) SetSemiSyncReplica(instanceKey *InstanceKey, enableReplica bool) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, err
 	}
@@ -246,22 +242,22 @@ func SetSemiSyncReplica(instanceKey *InstanceKey, enableReplica bool) (*Instance
 		query = "set @@global.rpl_semi_sync_replica_enabled=?"
 	}
 
-	if _, err := ExecInstance(instanceKey, query, enableReplica); err != nil {
+	if _, err := s.ExecInstance(instanceKey, query, enableReplica); err != nil {
 		return instance, log.Errore(err)
 	}
 	if instance.ReplicationIOThreadRuning {
 		// Need to apply change by stopping starting IO thread
-		ExecInstance(instanceKey, instance.QSP.stop_slave_io_thread())
-		if _, err := ExecInstance(instanceKey, instance.QSP.start_slave_io_thread()); err != nil {
+		s.ExecInstance(instanceKey, instance.QSP.stop_slave_io_thread())
+		if _, err := s.ExecInstance(instanceKey, instance.QSP.start_slave_io_thread()); err != nil {
 			return instance, log.Errore(err)
 		}
 	}
-	return ReadTopologyInstance(instanceKey)
+	return s.ReadTopologyInstance(instanceKey)
 }
 
-func RestartReplicationQuick(instance *Instance, instanceKey *InstanceKey) error {
+func (s *Store) RestartReplicationQuick(instance *Instance, instanceKey *InstanceKey) error {
 	for _, cmd := range []string{instance.QSP.stop_slave_io_thread(), instance.QSP.start_slave_io_thread()} {
-		if _, err := ExecInstance(instanceKey, cmd); err != nil {
+		if _, err := s.ExecInstance(instanceKey, cmd); err != nil {
 			return log.Errorf("%+v: RestartReplicationQuick: '%q' failed: %+v", *instanceKey, cmd, err)
 		} else {
 			log.Infof("%s on %+v as part of RestartReplicationQuick", cmd, *instanceKey)
@@ -273,8 +269,8 @@ func RestartReplicationQuick(instance *Instance, instanceKey *InstanceKey) error
 // DrainRelayLogs starts the SQL thread only (does not stop/start the IO thread), waits until
 // SQL has consumed all relay log entries, then stops replication on both threads.
 // Safe for MariaDB GTID: stopping/starting the IO thread can drop relay logs; this path avoids that.
-func DrainRelayLogs(instanceKey *InstanceKey, timeout time.Duration) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) DrainRelayLogs(instanceKey *InstanceKey, timeout time.Duration) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -284,7 +280,7 @@ func DrainRelayLogs(instanceKey *InstanceKey, timeout time.Duration) (*Instance,
 	}
 
 	if instance.SQLThreadUpToDate() {
-		_, err = ExecInstance(instanceKey, instance.QSP.stop_slave())
+		_, err = s.ExecInstance(instanceKey, instance.QSP.stop_slave())
 		if err != nil {
 			if instance.isMaxScale() && err.Error() == "Error 1199: Slave connection is not running" {
 				err = nil
@@ -293,11 +289,11 @@ func DrainRelayLogs(instanceKey *InstanceKey, timeout time.Duration) (*Instance,
 		if err != nil {
 			return instance, log.Errore(err)
 		}
-		instance, err = ReadTopologyInstance(instanceKey)
+		instance, err = s.ReadTopologyInstance(instanceKey)
 		return instance, err
 	}
 
-	if _, err := ExecInstance(instanceKey, instance.QSP.start_slave_sql_thread()); err != nil {
+	if _, err := s.ExecInstance(instanceKey, instance.QSP.start_slave_sql_thread()); err != nil {
 		return nil, log.Errorf("%+v: DrainRelayLogs: start sql thread failed: %+v", *instanceKey, err)
 	}
 
@@ -308,12 +304,12 @@ func DrainRelayLogs(instanceKey *InstanceKey, timeout time.Duration) (*Instance,
 		if staleTimeout < 30*time.Second {
 			staleTimeout = 30 * time.Second
 		}
-		if instance, err = WaitForSQLThreadUpToDate(instanceKey, timeout, staleTimeout); err != nil {
+		if instance, err = s.WaitForSQLThreadUpToDate(instanceKey, timeout, staleTimeout); err != nil {
 			return instance, err
 		}
 	}
 
-	_, err = ExecInstance(instanceKey, instance.QSP.stop_slave())
+	_, err = s.ExecInstance(instanceKey, instance.QSP.stop_slave())
 	if err != nil {
 		if instance.isMaxScale() && err.Error() == "Error 1199: Slave connection is not running" {
 			err = nil
@@ -323,7 +319,7 @@ func DrainRelayLogs(instanceKey *InstanceKey, timeout time.Duration) (*Instance,
 		return instance, log.Errore(err)
 	}
 
-	instance, err = ReadTopologyInstance(instanceKey)
+	instance, err = s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, err
 	}
@@ -337,8 +333,8 @@ func DrainRelayLogs(instanceKey *InstanceKey, timeout time.Duration) (*Instance,
 // StopReplicationNicely stops a replica such that SQL_thread and IO_thread are aligned (i.e.
 // SQL_thread consumes all relay log entries)
 // It will actually START the sql_thread even if the replica is completely stopped.
-func StopReplicationNicely(instanceKey *InstanceKey, timeout time.Duration) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) StopReplicationNicely(instanceKey *InstanceKey, timeout time.Duration) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -349,19 +345,19 @@ func StopReplicationNicely(instanceKey *InstanceKey, timeout time.Duration) (*In
 
 	// stop io_thread, start sql_thread but catch any errors
 	for _, cmd := range []string{instance.QSP.stop_slave_io_thread(), instance.QSP.start_slave_sql_thread()} {
-		if _, err := ExecInstance(instanceKey, cmd); err != nil {
+		if _, err := s.ExecInstance(instanceKey, cmd); err != nil {
 			return nil, log.Errorf("%+v: StopReplicationNicely: '%q' failed: %+v", *instanceKey, cmd, err)
 		}
 	}
 
 	if instance.SQLDelay == 0 {
 		// Otherwise we don't bother.
-		if instance, err = WaitForSQLThreadUpToDate(instanceKey, timeout, 0); err != nil {
+		if instance, err = s.WaitForSQLThreadUpToDate(instanceKey, timeout, 0); err != nil {
 			return instance, err
 		}
 	}
 
-	_, err = ExecInstance(instanceKey, instance.QSP.stop_slave())
+	_, err = s.ExecInstance(instanceKey, instance.QSP.stop_slave())
 	if err != nil {
 		// Patch; current MaxScale behavior for STOP SLAVE is to throw an error if replica already stopped.
 		if instance.isMaxScale() && err.Error() == "Error 1199: Slave connection is not running" {
@@ -372,12 +368,12 @@ func StopReplicationNicely(instanceKey *InstanceKey, timeout time.Duration) (*In
 		return instance, log.Errore(err)
 	}
 
-	instance, err = ReadTopologyInstance(instanceKey)
+	instance, err = s.ReadTopologyInstance(instanceKey)
 	log.Infof("Stopped replication nicely on %+v, Self:%+v, Exec:%+v", *instanceKey, instance.SelfBinlogCoordinates, instance.ExecBinlogCoordinates)
 	return instance, err
 }
 
-func WaitForSQLThreadUpToDate(instanceKey *InstanceKey, overallTimeout time.Duration, staleCoordinatesTimeout time.Duration) (instance *Instance, err error) {
+func (s *Store) WaitForSQLThreadUpToDate(instanceKey *InstanceKey, overallTimeout time.Duration, staleCoordinatesTimeout time.Duration) (instance *Instance, err error) {
 	// Otherwise we don't bother.
 	var lastExecBinlogCoordinates BinlogCoordinates
 
@@ -385,13 +381,13 @@ func WaitForSQLThreadUpToDate(instanceKey *InstanceKey, overallTimeout time.Dura
 		overallTimeout = 24 * time.Hour
 	}
 	if staleCoordinatesTimeout == 0 {
-		staleCoordinatesTimeout = time.Duration(config.Config.ReasonableReplicationLagSeconds) * time.Second
+		staleCoordinatesTimeout = time.Duration(s.cfg.ReasonableReplicationLagSeconds) * time.Second
 	}
 	generalTimer := time.NewTimer(overallTimeout)
 	staleTimer := time.NewTimer(staleCoordinatesTimeout)
 	for {
 		instance, err := RetryInstanceFunction(func() (*Instance, error) {
-			return ReadTopologyInstance(instanceKey)
+			return s.ReadTopologyInstance(instanceKey)
 		})
 		if err != nil {
 			return instance, log.Errore(err)
@@ -429,7 +425,7 @@ func WaitForSQLThreadUpToDate(instanceKey *InstanceKey, overallTimeout time.Dura
 
 // StopReplicas will stop replication concurrently on given set of replicas.
 // It will potentially do nothing, or attempt to stop _nicely_ or just stop normally, all according to stopReplicationMethod
-func StopReplicas(replicas [](*Instance), stopReplicationMethod StopReplicationMethod, timeout time.Duration) [](*Instance) {
+func (s *Store) StopReplicas(replicas [](*Instance), stopReplicationMethod StopReplicationMethod, timeout time.Duration) [](*Instance) {
 	if stopReplicationMethod == NoStopReplication {
 		return replicas
 	}
@@ -445,18 +441,18 @@ func StopReplicas(replicas [](*Instance), stopReplicationMethod StopReplicationM
 			// Signal completed replica
 			defer func() { barrier <- *updatedReplica }()
 			// Wait your turn to read a replica
-			ExecuteOnTopology(func() {
+			s.ExecuteOnTopology(func() {
 				if stopReplicationMethod == StopReplicationNice {
 					if replica.IsMariaDB() {
 						// MariaDB GTID may drop relay logs on IO thread restart; drain via SQL thread only.
-						if _, err := DrainRelayLogs(&replica.Key, timeout); err != nil {
+						if _, err := s.DrainRelayLogs(&replica.Key, timeout); err != nil {
 							_ = log.Errorf("DrainRelayLogs failed on %+v: %+v", replica.Key, err)
 						}
 					} else {
-						_, _ = StopReplicationNicely(&replica.Key, timeout)
+						_, _ = s.StopReplicationNicely(&replica.Key, timeout)
 					}
 				}
-				replica, _ = StopReplication(&replica.Key)
+				replica, _ = s.StopReplication(&replica.Key)
 				updatedReplica = &replica
 			})
 		}()
@@ -468,15 +464,15 @@ func StopReplicas(replicas [](*Instance), stopReplicationMethod StopReplicationM
 }
 
 // StopReplication stops replication on a given instance
-func StopReplication(instanceKey *InstanceKey) (*Instance, error) {
-	return StopReplicationForChannel(instanceKey, "")
+func (s *Store) StopReplication(instanceKey *InstanceKey) (*Instance, error) {
+	return s.StopReplicationForChannel(instanceKey, "")
 }
 
 // StopReplicationForChannel stops replication on a given instance, optionally for a specific channel.
 // When channelName is empty, it stops all replication (backward compatible behavior).
 // When channelName is specified, it stops only that channel.
-func StopReplicationForChannel(instanceKey *InstanceKey, channelName string) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) StopReplicationForChannel(instanceKey *InstanceKey, channelName string) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -491,7 +487,7 @@ func StopReplicationForChannel(instanceKey *InstanceKey, channelName string) (*I
 		effectiveChannel = instance.ManagedChannelName
 	}
 
-	_, err = ExecInstance(instanceKey, instance.QSP.StopReplicaForChannel(effectiveChannel))
+	_, err = s.ExecInstance(instanceKey, instance.QSP.StopReplicaForChannel(effectiveChannel))
 	if err != nil {
 		// Patch; current MaxScale behavior for STOP SLAVE is to throw an error if replica already stopped.
 		if instance.isMaxScale() && err.Error() == "Error 1199: Slave connection is not running" {
@@ -501,7 +497,7 @@ func StopReplicationForChannel(instanceKey *InstanceKey, channelName string) (*I
 	if err != nil {
 		return instance, log.Errore(err)
 	}
-	instance, err = ReadTopologyInstance(instanceKey)
+	instance, err = s.ReadTopologyInstance(instanceKey)
 
 	log.Infof("Stopped replication on %+v (channel %q), Self:%+v, Exec:%+v", *instanceKey, effectiveChannel, instance.SelfBinlogCoordinates, instance.ExecBinlogCoordinates)
 	return instance, err
@@ -510,7 +506,7 @@ func StopReplicationForChannel(instanceKey *InstanceKey, channelName string) (*I
 // waitForReplicationState waits for both replication threads to be either running or not running, together.
 // This is useful post- `start slave` operation, ensuring both threads are actually running,
 // or post `stop slave` operation, ensuring both threads are not running.
-func waitForReplicationState(instance *Instance, instanceKey *InstanceKey, expectedState ReplicationThreadState) (expectationMet bool, err error) {
+func (s *Store) waitForReplicationState(instance *Instance, instanceKey *InstanceKey, expectedState ReplicationThreadState) (expectationMet bool, err error) {
 	waitDuration := time.Second
 	waitInterval := 10 * time.Millisecond
 	startTime := time.Now()
@@ -518,7 +514,7 @@ func waitForReplicationState(instance *Instance, instanceKey *InstanceKey, expec
 	for {
 		// Since this is an incremental aggressive polling, it's OK if an occasional
 		// error is observed. We don't bail out on a single error.
-		if expectationMet, _ := expectReplicationThreadsState(instance, instanceKey, expectedState); expectationMet {
+		if expectationMet, _ := s.expectReplicationThreadsState(instance, instanceKey, expectedState); expectationMet {
 			return true, nil
 		}
 		if time.Since(startTime)+waitInterval > waitDuration {
@@ -531,15 +527,15 @@ func waitForReplicationState(instance *Instance, instanceKey *InstanceKey, expec
 }
 
 // StartReplication starts replication on a given instance.
-func StartReplication(instanceKey *InstanceKey) (*Instance, error) {
-	return StartReplicationForChannel(instanceKey, "")
+func (s *Store) StartReplication(instanceKey *InstanceKey) (*Instance, error) {
+	return s.StartReplicationForChannel(instanceKey, "")
 }
 
 // StartReplicationForChannel starts replication on a given instance, optionally for a specific channel.
 // When channelName is empty, it starts all replication (backward compatible behavior).
 // When channelName is specified, it starts only that channel.
-func StartReplicationForChannel(instanceKey *InstanceKey, channelName string) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) StartReplicationForChannel(instanceKey *InstanceKey, channelName string) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -548,7 +544,7 @@ func StartReplicationForChannel(instanceKey *InstanceKey, channelName string) (*
 		return instance, fmt.Errorf("instance is not a replica: %+v", instanceKey)
 	}
 
-	instance, err = MaybeDisableSemiSyncMaster(instance)
+	instance, err = s.MaybeDisableSemiSyncMaster(instance)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -558,7 +554,7 @@ func StartReplicationForChannel(instanceKey *InstanceKey, channelName string) (*
 	// some replicas (those that must never be promoted) should never ACK.
 	// Note: We assume that replicas use 'skip-slave-start' so they won't
 	//       START SLAVE on their own upon restart.
-	instance, err = MaybeEnableSemiSyncReplica(instance)
+	instance, err = s.MaybeEnableSemiSyncReplica(instance)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -569,15 +565,15 @@ func StartReplicationForChannel(instanceKey *InstanceKey, channelName string) (*
 		effectiveChannel = instance.ManagedChannelName
 	}
 
-	_, err = ExecInstance(instanceKey, instance.QSP.StartReplicaForChannel(effectiveChannel))
+	_, err = s.ExecInstance(instanceKey, instance.QSP.StartReplicaForChannel(effectiveChannel))
 	if err != nil {
 		return instance, log.Errore(err)
 	}
 	log.Infof("Started replication on %+v (channel %q)", instanceKey, effectiveChannel)
 
-	waitForReplicationState(instance, instanceKey, ReplicationThreadStateRunning)
+	s.waitForReplicationState(instance, instanceKey, ReplicationThreadStateRunning)
 
-	instance, err = ReadTopologyInstance(instanceKey)
+	instance, err = s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -588,17 +584,17 @@ func StartReplicationForChannel(instanceKey *InstanceKey, channelName string) (*
 }
 
 // RestartReplication stops & starts replication on a given instance
-func RestartReplication(instanceKey *InstanceKey) (instance *Instance, err error) {
-	instance, err = StopReplication(instanceKey)
+func (s *Store) RestartReplication(instanceKey *InstanceKey) (instance *Instance, err error) {
+	instance, err = s.StopReplication(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
-	instance, err = StartReplication(instanceKey)
+	instance, err = s.StartReplication(instanceKey)
 	return instance, log.Errore(err)
 }
 
 // StartReplicas will do concurrent start-replica
-func StartReplicas(replicas [](*Instance)) {
+func (s *Store) StartReplicas(replicas [](*Instance)) {
 	// use concurrency but wait for all to complete
 	log.Debugf("Starting %d replicas", len(replicas))
 	barrier := make(chan InstanceKey)
@@ -608,7 +604,7 @@ func StartReplicas(replicas [](*Instance)) {
 			// Signal compelted replica
 			defer func() { barrier <- instance.Key }()
 			// Wait your turn to read a replica
-			ExecuteOnTopology(func() { StartReplication(&instance.Key) })
+			s.ExecuteOnTopology(func() { s.StartReplication(&instance.Key) })
 		}()
 	}
 	for range replicas {
@@ -616,13 +612,13 @@ func StartReplicas(replicas [](*Instance)) {
 	}
 }
 
-func WaitForExecBinlogCoordinatesToReach(instanceKey *InstanceKey, coordinates *BinlogCoordinates, maxWait time.Duration) (instance *Instance, exactMatch bool, err error) {
+func (s *Store) WaitForExecBinlogCoordinatesToReach(instanceKey *InstanceKey, coordinates *BinlogCoordinates, maxWait time.Duration) (instance *Instance, exactMatch bool, err error) {
 	startTime := time.Now()
 	for {
 		if maxWait != 0 && time.Since(startTime) > maxWait {
 			return nil, exactMatch, fmt.Errorf("WaitForExecBinlogCoordinatesToReach: reached maxWait %+v on %+v", maxWait, *instanceKey)
 		}
-		instance, err = ReadTopologyInstance(instanceKey)
+		instance, err = s.ReadTopologyInstance(instanceKey)
 		if err != nil {
 			return instance, exactMatch, log.Errore(err)
 		}
@@ -639,8 +635,8 @@ func WaitForExecBinlogCoordinatesToReach(instanceKey *InstanceKey, coordinates *
 }
 
 // StartReplicationUntilMasterCoordinates issues a START SLAVE UNTIL... statement on given instance
-func StartReplicationUntilMasterCoordinates(instanceKey *InstanceKey, masterCoordinates *BinlogCoordinates) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) StartReplicationUntilMasterCoordinates(instanceKey *InstanceKey, masterCoordinates *BinlogCoordinates) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -654,11 +650,11 @@ func StartReplicationUntilMasterCoordinates(instanceKey *InstanceKey, masterCoor
 
 	log.Infof("Will start replication on %+v until coordinates: %+v", instanceKey, masterCoordinates)
 
-	instance, err = MaybeDisableSemiSyncMaster(instance)
+	instance, err = s.MaybeDisableSemiSyncMaster(instance)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
-	instance, err = MaybeEnableSemiSyncReplica(instance)
+	instance, err = s.MaybeEnableSemiSyncReplica(instance)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -666,13 +662,13 @@ func StartReplicationUntilMasterCoordinates(instanceKey *InstanceKey, masterCoor
 	// MariaDB has a bug: a CHANGE MASTER TO statement does not work properly with prepared statement... :P
 	// See https://mariadb.atlassian.net/browse/MDEV-7640
 	// This is the reason for ExecInstance
-	_, err = ExecInstance(instanceKey, instance.QSP.start_slave_until_master_log(),
+	_, err = s.ExecInstance(instanceKey, instance.QSP.start_slave_until_master_log(),
 		masterCoordinates.LogFile, masterCoordinates.LogPos)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
 
-	instance, exactMatch, err := WaitForExecBinlogCoordinatesToReach(instanceKey, masterCoordinates, 0)
+	instance, exactMatch, err := s.WaitForExecBinlogCoordinatesToReach(instanceKey, masterCoordinates, 0)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -680,7 +676,7 @@ func StartReplicationUntilMasterCoordinates(instanceKey *InstanceKey, masterCoor
 		return instance, fmt.Errorf("Start SLAVE UNTIL is past coordinates: %+v", instanceKey)
 	}
 
-	instance, err = StopReplication(instanceKey)
+	instance, err = s.StopReplication(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -690,10 +686,10 @@ func StartReplicationUntilMasterCoordinates(instanceKey *InstanceKey, masterCoor
 
 // MaybeDisableSemiSyncMaster always disables the semi-sync master (rpl_semi_sync_master_enabled) if the semi-sync priority is > 0. This is
 // a little odd but in line with the legacy behavior and we really should disable the semi-sync master flag for replicas when starting replication.
-func MaybeDisableSemiSyncMaster(replicaInstance *Instance) (*Instance, error) {
+func (s *Store) MaybeDisableSemiSyncMaster(replicaInstance *Instance) (*Instance, error) {
 	if replicaInstance.SemiSyncPriority > 0 && replicaInstance.SemiSyncMasterEnabled {
 		log.Infof("semi-sync: %s: setting rpl_semi_sync_master_enabled: %t", &replicaInstance.Key, false)
-		replicaInstance, err := SetSemiSyncMaster(&replicaInstance.Key, false)
+		replicaInstance, err := s.SetSemiSyncMaster(&replicaInstance.Key, false)
 		if err != nil {
 			_ = log.Warningf("semi-sync: %s: cannot disable rpl_semi_sync_master_enabled; that's not that bad though", &replicaInstance.Key)
 		}
@@ -707,23 +703,23 @@ func MaybeDisableSemiSyncMaster(replicaInstance *Instance) (*Instance, error) {
 // only if the given instance is supposed to be enabled according to the semi-sync priority order and the number of desired semi-sync replicas.
 // If the flags are both turned off, the legacy behavior kicks in: If SemiSyncPriority > 0 and the instance is promotable (not "must_not"),
 // semi-sync is enabled.
-func MaybeEnableSemiSyncReplica(replicaInstance *Instance) (*Instance, error) {
+func (s *Store) MaybeEnableSemiSyncReplica(replicaInstance *Instance) (*Instance, error) {
 	// Backwards compatible logic: Enable semi-sync if SemiSyncPriority > 0 (formerly SemiSyncEnforced)
 	// Note that this logic NEVER enables semi-sync if the promotion rule is "must_not".
-	if !config.Config.EnforceExactSemiSyncReplicas && !config.Config.RecoverLockedSemiSyncMaster {
-		return maybeEnableSemiSyncReplicaLegacy(replicaInstance)
+	if !s.cfg.EnforceExactSemiSyncReplicas && !s.cfg.RecoverLockedSemiSyncMaster {
+		return s.maybeEnableSemiSyncReplicaLegacy(replicaInstance)
 	}
 
 	// New logic: If EnforceExactSemiSyncReplicas or RecoverLockedSemiSyncMaster are set, we enable semi-sync only if the
 	// given replica instance is in the list of replicas to have semi-sync enabled (according to the priority).
-	_, _, actions, err := AnalyzeSemiSyncReplicaTopology(&replicaInstance.MasterKey, &replicaInstance.Key, config.Config.EnforceExactSemiSyncReplicas)
+	_, _, actions, err := s.AnalyzeSemiSyncReplicaTopology(&replicaInstance.MasterKey, &replicaInstance.Key, s.cfg.EnforceExactSemiSyncReplicas)
 	if err != nil {
 		return replicaInstance, log.Errorf("semi-sync: %s", err.Error())
 	}
 	for replica, enable := range actions {
 		if replica.Key.Equals(&replicaInstance.Key) {
 			log.Infof("semi-sync: %s: setting rpl_semi_sync_slave_enabled=%t, restarting slave_io thread", replica.Key.String(), enable)
-			if _, err := SetSemiSyncReplica(&replica.Key, enable); err != nil {
+			if _, err := s.SetSemiSyncReplica(&replica.Key, enable); err != nil {
 				return nil, fmt.Errorf("cannot enable semi sync on replica %+v", replica.Key)
 			}
 			return replicaInstance, nil
@@ -739,26 +735,26 @@ func MaybeEnableSemiSyncReplica(replicaInstance *Instance) (*Instance, error) {
 
 // maybeEnableSemiSyncReplicaLegacy enable semi-sync if SemiSyncPriority > 0 (formerly SemiSyncEnforced). This is a backwards
 // compatible logic that NEVER enables semi-sync if the promotion rule is "must_not".
-func maybeEnableSemiSyncReplicaLegacy(replicaInstance *Instance) (*Instance, error) {
+func (s *Store) maybeEnableSemiSyncReplicaLegacy(replicaInstance *Instance) (*Instance, error) {
 	if replicaInstance.SemiSyncPriority > 0 {
 		enable := replicaInstance.PromotionRule != MustNotPromoteRule // Send ACK only from promotable instances
 		log.Infof("semi-sync: %+v: setting rpl_semi_sync_slave_enabled = %t (legacy behavior)", &replicaInstance.Key, enable)
-		return SetSemiSyncReplica(&replicaInstance.Key, enable)
+		return s.SetSemiSyncReplica(&replicaInstance.Key, enable)
 	}
 	return replicaInstance, nil
 }
 
 // AnalyzeSemiSyncReplicaTopology analyzes the replica topology for the given master and determines actions for the semi-sync replica enabled
 // variable. It does not take any action itself.
-func AnalyzeSemiSyncReplicaTopology(masterKey *InstanceKey, includeNonReplicatingInstance *InstanceKey, exactReplicaTopology bool) (masterInstance *Instance, replicas []*Instance, actions map[*Instance]bool, err error) {
+func (s *Store) AnalyzeSemiSyncReplicaTopology(masterKey *InstanceKey, includeNonReplicatingInstance *InstanceKey, exactReplicaTopology bool) (masterInstance *Instance, replicas []*Instance, actions map[*Instance]bool, err error) {
 	// Read entire topology of master and its replicas to ensure we have the most up-to-date information
-	masterInstance, err = ReadTopologyInstance(masterKey)
+	masterInstance, err = s.ReadTopologyInstance(masterKey)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	replicas, err = ReadTopologyInstances(masterInstance.Replicas.GetInstanceKeys())
+	replicas, err = s.ReadTopologyInstances(masterInstance.Replicas.GetInstanceKeys())
 	if err != nil {
-		replicas, err = ReadReplicaInstances(masterKey) // Falling back to just reading from our backend
+		replicas, err = s.ReadReplicaInstances(masterKey) // Falling back to just reading from our backend
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -880,36 +876,36 @@ func logSemiSyncReplicaList(description string, replicas []*Instance) {
 
 // DelayReplication set the replication delay given seconds
 // keeping the current state of the replication threads.
-func DelayReplication(instanceKey *InstanceKey, seconds int) error {
+func (s *Store) DelayReplication(instanceKey *InstanceKey, seconds int) error {
 	if seconds < 0 {
 		return fmt.Errorf("invalid seconds: %d, it should be greater or equal to 0", seconds)
 	}
 
-	instance, err := ReadTopologyInstance(instanceKey)
+	instance, err := s.ReadTopologyInstance(instanceKey)
 
 	if err != nil {
 		return err
 	}
 
 	query := fmt.Sprintf(instance.QSP.change_master_to_master_delay(), seconds)
-	statements, err := GetReplicationRestartPreserveStatements(instanceKey, query)
+	statements, err := s.GetReplicationRestartPreserveStatements(instanceKey, query)
 	if err != nil {
 		return err
 	}
 	for _, cmd := range statements {
-		if _, err := ExecInstance(instanceKey, cmd); err != nil {
+		if _, err := s.ExecInstance(instanceKey, cmd); err != nil {
 			return log.Errorf("%+v: DelayReplication: '%q' failed: %+v", *instanceKey, cmd, err)
 		} else {
 			log.Infof("DelayReplication: %s on %+v", cmd, *instanceKey)
 		}
 	}
-	AuditOperation("delay-replication", instanceKey, fmt.Sprintf("set to %d", seconds))
+	s.AuditOperation("delay-replication", instanceKey, fmt.Sprintf("set to %d", seconds))
 	return nil
 }
 
 // ChangeMasterCredentials issues a CHANGE MASTER TO... MASTER_USER=, MASTER_PASSWORD=...
-func ChangeMasterCredentials(instanceKey *InstanceKey, creds *ReplicationCredentials) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) ChangeMasterCredentials(instanceKey *InstanceKey, creds *ReplicationCredentials) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -956,7 +952,7 @@ func ChangeMasterCredentials(instanceKey *InstanceKey, creds *ReplicationCredent
 	}
 
 	query := fmt.Sprintf(instance.QSP.change_master_to_with_params(), strings.Join(query_params, ", "))
-	_, err = ExecInstance(instanceKey, query, query_params_args...)
+	_, err = s.ExecInstance(instanceKey, query, query_params_args...)
 
 	if err != nil {
 		return instance, log.Errore(err)
@@ -964,12 +960,12 @@ func ChangeMasterCredentials(instanceKey *InstanceKey, creds *ReplicationCredent
 
 	log.Infof("ChangeMasterTo: Changed master credentials on %+v", *instanceKey)
 
-	instance, err = ReadTopologyInstance(instanceKey)
+	instance, err = s.ReadTopologyInstance(instanceKey)
 	return instance, err
 }
 
-func EnableMasterGetSourcePublicKey(instanceKey *InstanceKey) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) EnableMasterGetSourcePublicKey(instanceKey *InstanceKey) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -982,7 +978,7 @@ func EnableMasterGetSourcePublicKey(instanceKey *InstanceKey) (*Instance, error)
 	if *config.RuntimeCLIFlags.Noop {
 		return instance, fmt.Errorf("noop: aborting CHANGE REPLICATION SOURCE TO GET_SOURCE_PUBLIC_KEY=1 operation on %+v; signaling error but nothing went wrong", *instanceKey)
 	}
-	_, err = ExecInstance(instanceKey, instance.QSP.change_master_to_get_source_public_key())
+	_, err = s.ExecInstance(instanceKey, instance.QSP.change_master_to_get_source_public_key())
 
 	if err != nil {
 		return instance, log.Errore(err)
@@ -990,13 +986,13 @@ func EnableMasterGetSourcePublicKey(instanceKey *InstanceKey) (*Instance, error)
 
 	log.Infof("EnableMasterGetSourcePublicKey: Enabled GetSourcePublicKey replication on %+v", *instanceKey)
 
-	instance, err = ReadTopologyInstance(instanceKey)
+	instance, err = s.ReadTopologyInstance(instanceKey)
 	return instance, err
 }
 
 // EnableMasterSSL issues CHANGE MASTER TO MASTER_SSL=1
-func EnableMasterSSL(instanceKey *InstanceKey) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) EnableMasterSSL(instanceKey *InstanceKey) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -1009,7 +1005,7 @@ func EnableMasterSSL(instanceKey *InstanceKey) (*Instance, error) {
 	if *config.RuntimeCLIFlags.Noop {
 		return instance, fmt.Errorf("noop: aborting CHANGE MASTER TO MASTER_SSL=1 operation on %+v; signaling error but nothing went wrong.", *instanceKey)
 	}
-	_, err = ExecInstance(instanceKey, instance.QSP.change_master_to_master_ssl())
+	_, err = s.ExecInstance(instanceKey, instance.QSP.change_master_to_master_ssl())
 
 	if err != nil {
 		return instance, log.Errore(err)
@@ -1017,12 +1013,12 @@ func EnableMasterSSL(instanceKey *InstanceKey) (*Instance, error) {
 
 	log.Infof("EnableMasterSSL: Enabled SSL replication on %+v", *instanceKey)
 
-	instance, err = ReadTopologyInstance(instanceKey)
+	instance, err = s.ReadTopologyInstance(instanceKey)
 	return instance, err
 }
 
 // See https://bugs.mysql.com/bug.php?id=83713
-func workaroundBug83713(instance *Instance, instanceKey *InstanceKey) {
+func (s *Store) workaroundBug83713(instance *Instance, instanceKey *InstanceKey) {
 	log.Debugf("workaroundBug83713: %+v", *instanceKey)
 	queries := []string{
 		instance.QSP.reset_slave(),
@@ -1031,22 +1027,22 @@ func workaroundBug83713(instance *Instance, instanceKey *InstanceKey) {
 		instance.QSP.reset_slave(),
 	}
 	for _, query := range queries {
-		if _, err := ExecInstance(instanceKey, query); err != nil {
+		if _, err := s.ExecInstance(instanceKey, query); err != nil {
 			log.Debugf("workaroundBug83713: error on %s: %+v", query, err)
 		}
 	}
 }
 
 // ChangeMasterTo changes the given instance's master according to given input.
-func ChangeMasterTo(instanceKey *InstanceKey, masterKey *InstanceKey, masterBinlogCoordinates *BinlogCoordinates, skipUnresolve bool, gtidHint OperationGTIDHint) (*Instance, error) {
-	return ChangeMasterToForChannel(instanceKey, masterKey, masterBinlogCoordinates, skipUnresolve, gtidHint, "")
+func (s *Store) ChangeMasterTo(instanceKey *InstanceKey, masterKey *InstanceKey, masterBinlogCoordinates *BinlogCoordinates, skipUnresolve bool, gtidHint OperationGTIDHint) (*Instance, error) {
+	return s.ChangeMasterToForChannel(instanceKey, masterKey, masterBinlogCoordinates, skipUnresolve, gtidHint, "")
 }
 
 // ChangeMasterToForChannel changes the given instance's master for a specific replication channel.
 // When channelName is empty, this behaves identically to the original ChangeMasterTo for
 // backward compatibility with single-source replication.
-func ChangeMasterToForChannel(instanceKey *InstanceKey, masterKey *InstanceKey, masterBinlogCoordinates *BinlogCoordinates, skipUnresolve bool, gtidHint OperationGTIDHint, channelName string) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) ChangeMasterToForChannel(instanceKey *InstanceKey, masterKey *InstanceKey, masterBinlogCoordinates *BinlogCoordinates, skipUnresolve bool, gtidHint OperationGTIDHint, channelName string) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -1057,7 +1053,7 @@ func ChangeMasterToForChannel(instanceKey *InstanceKey, masterKey *InstanceKey, 
 	log.Debugf("ChangeMasterTo: will attempt changing master on %+v to %+v, %+v (channel %q)", *instanceKey, *masterKey, *masterBinlogCoordinates, channelName)
 	changeToMasterKey := masterKey
 	if !skipUnresolve {
-		unresolvedMasterKey, nameUnresolved, err := UnresolveHostname(masterKey)
+		unresolvedMasterKey, nameUnresolved, err := s.UnresolveHostname(masterKey)
 		if err != nil {
 			log.Debugf("ChangeMasterTo: aborting operation on %+v due to resolving error on %+v: %+v", *instanceKey, *masterKey, err)
 			return instance, err
@@ -1083,7 +1079,7 @@ func ChangeMasterToForChannel(instanceKey *InstanceKey, masterKey *InstanceKey, 
 	if instance.UsingMariaDBGTID && gtidHint != GTIDHintDeny {
 		// Keep on using GTID
 		changeMasterFunc = func() error {
-			_, err := ExecInstance(instanceKey, instance.QSP.change_master_to_master_host_port()+channelClause,
+			_, err := s.ExecInstance(instanceKey, instance.QSP.change_master_to_master_host_port()+channelClause,
 				changeToMasterKey.Hostname, changeToMasterKey.Port)
 			return err
 		}
@@ -1091,7 +1087,7 @@ func ChangeMasterToForChannel(instanceKey *InstanceKey, masterKey *InstanceKey, 
 	} else if instance.UsingMariaDBGTID && gtidHint == GTIDHintDeny {
 		// Make sure to not use GTID
 		changeMasterFunc = func() error {
-			_, err = ExecInstance(instanceKey, instance.QSP.change_master_to_master_host_port_log_gtid_no()+channelClause,
+			_, err = s.ExecInstance(instanceKey, instance.QSP.change_master_to_master_host_port_log_gtid_no()+channelClause,
 				changeToMasterKey.Hostname, changeToMasterKey.Port, masterBinlogCoordinates.LogFile, masterBinlogCoordinates.LogPos)
 			return err
 		}
@@ -1108,7 +1104,7 @@ func ChangeMasterToForChannel(instanceKey *InstanceKey, masterKey *InstanceKey, 
 			mariadbGTIDHint = "current_pos"
 		}
 		changeMasterFunc = func() error {
-			_, err = ExecInstance(instanceKey, fmt.Sprintf("change master to master_host=?, master_port=?, master_use_gtid=%s", mariadbGTIDHint)+channelClause,
+			_, err = s.ExecInstance(instanceKey, fmt.Sprintf("change master to master_host=?, master_port=?, master_use_gtid=%s", mariadbGTIDHint)+channelClause,
 				changeToMasterKey.Hostname, changeToMasterKey.Port)
 			return err
 		}
@@ -1116,7 +1112,7 @@ func ChangeMasterToForChannel(instanceKey *InstanceKey, masterKey *InstanceKey, 
 	} else if instance.UsingOracleGTID && gtidHint != GTIDHintDeny {
 		// Is Oracle; already uses GTID; keep using it.
 		changeMasterFunc = func() error {
-			_, err = ExecInstance(instanceKey, instance.QSP.change_master_to_master_host_port()+channelClause,
+			_, err = s.ExecInstance(instanceKey, instance.QSP.change_master_to_master_host_port()+channelClause,
 				changeToMasterKey.Hostname, changeToMasterKey.Port)
 			return err
 		}
@@ -1124,14 +1120,14 @@ func ChangeMasterToForChannel(instanceKey *InstanceKey, masterKey *InstanceKey, 
 	} else if instance.UsingOracleGTID && gtidHint == GTIDHintDeny {
 		// Is Oracle; already uses GTID
 		changeMasterFunc = func() error {
-			_, err = ExecInstance(instanceKey, instance.QSP.change_master_to_master_host_port_log_autoposition_no()+channelClause,
+			_, err = s.ExecInstance(instanceKey, instance.QSP.change_master_to_master_host_port_log_autoposition_no()+channelClause,
 				changeToMasterKey.Hostname, changeToMasterKey.Port, masterBinlogCoordinates.LogFile, masterBinlogCoordinates.LogPos)
 			return err
 		}
 	} else if instance.SupportsOracleGTID && gtidHint == GTIDHintForce {
 		// Is Oracle; not using GTID right now; turn into GTID
 		changeMasterFunc = func() error {
-			_, err = ExecInstance(instanceKey, instance.QSP.change_master_to_master_host_port_autoposition_yes()+channelClause,
+			_, err = s.ExecInstance(instanceKey, instance.QSP.change_master_to_master_host_port_autoposition_yes()+channelClause,
 				changeToMasterKey.Hostname, changeToMasterKey.Port)
 			return err
 		}
@@ -1139,7 +1135,7 @@ func ChangeMasterToForChannel(instanceKey *InstanceKey, masterKey *InstanceKey, 
 	} else {
 		// Normal binlog file:pos
 		changeMasterFunc = func() error {
-			_, err = ExecInstance(instanceKey, instance.QSP.change_master_to_master_host_port_log()+channelClause,
+			_, err = s.ExecInstance(instanceKey, instance.QSP.change_master_to_master_host_port_log()+channelClause,
 				changeToMasterKey.Hostname, changeToMasterKey.Port, masterBinlogCoordinates.LogFile, masterBinlogCoordinates.LogPos)
 			return err
 		}
@@ -1147,26 +1143,26 @@ func ChangeMasterToForChannel(instanceKey *InstanceKey, masterKey *InstanceKey, 
 	err = changeMasterFunc()
 	if err != nil && instance.UsingOracleGTID && strings.Contains(err.Error(), Error1201CouldnotInitializeMasterInfoStructure) {
 		log.Debugf("ChangeMasterTo: got %+v", err)
-		workaroundBug83713(instance, instanceKey)
+		s.workaroundBug83713(instance, instanceKey)
 		err = changeMasterFunc()
 	}
 	if err != nil {
 		return instance, log.Errore(err)
 	}
-	WriteMasterPositionEquivalence(&originalMasterKey, &originalExecBinlogCoordinates, changeToMasterKey, masterBinlogCoordinates)
-	ResetInstanceRelaylogCoordinatesHistory(instanceKey)
+	s.WriteMasterPositionEquivalence(&originalMasterKey, &originalExecBinlogCoordinates, changeToMasterKey, masterBinlogCoordinates)
+	s.ResetInstanceRelaylogCoordinatesHistory(instanceKey)
 
 	log.Infof("ChangeMasterTo: Changed master on %+v to: %+v, %+v. GTID: %+v, Channel: %q", *instanceKey, masterKey, masterBinlogCoordinates, changedViaGTID, channelName)
 
-	instance, err = ReadTopologyInstance(instanceKey)
+	instance, err = s.ReadTopologyInstance(instanceKey)
 	return instance, err
 }
 
 // SkipToNextBinaryLog changes master position to beginning of next binlog
 // USE WITH CARE!
 // Use case is binlog servers where the master was gone & replaced by another.
-func SkipToNextBinaryLog(instanceKey *InstanceKey) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) SkipToNextBinaryLog(instanceKey *InstanceKey) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -1178,17 +1174,17 @@ func SkipToNextBinaryLog(instanceKey *InstanceKey) (*Instance, error) {
 	nextFileCoordinates.LogPos = 4
 	log.Debugf("Will skip replication on %+v to next binary log: %+v", instance.Key, nextFileCoordinates.LogFile)
 
-	instance, err = ChangeMasterTo(&instance.Key, &instance.MasterKey, &nextFileCoordinates, false, GTIDHintNeutral)
+	instance, err = s.ChangeMasterTo(&instance.Key, &instance.MasterKey, &nextFileCoordinates, false, GTIDHintNeutral)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
-	AuditOperation("skip-binlog", instanceKey, fmt.Sprintf("Skipped replication to next binary log: %+v", nextFileCoordinates.LogFile))
-	return StartReplication(instanceKey)
+	s.AuditOperation("skip-binlog", instanceKey, fmt.Sprintf("Skipped replication to next binary log: %+v", nextFileCoordinates.LogFile))
+	return s.StartReplication(instanceKey)
 }
 
 // ResetReplication resets a replica, breaking the replication
-func ResetReplication(instanceKey *InstanceKey) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) ResetReplication(instanceKey *InstanceKey) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -1205,28 +1201,28 @@ func ResetReplication(instanceKey *InstanceKey) (*Instance, error) {
 	// and only resets till after next restart. This leads to orchestrator still thinking the instance replicates
 	// from old host. We therefore forcibly modify the hostname.
 	// RESET SLAVE ALL command solves this, but only as of 5.6.3
-	_, err = ExecInstance(instanceKey, instance.QSP.change_master_to_master_host())
+	_, err = s.ExecInstance(instanceKey, instance.QSP.change_master_to_master_host())
 	if err != nil {
 		return instance, log.Errore(err)
 	}
-	_, err = ExecInstance(instanceKey, instance.QSP.reset_slave_50603_all())
+	_, err = s.ExecInstance(instanceKey, instance.QSP.reset_slave_50603_all())
 	if err != nil && strings.Contains(err.Error(), Error1201CouldnotInitializeMasterInfoStructure) {
 		log.Debugf("ResetReplication: got %+v", err)
-		workaroundBug83713(instance, instanceKey)
-		_, err = ExecInstance(instanceKey, instance.QSP.reset_slave_50603_all())
+		s.workaroundBug83713(instance, instanceKey)
+		_, err = s.ExecInstance(instanceKey, instance.QSP.reset_slave_50603_all())
 	}
 	if err != nil {
 		return instance, log.Errore(err)
 	}
 	log.Infof("Reset replication %+v", instanceKey)
 
-	instance, err = ReadTopologyInstance(instanceKey)
+	instance, err = s.ReadTopologyInstance(instanceKey)
 	return instance, err
 }
 
 // ResetMaster issues a RESET MASTER statement on given instance. Use with extreme care!
-func ResetMaster(instanceKey *InstanceKey) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) ResetMaster(instanceKey *InstanceKey) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -1239,29 +1235,29 @@ func ResetMaster(instanceKey *InstanceKey) (*Instance, error) {
 		return instance, fmt.Errorf("noop: aborting reset-master operation on %+v; signalling error but nothing went wrong.", *instanceKey)
 	}
 
-	_, err = ExecInstance(instanceKey, instance.QSP.reset_master())
+	_, err = s.ExecInstance(instanceKey, instance.QSP.reset_master())
 	if err != nil {
 		return instance, log.Errore(err)
 	}
 	log.Infof("Reset master %+v", instanceKey)
 
-	instance, err = ReadTopologyInstance(instanceKey)
+	instance, err = s.ReadTopologyInstance(instanceKey)
 	return instance, err
 }
 
 // skipQueryClassic skips a query in normal binlog file:pos replication
-func setGTIDPurged(instance *Instance, gtidPurged string) error {
+func (s *Store) setGTIDPurged(instance *Instance, gtidPurged string) error {
 	if *config.RuntimeCLIFlags.Noop {
 		return fmt.Errorf("noop: aborting set-gtid-purged operation on %+v; signalling error but nothing went wrong.", instance.Key)
 	}
 
-	_, err := ExecInstance(&instance.Key, `set global gtid_purged := ?`, gtidPurged)
+	_, err := s.ExecInstance(&instance.Key, `set global gtid_purged := ?`, gtidPurged)
 	return err
 }
 
 // injectEmptyGTIDTransaction
-func injectEmptyGTIDTransaction(instanceKey *InstanceKey, gtidEntry *OracleGtidSetEntry) error {
-	db, err := db.OpenTopology(instanceKey.Hostname, instanceKey.Port)
+func (s *Store) injectEmptyGTIDTransaction(instanceKey *InstanceKey, gtidEntry *OracleGtidSetEntry) error {
+	db, err := s.backend.OpenTopology(instanceKey.Hostname, instanceKey.Port)
 	if err != nil {
 		return err
 	}
@@ -1289,13 +1285,13 @@ func injectEmptyGTIDTransaction(instanceKey *InstanceKey, gtidEntry *OracleGtidS
 }
 
 // skipQueryClassic skips a query in normal binlog file:pos replication
-func skipQueryClassic(instance *Instance) error {
-	_, err := ExecInstance(&instance.Key, instance.QSP.set_sql_slave_skip_counter())
+func (s *Store) skipQueryClassic(instance *Instance) error {
+	_, err := s.ExecInstance(&instance.Key, instance.QSP.set_sql_slave_skip_counter())
 	return err
 }
 
 // skipQueryOracleGtid skips a single query in an Oracle GTID replicating replica, by injecting an empty transaction
-func skipQueryOracleGtid(instance *Instance) error {
+func (s *Store) skipQueryOracleGtid(instance *Instance) error {
 	nextGtid, err := instance.NextGTID()
 	if err != nil {
 		return err
@@ -1303,21 +1299,21 @@ func skipQueryOracleGtid(instance *Instance) error {
 	if nextGtid == "" {
 		return fmt.Errorf("Empty NextGTID() in skipQueryGtid() for %+v", instance.Key)
 	}
-	if _, err := ExecInstance(&instance.Key, `SET GTID_NEXT=?`, nextGtid); err != nil {
+	if _, err := s.ExecInstance(&instance.Key, `SET GTID_NEXT=?`, nextGtid); err != nil {
 		return err
 	}
-	if err := EmptyCommitInstance(&instance.Key); err != nil {
+	if err := s.EmptyCommitInstance(&instance.Key); err != nil {
 		return err
 	}
-	if _, err := ExecInstance(&instance.Key, `SET GTID_NEXT='AUTOMATIC'`); err != nil {
+	if _, err := s.ExecInstance(&instance.Key, `SET GTID_NEXT='AUTOMATIC'`); err != nil {
 		return err
 	}
 	return nil
 }
 
 // SkipQuery skip a single query in a failed replication instance
-func SkipQuery(instanceKey *InstanceKey) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) SkipQuery(instanceKey *InstanceKey) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -1338,46 +1334,46 @@ func SkipQuery(instanceKey *InstanceKey) (*Instance, error) {
 
 	log.Debugf("Skipping one query on %+v", instanceKey)
 	if instance.UsingOracleGTID {
-		err = skipQueryOracleGtid(instance)
+		err = s.skipQueryOracleGtid(instance)
 	} else if instance.UsingMariaDBGTID {
 		return instance, log.Errorf("%+v is replicating with MariaDB GTID. To skip a query first disable GTID, then skip, then enable GTID again", *instanceKey)
 	} else {
-		err = skipQueryClassic(instance)
+		err = s.skipQueryClassic(instance)
 	}
 	if err != nil {
 		return instance, log.Errore(err)
 	}
-	AuditOperation("skip-query", instanceKey, "Skipped one query")
-	return StartReplication(instanceKey)
+	s.AuditOperation("skip-query", instanceKey, "Skipped one query")
+	return s.StartReplication(instanceKey)
 }
 
 // MasterPosWait issues a MASTER_POS_WAIT() an given instance according to given coordinates.
-func MasterPosWait(instanceKey *InstanceKey, binlogCoordinates *BinlogCoordinates) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) MasterPosWait(instanceKey *InstanceKey, binlogCoordinates *BinlogCoordinates) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
 
-	_, err = ExecInstance(instanceKey, instance.QSP.select_master_pos_wait(), binlogCoordinates.LogFile, binlogCoordinates.LogPos)
+	_, err = s.ExecInstance(instanceKey, instance.QSP.select_master_pos_wait(), binlogCoordinates.LogFile, binlogCoordinates.LogPos)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
 	log.Infof("Instance %+v has reached coordinates: %+v", instanceKey, binlogCoordinates)
 
-	instance, err = ReadTopologyInstance(instanceKey)
+	instance, err = s.ReadTopologyInstance(instanceKey)
 	return instance, err
 }
 
 // Attempt to read and return replication credentials from the mysql.slave_master_info system table
-func ReadReplicationCredentials(instanceKey *InstanceKey) (creds *ReplicationCredentials, err error) {
+func (s *Store) ReadReplicationCredentials(instanceKey *InstanceKey) (creds *ReplicationCredentials, err error) {
 	creds = &ReplicationCredentials{}
-	if config.Config.ReplicationCredentialsQuery != "" {
-		db, err := db.OpenTopology(instanceKey.Hostname, instanceKey.Port)
+	if s.cfg.ReplicationCredentialsQuery != "" {
+		db, err := s.backend.OpenTopology(instanceKey.Hostname, instanceKey.Port)
 		if err != nil {
 			return creds, log.Errore(err)
 		}
 		{
-			resultData, err := sqlutils.QueryResultData(db, config.Config.ReplicationCredentialsQuery)
+			resultData, err := sqlutils.QueryResultData(db, s.cfg.ReplicationCredentialsQuery)
 			if err != nil {
 				return creds, log.Errore(err)
 			}
@@ -1420,7 +1416,7 @@ func ReadReplicationCredentials(instanceKey *InstanceKey) (creds *ReplicationCre
 			from
 				mysql.slave_master_info
 		`
-		err = ScanInstanceRow(instanceKey, query, &creds.User, &creds.Password)
+		err = s.ScanInstanceRow(instanceKey, query, &creds.User, &creds.Password)
 		if err == nil && creds.User == "" {
 			err = fmt.Errorf("Empty username found in mysql.slave_master_info")
 		}
@@ -1430,8 +1426,8 @@ func ReadReplicationCredentials(instanceKey *InstanceKey) (creds *ReplicationCre
 }
 
 // SetReadOnly sets or clears the instance's global read_only variable
-func SetReadOnly(instanceKey *InstanceKey, readOnly bool) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) SetReadOnly(instanceKey *InstanceKey, readOnly bool) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -1443,16 +1439,16 @@ func SetReadOnly(instanceKey *InstanceKey, readOnly bool) (*Instance, error) {
 	// If async fallback is disallowed, we're responsible for flipping the master
 	// semi-sync switch ON before accepting writes. The setting is off by default.
 	if instance.SemiSyncPriority > 0 && !readOnly {
-		if _, err := SetSemiSyncMaster(instanceKey, true); err != nil {
+		if _, err := s.SetSemiSyncMaster(instanceKey, true); err != nil {
 			return instance, log.Errore(err)
 		}
 	}
 
-	if _, err := ExecInstance(instanceKey, "set global read_only = ?", readOnly); err != nil {
+	if _, err := s.ExecInstance(instanceKey, "set global read_only = ?", readOnly); err != nil {
 		return instance, log.Errore(err)
 	}
-	if config.Config.UseSuperReadOnly {
-		if _, err := ExecInstance(instanceKey, "set global super_read_only = ?", readOnly); err != nil {
+	if s.cfg.UseSuperReadOnly {
+		if _, err := s.ExecInstance(instanceKey, "set global super_read_only = ?", readOnly); err != nil {
 			// We don't bail out here. super_read_only is only available on
 			// MySQL 5.7.8 and Percona Server 5.6.21-70
 			// At this time orchestrator does not verify whether a server supports super_read_only or not.
@@ -1460,7 +1456,7 @@ func SetReadOnly(instanceKey *InstanceKey, readOnly bool) (*Instance, error) {
 			_ = log.Errore(err)
 		}
 	}
-	instance, err = ReadTopologyInstance(instanceKey)
+	instance, err = s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -1468,20 +1464,20 @@ func SetReadOnly(instanceKey *InstanceKey, readOnly bool) (*Instance, error) {
 	// If we just went read-only, it's safe to flip the master semi-sync switch
 	// OFF, which is the default value so that replicas can make progress.
 	if instance.SemiSyncPriority > 0 && readOnly {
-		if _, err := SetSemiSyncMaster(instanceKey, false); err != nil {
+		if _, err := s.SetSemiSyncMaster(instanceKey, false); err != nil {
 			return instance, log.Errore(err)
 		}
 	}
 
 	log.Infof("instance %+v read_only: %t", instanceKey, readOnly)
-	AuditOperation("read-only", instanceKey, fmt.Sprintf("set as %t", readOnly))
+	s.AuditOperation("read-only", instanceKey, fmt.Sprintf("set as %t", readOnly))
 
 	return instance, err
 }
 
 // KillQuery stops replication on a given instance
-func KillQuery(instanceKey *InstanceKey, process int64) (*Instance, error) {
-	instance, err := ReadTopologyInstance(instanceKey)
+func (s *Store) KillQuery(instanceKey *InstanceKey, process int64) (*Instance, error) {
+	instance, err := s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
@@ -1490,23 +1486,23 @@ func KillQuery(instanceKey *InstanceKey, process int64) (*Instance, error) {
 		return instance, fmt.Errorf("noop: aborting kill-query operation on %+v; signalling error but nothing went wrong.", *instanceKey)
 	}
 
-	_, err = ExecInstance(instanceKey, `kill query ?`, process)
+	_, err = s.ExecInstance(instanceKey, `kill query ?`, process)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
 
-	instance, err = ReadTopologyInstance(instanceKey)
+	instance, err = s.ReadTopologyInstance(instanceKey)
 	if err != nil {
 		return instance, log.Errore(err)
 	}
 
 	log.Infof("Killed query on %+v", *instanceKey)
-	AuditOperation("kill-query", instanceKey, fmt.Sprintf("Killed query %d", process))
+	s.AuditOperation("kill-query", instanceKey, fmt.Sprintf("Killed query %d", process))
 	return instance, err
 }
 
 // injectPseudoGTID injects a Pseudo-GTID statement on a writable instance
-func injectPseudoGTID(instance *Instance) (hint string, err error) {
+func (s *Store) injectPseudoGTID(instance *Instance) (hint string, err error) {
 	if *config.RuntimeCLIFlags.Noop {
 		return hint, fmt.Errorf("noop: aborting inject-pseudo-gtid operation on %+v; signalling error but nothing went wrong.", instance.Key)
 	}
@@ -1515,17 +1511,17 @@ func injectPseudoGTID(instance *Instance) (hint string, err error) {
 	randomHash := util.RandomHash()[0:16]
 	hint = fmt.Sprintf("%.8x:%.8x:%s", now.Unix(), instance.ServerID, randomHash)
 	query := fmt.Sprintf("drop view if exists `%s`.`_asc:%s`", config.PseudoGTIDSchema, hint)
-	_, err = ExecInstance(&instance.Key, query)
+	_, err = s.ExecInstance(&instance.Key, query)
 	return hint, log.Errore(err)
 }
 
 // canInjectPseudoGTID checks orchestrator's grants to determine whether is has the
 // privilege of auto-injecting pseudo-GTID
-func canInjectPseudoGTID(instanceKey *InstanceKey) (canInject bool, err error) {
-	if canInject, found := supportedAutoPseudoGTIDWriters.Get(instanceKey.StringCode()); found {
+func (s *Store) canInjectPseudoGTID(instanceKey *InstanceKey) (canInject bool, err error) {
+	if canInject, found := s.supportedAutoPseudoGTIDWriters.Get(instanceKey.StringCode()); found {
 		return canInject.(bool), nil
 	}
-	db, err := db.OpenTopology(instanceKey.Hostname, instanceKey.Port)
+	db, err := s.backend.OpenTopology(instanceKey.Hostname, instanceKey.Port)
 	if err != nil {
 		return canInject, err
 	}
@@ -1564,14 +1560,14 @@ func canInjectPseudoGTID(instanceKey *InstanceKey) (canInject bool, err error) {
 	}
 
 	canInject = foundAll || foundDropOnAll || foundAllOnSchema || foundDropOnSchema
-	supportedAutoPseudoGTIDWriters.Set(instanceKey.StringCode(), canInject, cache.DefaultExpiration)
+	s.supportedAutoPseudoGTIDWriters.Set(instanceKey.StringCode(), canInject, cache.DefaultExpiration)
 
 	return canInject, nil
 }
 
 // CheckAndInjectPseudoGTIDOnWriter checks whether pseudo-GTID can and
 // should be injected on given instance, and if so, attempts to inject.
-func CheckAndInjectPseudoGTIDOnWriter(instance *Instance) (injected bool, err error) {
+func (s *Store) CheckAndInjectPseudoGTIDOnWriter(instance *Instance) (injected bool, err error) {
 	if instance == nil {
 		return injected, log.Errorf("CheckAndInjectPseudoGTIDOnWriter: instance is nil")
 	}
@@ -1581,7 +1577,7 @@ func CheckAndInjectPseudoGTIDOnWriter(instance *Instance) (injected bool, err er
 	if !instance.IsLastCheckValid {
 		return injected, nil
 	}
-	canInject, err := canInjectPseudoGTID(&instance.Key)
+	canInject, err := s.canInjectPseudoGTID(&instance.Key)
 	if err != nil {
 		return injected, log.Errore(err)
 	}
@@ -1592,18 +1588,18 @@ func CheckAndInjectPseudoGTIDOnWriter(instance *Instance) (injected bool, err er
 
 		return injected, nil
 	}
-	if _, err := injectPseudoGTID(instance); err != nil {
+	if _, err := s.injectPseudoGTID(instance); err != nil {
 		return injected, log.Errore(err)
 	}
 	injected = true
-	if err := RegisterInjectedPseudoGTID(instance.ClusterName); err != nil {
+	if err := s.RegisterInjectedPseudoGTID(instance.ClusterName); err != nil {
 		return injected, log.Errore(err)
 	}
 	return injected, nil
 }
 
-func GTIDSubtract(instanceKey *InstanceKey, gtidSet string, gtidSubset string) (gtidSubtract string, err error) {
-	db, err := db.OpenTopology(instanceKey.Hostname, instanceKey.Port)
+func (s *Store) GTIDSubtract(instanceKey *InstanceKey, gtidSet string, gtidSubset string) (gtidSubtract string, err error) {
+	db, err := s.backend.OpenTopology(instanceKey.Hostname, instanceKey.Port)
 	if err != nil {
 		return gtidSubtract, err
 	}
@@ -1611,8 +1607,8 @@ func GTIDSubtract(instanceKey *InstanceKey, gtidSet string, gtidSubset string) (
 	return gtidSubtract, err
 }
 
-func ShowMasterStatus(instance *Instance, instanceKey *InstanceKey) (masterStatusFound bool, executedGtidSet string, err error) {
-	db, err := db.OpenTopology(instanceKey.Hostname, instanceKey.Port)
+func (s *Store) ShowMasterStatus(instance *Instance, instanceKey *InstanceKey) (masterStatusFound bool, executedGtidSet string, err error) {
+	db, err := s.backend.OpenTopology(instanceKey.Hostname, instanceKey.Port)
 	if err != nil {
 		return masterStatusFound, executedGtidSet, err
 	}
@@ -1624,8 +1620,8 @@ func ShowMasterStatus(instance *Instance, instanceKey *InstanceKey) (masterStatu
 	return masterStatusFound, executedGtidSet, err
 }
 
-func ShowBinaryLogs(instanceKey *InstanceKey) (binlogs []string, err error) {
-	db, err := db.OpenTopology(instanceKey.Hostname, instanceKey.Port)
+func (s *Store) ShowBinaryLogs(instanceKey *InstanceKey) (binlogs []string, err error) {
+	db, err := s.backend.OpenTopology(instanceKey.Hostname, instanceKey.Port)
 	if err != nil {
 		return binlogs, err
 	}
