@@ -2605,7 +2605,7 @@ func (s *Store) HeuristicallyApplyClusterDomainInstanceAttribute(clusterName str
 		return nil, fmt.Errorf("Found %+v potential master for cluster %+v", len(masters), clusterName)
 	}
 	instanceKey = &masters[0].Key
-	return instanceKey, attributes.SetGeneralAttribute(clusterInfo.ClusterDomain, instanceKey.StringCode())
+	return instanceKey, attributes.NewStore(s.backend).SetGeneralAttribute(clusterInfo.ClusterDomain, instanceKey.StringCode())
 }
 
 // GetHeuristicClusterDomainInstanceAttribute attempts detecting the cluster domain
@@ -2620,7 +2620,7 @@ func (s *Store) GetHeuristicClusterDomainInstanceAttribute(clusterName string) (
 		return nil, fmt.Errorf("Cannot find domain name for cluster %+v", clusterName)
 	}
 
-	writerInstanceName, err := attributes.GetGeneralAttribute(clusterInfo.ClusterDomain)
+	writerInstanceName, err := attributes.NewStore(s.backend).GetGeneralAttribute(clusterInfo.ClusterDomain)
 	if err != nil {
 		return nil, err
 	}
