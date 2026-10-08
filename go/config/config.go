@@ -287,6 +287,7 @@ type Configuration struct {
 	ProxySQLReaderHostgroup                    int      // ProxySQL hostgroup ID for readers (replicas). 0 means unconfigured.
 	ProxySQLPreFailoverAction                  string   // Action on old master before failover: "offline_soft" (default), "weight_zero", "none"
 	PrometheusEnabled                          bool     // When true (default), expose Prometheus metrics on /metrics endpoint
+	TenantsConfigFile                          string   // Optional JSON file declaring the tenants of this process (see docs/multi-tenant-config.md). Node-local. When empty, a single legacy tenant "default" uses this configuration
 }
 
 // ToJSONString will marshal this configuration as JSON
@@ -482,56 +483,83 @@ func newConfiguration() *Configuration {
 	}
 }
 
-func (this *Configuration) postReadAdjustments() error {
-	if this.MySQLOrchestratorCredentialsConfigFile != "" {
-		mySQLConfig := struct {
-			Client struct {
-				User     string
-				Password string
-			}
-		}{}
-		err := gcfg.ReadFileInto(&mySQLConfig, this.MySQLOrchestratorCredentialsConfigFile)
-		if err != nil {
-			_ = log.Fatalf("Failed to parse gcfg data from file: %+v", err)
-		} else {
-			log.Debugf("Parsed orchestrator credentials from %s", this.MySQLOrchestratorCredentialsConfigFile)
-			this.MySQLOrchestratorUser = mySQLConfig.Client.User
-			this.MySQLOrchestratorPassword = mySQLConfig.Client.Password
+// readCredentialsFile reads a my.cnf style file holding `user` and `password` under a `[client]` section.
+func readCredentialsFile(fileName string) (user string, password string, err error) {
+	mySQLConfig := struct {
+		Client struct {
+			User     string
+			Password string
 		}
+	}{}
+	if err := gcfg.ReadFileInto(&mySQLConfig, fileName); err != nil {
+		return "", "", fmt.Errorf("Failed to parse gcfg data from file: %+v", err)
 	}
-	{
-		// We accept password in the form "${SOME_ENV_VARIABLE}" in which case we pull
-		// the given variable from os env
-		submatch := envVariableRegexp.FindStringSubmatch(this.MySQLOrchestratorPassword)
-		if len(submatch) > 1 {
-			this.MySQLOrchestratorPassword = os.Getenv(submatch[1])
-		}
-	}
-	if this.MySQLTopologyCredentialsConfigFile != "" {
-		mySQLConfig := struct {
-			Client struct {
-				User     string
-				Password string
-			}
-		}{}
-		err := gcfg.ReadFileInto(&mySQLConfig, this.MySQLTopologyCredentialsConfigFile)
-		if err != nil {
-			_ = log.Fatalf("Failed to parse gcfg data from file: %+v", err)
-		} else {
-			log.Debugf("Parsed topology credentials from %s", this.MySQLTopologyCredentialsConfigFile)
-			this.MySQLTopologyUser = mySQLConfig.Client.User
-			this.MySQLTopologyPassword = mySQLConfig.Client.Password
-		}
-	}
-	{
-		// We accept password in the form "${SOME_ENV_VARIABLE}" in which case we pull
-		// the given variable from os env
-		submatch := envVariableRegexp.FindStringSubmatch(this.MySQLTopologyPassword)
-		if len(submatch) > 1 {
-			this.MySQLTopologyPassword = os.Getenv(submatch[1])
-		}
-	}
+	return mySQLConfig.Client.User, mySQLConfig.Client.Password, nil
+}
 
+// expandEnvPassword accepts a password in the form "${SOME_ENV_VARIABLE}", in which case
+// the given variable is pulled from the os env.
+func expandEnvPassword(password string) string {
+	submatch := envVariableRegexp.FindStringSubmatch(password)
+	if len(submatch) > 1 {
+		return os.Getenv(submatch[1])
+	}
+	return password
+}
+
+// resolveOrchestratorCredentials resolves the backend credentials: from MySQLOrchestratorCredentialsConfigFile
+// (when readFile and the file is set) and from a "${ENV}" password (when expandEnv).
+func (this *Configuration) resolveOrchestratorCredentials(readFile bool, expandEnv bool) error {
+	if readFile && this.MySQLOrchestratorCredentialsConfigFile != "" {
+		user, password, err := readCredentialsFile(this.MySQLOrchestratorCredentialsConfigFile)
+		if err != nil {
+			return err
+		}
+		log.Debugf("Parsed orchestrator credentials from %s", this.MySQLOrchestratorCredentialsConfigFile)
+		this.MySQLOrchestratorUser = user
+		this.MySQLOrchestratorPassword = password
+	}
+	if expandEnv {
+		this.MySQLOrchestratorPassword = expandEnvPassword(this.MySQLOrchestratorPassword)
+	}
+	return nil
+}
+
+// resolveTopologyCredentials is the topology counterpart of resolveOrchestratorCredentials.
+func (this *Configuration) resolveTopologyCredentials(readFile bool, expandEnv bool) error {
+	if readFile && this.MySQLTopologyCredentialsConfigFile != "" {
+		user, password, err := readCredentialsFile(this.MySQLTopologyCredentialsConfigFile)
+		if err != nil {
+			return err
+		}
+		log.Debugf("Parsed topology credentials from %s", this.MySQLTopologyCredentialsConfigFile)
+		this.MySQLTopologyUser = user
+		this.MySQLTopologyPassword = password
+	}
+	if expandEnv {
+		this.MySQLTopologyPassword = expandEnvPassword(this.MySQLTopologyPassword)
+	}
+	return nil
+}
+
+// postReadAdjustments validates and normalizes the (global) configuration after reading a file.
+func (this *Configuration) postReadAdjustments() error {
+	if err := this.resolveOrchestratorCredentials(true, true); err != nil {
+		_ = log.Fatalf("%s", err.Error())
+	}
+	if err := this.resolveTopologyCredentials(true, true); err != nil {
+		_ = log.Fatalf("%s", err.Error())
+	}
+	if err := this.adjustTenantScoped(); err != nil {
+		return err
+	}
+	return this.adjustNodeLevel()
+}
+
+// adjustTenantScoped holds the validations/derivations that only involve tenant-scoped fields.
+// It operates on any Configuration, so it is shared by the legacy global config and by each
+// tenant's config.
+func (this *Configuration) adjustTenantScoped() error {
 	if this.RecoveryPeriodBlockSeconds == 0 && this.RecoveryPeriodBlockMinutes > 0 {
 		// RecoveryPeriodBlockSeconds is a newer addition that overrides RecoveryPeriodBlockMinutes
 		// The code does not consider RecoveryPeriodBlockMinutes anymore, but RecoveryPeriodBlockMinutes
@@ -580,25 +608,6 @@ func (this *Configuration) postReadAdjustments() error {
 		}
 	}
 
-	if this.URLPrefix != "" {
-		// Ensure the prefix starts with "/" and has no trailing one.
-		this.URLPrefix = strings.TrimLeft(this.URLPrefix, "/")
-		this.URLPrefix = strings.TrimRight(this.URLPrefix, "/")
-		this.URLPrefix = "/" + this.URLPrefix
-	}
-
-	if this.IsSQLite() && this.SQLite3DataFile == "" {
-		return fmt.Errorf("SQLite3DataFile must be set when BackendDB is sqlite3")
-	}
-	if this.RaftEnabled && this.RaftDataDir == "" {
-		return fmt.Errorf("RaftDataDir must be defined since raft is enabled (RaftEnabled)")
-	}
-	if this.RaftEnabled && this.RaftBind == "" {
-		return fmt.Errorf("RaftBind must be defined since raft is enabled (RaftEnabled)")
-	}
-	if this.RaftAdvertise == "" {
-		this.RaftAdvertise = this.RaftBind
-	}
 	if this.KVClusterMasterPrefix != "/" {
 		// "/" remains "/"
 		// "prefix" turns to "prefix/"
@@ -611,6 +620,55 @@ func (this *Configuration) postReadAdjustments() error {
 		this.PseudoGTIDPatternIsFixedSubstring = true
 		this.PseudoGTIDMonotonicHint = "asc:"
 		this.DetectPseudoGTIDQuery = SelectTrueQuery
+	}
+	if this.ConsulMaxKVsPerTransaction < ConsulKVsPerCluster {
+		this.ConsulMaxKVsPerTransaction = ConsulKVsPerCluster
+	} else if this.ConsulMaxKVsPerTransaction > ConsulMaxTransactionOps {
+		this.ConsulMaxKVsPerTransaction = ConsulMaxTransactionOps
+	}
+	if this.ReasonableLockedSemiSyncMasterSeconds == 0 {
+		this.ReasonableLockedSemiSyncMasterSeconds = uint(this.ReasonableReplicationLagSeconds)
+	}
+
+	if this.DeadInstancePollSecondsMultiplyFactor < 1 {
+		return fmt.Errorf("DeadInstancePollSecondsMultiplyFactor can not be smaller than 1")
+	}
+
+	if this.DeadInstancePollSecondsMax < this.InstancePollSeconds {
+		return fmt.Errorf(("DeadInstancePollSecondsMax can not be smaller than InstancePollSeconds"))
+	}
+	return nil
+}
+
+// validateBackend checks the backend (orchestrator database) settings.
+func (this *Configuration) validateBackend() error {
+	if this.IsSQLite() && this.SQLite3DataFile == "" {
+		return fmt.Errorf("SQLite3DataFile must be set when BackendDB is sqlite3")
+	}
+	return nil
+}
+
+// adjustNodeLevel holds the validations/derivations of global and node-local settings
+// (URL prefix, backend, Raft, HTTP advertise). Tenants inherit these from the global config.
+func (this *Configuration) adjustNodeLevel() error {
+	if this.URLPrefix != "" {
+		// Ensure the prefix starts with "/" and has no trailing one.
+		this.URLPrefix = strings.TrimLeft(this.URLPrefix, "/")
+		this.URLPrefix = strings.TrimRight(this.URLPrefix, "/")
+		this.URLPrefix = "/" + this.URLPrefix
+	}
+
+	if err := this.validateBackend(); err != nil {
+		return err
+	}
+	if this.RaftEnabled && this.RaftDataDir == "" {
+		return fmt.Errorf("RaftDataDir must be defined since raft is enabled (RaftEnabled)")
+	}
+	if this.RaftEnabled && this.RaftBind == "" {
+		return fmt.Errorf("RaftBind must be defined since raft is enabled (RaftEnabled)")
+	}
+	if this.RaftAdvertise == "" {
+		this.RaftAdvertise = this.RaftBind
 	}
 	if this.HTTPAdvertise != "" {
 		u, err := url.Parse(this.HTTPAdvertise)
@@ -632,22 +690,6 @@ func (this *Configuration) postReadAdjustments() error {
 		if this.InstanceWriteBufferSize <= 0 {
 			this.BufferInstanceWrites = false
 		}
-	}
-	if this.ConsulMaxKVsPerTransaction < ConsulKVsPerCluster {
-		this.ConsulMaxKVsPerTransaction = ConsulKVsPerCluster
-	} else if this.ConsulMaxKVsPerTransaction > ConsulMaxTransactionOps {
-		this.ConsulMaxKVsPerTransaction = ConsulMaxTransactionOps
-	}
-	if this.ReasonableLockedSemiSyncMasterSeconds == 0 {
-		this.ReasonableLockedSemiSyncMasterSeconds = uint(this.ReasonableReplicationLagSeconds)
-	}
-
-	if this.DeadInstancePollSecondsMultiplyFactor < 1 {
-		return fmt.Errorf("DeadInstancePollSecondsMultiplyFactor can not be smaller than 1")
-	}
-
-	if this.DeadInstancePollSecondsMax < this.InstancePollSeconds {
-		return fmt.Errorf(("DeadInstancePollSecondsMax can not be smaller than InstancePollSeconds"))
 	}
 	return nil
 }
