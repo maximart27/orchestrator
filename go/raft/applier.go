@@ -16,6 +16,10 @@
 
 package orcraft
 
+// CommandApplier applies raft commands. Global ops are always applied through
+// ApplyCommand. Tenant-scoped ops are applied through ApplyTenantCommand when the
+// applier also implements TenantCommandApplier; otherwise (tenant-unaware applier)
+// only legacy-tenant commands are accepted and go through ApplyCommand.
 type CommandApplier interface {
 	ApplyCommand(op string, value []byte) interface{}
 }

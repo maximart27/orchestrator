@@ -18,8 +18,10 @@ package orcraft
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
+	"sync/atomic"
 
 	"github.com/proxysql/golib/log"
 
@@ -47,8 +49,20 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		hint := string(c.Value)
 		return f.yieldByHint(hint)
 	}
-	log.Debugf("orchestrator/raft: applying command %+v: %s", l.Index, c.Op)
-	return store.applier.ApplyCommand(c.Op, c.Value)
+	log.Debugf("orchestrator/raft: applying command %+v: tenant=%s op=%s", l.Index, ResolveTenant(c.Tenant), c.Op)
+	response := routeCommand(f.applier, c)
+	if err, ok := response.(error); ok && err != nil {
+		// Never abort nor skip silently: a follower that cannot apply a command
+		// (e.g. tenant unknown on this node) logs it, counts it and answers with the
+		// error; the process keeps running exactly as it did for other apply errors.
+		if errors.Is(err, ErrUnknownTenant) {
+			atomic.AddInt64(&unknownTenantCommands, 1)
+			_ = log.Errorf("orchestrator/raft: index=%d op=%s tenant=%s: command NOT applied on this node, tenant unknown here (tenant configuration differs between nodes?): %+v", l.Index, c.Op, ResolveTenant(c.Tenant), err)
+		} else if errors.Is(err, ErrTenantOnGlobalCommand) {
+			_ = log.Errorf("orchestrator/raft: index=%d: %+v", l.Index, err)
+		}
+	}
+	return response
 }
 
 // yield yields to a suggested peer, or does nothing if this peer IS the suggested peer

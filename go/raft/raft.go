@@ -288,6 +288,15 @@ func Yield() error {
 	return future.Error()
 }
 
+// YieldForTenantFailure lets a component outside this package ask this node to give
+// up leadership because the backend of a tenant is broken, so that another Raft node
+// takes over all tenants. It is exactly Yield(): leadership is global, there is no
+// per-tenant leader. Does nothing but log the cause beforehand.
+func YieldForTenantFailure(tenantID string, cause error) error {
+	log.Warningf("orchestrator/raft: yielding leadership: backend of tenant %s unhealthy: %+v", tenantID, cause)
+	return Yield()
+}
+
 func GetRaftBind() string {
 	return store.raftBind
 }
@@ -318,8 +327,17 @@ func IsPeer(peer string) (bool, error) {
 	return (store.raftBind == peer), nil
 }
 
-// PublishCommand will distribute a command across the group
+// PublishCommand will distribute a command across the group, for the legacy tenant
+// (or a global command). Shim over PublishTenantCommand.
 func PublishCommand(op string, value interface{}) (response interface{}, err error) {
+	return PublishTenantCommand(LegacyTenantID, op, value)
+}
+
+// PublishTenantCommand will distribute a command of the given tenant across the
+// group. The legacy tenant ("" or LegacyTenantID) is encoded without tenant field.
+// A global op (IsGlobalOp) with a non-legacy tenant is rejected with
+// ErrTenantOnGlobalCommand. Only the leader can publish.
+func PublishTenantCommand(tenantID, op string, value interface{}) (response interface{}, err error) {
 	if !IsRaftEnabled() {
 		return nil, ErrRaftNotRunning
 	}
@@ -327,7 +345,7 @@ func PublishCommand(op string, value interface{}) (response interface{}, err err
 	if err != nil {
 		return nil, err
 	}
-	return store.genericCommand(op, b)
+	return store.tenantCommand(tenantID, op, b)
 }
 
 func AddPeer(addr string) (response interface{}, err error) {
