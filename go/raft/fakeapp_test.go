@@ -17,9 +17,10 @@ import (
 // tenant it does not know is ErrUnknownTenant, global ops touch no tenant.
 //
 // Ops (value is JSON {"K":..,"V":..}):
-//   put K V   state[K] = V
-//   del K     delete state[K]
-//   cat K V   state[K] += V + ","    (order- and duplicate-sensitive)
+//
+//	put K V   state[K] = V
+//	del K     delete state[K]
+//	cat K V   state[K] += V + ","    (order- and duplicate-sensitive)
 type fakeApp struct {
 	mu      sync.Mutex
 	known   map[string]bool

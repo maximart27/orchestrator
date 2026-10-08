@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -31,11 +33,16 @@ type nodeApp interface {
 	Restarted()
 }
 
+type logStore interface {
+	raft.LogStore
+	raft.StableStore
+}
+
 type chaosNode struct {
 	idx   int
 	addr  raft.ServerAddress
-	logs  *raft.InmemStore
-	snaps *raft.InmemSnapshotStore
+	logs  logStore
+	snaps raft.SnapshotStore
 	trans *raft.InmemTransport
 	app   nodeApp
 	store *orcraft.Store
@@ -43,12 +50,14 @@ type chaosNode struct {
 }
 
 type chaosCluster struct {
-	t     *testing.T
-	nodes []*chaosNode
-	link  [][]bool // link[i][j]: i can reach j (directional)
-	mu    sync.Mutex
-	tune  func(*raft.Config)
-	seed  int64
+	t       *testing.T
+	nodes   []*chaosNode
+	link    [][]bool // link[i][j]: i can reach j (directional)
+	mu      sync.Mutex
+	tune    func(*raft.Config)
+	seed    int64
+	dir     string
+	relLogs bool
 
 	// leader samples (term -> set of node idx that were seen leading in that term)
 	leadersMu    sync.Mutex
@@ -72,24 +81,51 @@ func raftConfig(addr raft.ServerAddress, tune func(*raft.Config)) *raft.Config {
 	return cfg
 }
 
+// clusterOption tunes newChaosCluster.
+type clusterOption func(*chaosCluster)
+
+// withRelLogs keeps the Raft log and stable store in the production SQLite store
+// (orcraft.NewRelationalStore) instead of in memory. Snapshots always use the
+// production file snapshot store (orcraft.NewFileSnapshotStore) in a temp dir.
+func withRelLogs(c *chaosCluster) { c.relLogs = true }
+
+// newStores creates the log and snapshot stores of a node.
+func (c *chaosCluster) newStores(idx int) (logStore, raft.SnapshotStore) {
+	dir := filepath.Join(c.dir, fmt.Sprintf("node%d", idx))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		c.t.Fatal(err)
+	}
+	snaps, err := orcraft.NewFileSnapshotStore(dir, 3, io.Discard)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	if c.relLogs {
+		return orcraft.NewRelationalStore(dir), snaps
+	}
+	return raft.NewInmemStore(), snaps
+}
+
 // newChaosCluster starts n nodes; apps[i] is the state machine of node i.
-func newChaosCluster(t *testing.T, apps []nodeApp, tune func(*raft.Config)) *chaosCluster {
+func newChaosCluster(t *testing.T, apps []nodeApp, tune func(*raft.Config), opts ...clusterOption) *chaosCluster {
 	t.Helper()
 	n := len(apps)
-	c := &chaosCluster{t: t, tune: tune, leaderByTerm: map[uint64]map[int]bool{}}
+	c := &chaosCluster{t: t, tune: tune, leaderByTerm: map[uint64]map[int]bool{}, dir: t.TempDir()}
+	for _, o := range opts {
+		o(c)
+	}
 	var servers []raft.Server
 	for i := 0; i < n; i++ {
 		addr := raft.ServerAddress(fmt.Sprintf("node%d", i))
 		servers = append(servers, raft.Server{ID: raft.ServerID(addr), Address: addr})
-		c.nodes = append(c.nodes, &chaosNode{idx: i, addr: addr, app: apps[i],
-			logs: raft.NewInmemStore(), snaps: raft.NewInmemSnapshotStore()})
+		logs, snaps := c.newStores(i)
+		c.nodes = append(c.nodes, &chaosNode{idx: i, addr: addr, app: apps[i], logs: logs, snaps: snaps})
 		c.link = append(c.link, make([]bool, n))
 	}
 	for _, nd := range c.nodes {
-		_, tr := raft.NewInmemTransport(nd.addr)
+		_, tr := raft.NewInmemTransportWithTimeout(nd.addr, 250*time.Millisecond)
 		nd.trans = tr
 		cfg := raftConfig(nd.addr, tune)
-		if err := raft.BootstrapCluster(cfg, nd.logs, nd.logs, nd.snaps, tr, raft.Configuration{Servers: servers}); err != nil {
+		if err := raft.BootstrapCluster(cfg, nd.logs, nd.logs, nd.snaps, noPipeline{tr}, raft.Configuration{Servers: servers}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -107,7 +143,7 @@ func (c *chaosCluster) startRaft(nd *chaosNode) {
 	c.t.Helper()
 	cfg := raftConfig(nd.addr, c.tune)
 	s, f := orcraft.NewStoreForTest(string(nd.addr), nd.app, nd.app)
-	r, err := raft.NewRaft(cfg, f, nd.logs, nd.logs, nd.snaps, nd.trans)
+	r, err := raft.NewRaft(cfg, f, nd.logs, nd.logs, nd.snaps, noPipeline{nd.trans})
 	if err != nil {
 		c.t.Fatalf("starting %s: %v", nd.addr, err)
 	}
@@ -261,7 +297,7 @@ func (c *chaosCluster) Restart(i int) {
 		return
 	}
 	nd.app.Restarted()
-	_, nd.trans = raft.NewInmemTransport(nd.addr)
+	_, nd.trans = raft.NewInmemTransportWithTimeout(nd.addr, 250*time.Millisecond)
 	c.startRaft(nd)
 	c.applyLinksLocked()
 }
@@ -334,7 +370,22 @@ func (c *chaosCluster) Publish(i int, tenant, op string, value []byte) (interfac
 	if s == nil {
 		return nil, fmt.Errorf("node%d is down", i)
 	}
-	return s.TenantCommand(tenant, op, value)
+	type result struct {
+		resp interface{}
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := s.TenantCommand(tenant, op, value)
+		done <- result{resp, err}
+	}()
+	select {
+	case r := <-done:
+		return r.resp, r.err
+	case <-time.After(30 * time.Second):
+		c.t.Errorf("Publish(%s, %s) on node%d did not return in 30s: the Raft apply future never completed", tenant, op, i)
+		return nil, fmt.Errorf("publish hung")
+	}
 }
 
 // PublishAny tries the nodes in turn (as the HTTP layer would after a redirect to the
@@ -467,8 +518,9 @@ func (c *chaosCluster) AddNode(app nodeApp) int {
 	c.mu.Lock()
 	idx := len(c.nodes)
 	addr := raft.ServerAddress(fmt.Sprintf("node%d", idx))
-	nd := &chaosNode{idx: idx, addr: addr, app: app, logs: raft.NewInmemStore(), snaps: raft.NewInmemSnapshotStore()}
-	_, nd.trans = raft.NewInmemTransport(addr)
+	logs, snaps := c.newStores(idx)
+	nd := &chaosNode{idx: idx, addr: addr, app: app, logs: logs, snaps: snaps}
+	_, nd.trans = raft.NewInmemTransportWithTimeout(addr, 250*time.Millisecond)
 	c.nodes = append(c.nodes, nd)
 	for i := range c.link {
 		c.link[i] = append(c.link[i], true)
@@ -494,4 +546,14 @@ func (c *chaosCluster) logState(i int) (firstLog uint64, snapshots int) {
 	firstLog, _ = nd.logs.FirstIndex()
 	metas, _ := nd.snaps.List()
 	return firstLog, len(metas)
+}
+
+// noPipeline hides the pipelined AppendEntries of the in-memory transport: a pipeline
+// towards a node that was shut down and restarted (a new transport instance) can wedge
+// forever, which a real network connection never does (it errors out). Plain
+// AppendEntries RPCs, with a timeout, fail and are retried instead.
+type noPipeline struct{ *raft.InmemTransport }
+
+func (noPipeline) AppendEntriesPipeline(raft.ServerID, raft.ServerAddress) (raft.AppendPipeline, error) {
+	return nil, raft.ErrPipelineReplicationNotSupported
 }
