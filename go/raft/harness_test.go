@@ -71,6 +71,31 @@ type chaosCluster struct {
 	samplerDone  chan struct{}
 }
 
+// ringBuffer keeps the tail of the Raft logs of a cluster, to print them when a test fails.
+type ringBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (r *ringBuffer) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.buf = append(r.buf, p...)
+	if len(r.buf) > 3<<20 {
+		r.buf = append([]byte(nil), r.buf[len(r.buf)-2<<20:]...)
+	}
+	return len(p), nil
+}
+
+func (r *ringBuffer) String() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return string(r.buf)
+}
+
+// raftLogs receives the logs of every Raft instance of the test binary; failing tests dump its tail.
+var raftLogs = &ringBuffer{}
+
 func raftConfig(addr raft.ServerAddress, tune func(*raft.Config)) *raft.Config {
 	cfg := raft.DefaultConfig()
 	cfg.LocalID = raft.ServerID(addr)
@@ -78,7 +103,7 @@ func raftConfig(addr raft.ServerAddress, tune func(*raft.Config)) *raft.Config {
 	cfg.ElectionTimeout = 100 * time.Millisecond
 	cfg.LeaderLeaseTimeout = 50 * time.Millisecond
 	cfg.CommitTimeout = 5 * time.Millisecond
-	cfg.LogOutput = io.Discard
+	cfg.LogOutput = raftLogs
 	cfg.NoLegacyTelemetry = true
 	if tune != nil {
 		tune(cfg)
@@ -478,6 +503,13 @@ func (c *chaosCluster) WaitConverged(timeout time.Duration) {
 				if r := c.raftOf(i); r != nil {
 					st = append(st, fmt.Sprintf("node%d applied=%d last=%d state=%s", i, r.AppliedIndex(), r.LastIndex(), r.State()))
 				}
+			}
+			if os.Getenv("RAFT_LOGS") != "" {
+				tail := raftLogs.String()
+				if len(tail) > 400000 {
+					tail = tail[len(tail)-400000:]
+				}
+				c.t.Logf("raft logs (tail):\n%s", tail)
 			}
 			c.t.Fatalf("cluster did not converge: %s", strings.Join(st, "; "))
 		}
