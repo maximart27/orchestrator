@@ -3,6 +3,7 @@ package orcraft_test
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,7 +49,8 @@ func TestTenantSetUnknownToAnOlderNodeIsHarmless(t *testing.T) {
 	ld := c.WaitLeader()
 	set, _ := json.Marshal(orcraft.NewTenantSet("node0", map[string]string{"a": "mysql"}))
 	for i := 0; i < 3; i++ {
-		if _, err := c.GenericCommand(ld, orcraft.TenantSetCommand, set); err != nil {
+		// when the older node is the leader, the error of its applier is the response to the publisher
+		if _, err := c.GenericCommand(ld, orcraft.TenantSetCommand, set); err != nil && !(ld == 2 && strings.Contains(err.Error(), "Unknown command op")) {
 			t.Fatalf("tenant-set: %v", err)
 		}
 		if _, err := c.Publish(ld, "a", "cat", fakeVal("log", fmt.Sprintf("c%d", i))); err != nil {
