@@ -21,6 +21,12 @@
 #   with all service nodes and let it figure out by itself identify of leader, no need for proxy. Example:
 #     export ORCHESTRATOR_API="http://service1:3000/api http://service2:3000/api http://service3:3000/api"
 #
+#   Multi-tenant installations: select the tenant with -T <tenant> (or --tenant <tenant>), or by setting
+#   the ORCHESTRATOR_TENANT variable. Tenant-scoped calls then go to <api>/tenants/<tenant>/<path>.
+#   Global endpoints (health, status, leader-check, raft-*, ...) never carry the tenant. Without a tenant
+#   the client behaves exactly as for a single-tenant installation. Use "-c tenants" to list tenants.
+#     export ORCHESTRATOR_TENANT="mariadb-a"
+#
 #   Optionally set ORCHESTRATOR_INSTANCE to the local instance where mysql is running.
 #   This is most likely to be used on bare metal or VM systems where you have a single
 #   MySQL instance running on a known port, in which case you would ensure that
@@ -47,6 +53,7 @@ myname=$(basename $0)
 
 orchestrator_api="${ORCHESTRATOR_API:-http://localhost:3000}"
 leader_api=
+tenant="${ORCHESTRATOR_TENANT:-}"
 
 command=
 instance="${ORCHESTRATOR_INSTANCE:-}"
@@ -94,11 +101,12 @@ for arg in "$@"; do
     "-headers-auth"|"--headers-auth")     set -- "$@" "-e" ;;
     "-binlog"|"--binlog")                 set -- "$@" "-n" ;;
     "-seconds"|"--seconds")               set -- "$@" "-S" ;;
+    "-tenant"|"--tenant")                 set -- "$@" "-T" ;;
     *)                                    set -- "$@" "$arg"
   esac
 done
 
-while getopts "c:i:d:s:a:D:U:o:r:u:R:t:l:H:P:q:b:e:n:h:S:" OPTION
+while getopts "c:i:d:s:a:D:U:o:r:u:R:t:l:H:P:q:b:e:n:h:S:T:" OPTION
 do
   case $OPTION in
     h) command="help" ;;
@@ -121,7 +129,8 @@ do
     e) headers_auth="$OPTARG" ;;
     n) binlog="$OPTARG" ;;
     q) query="$OPTARG" ;;
-    S) seconds="$OPTARG"
+    S) seconds="$OPTARG" ;;
+    T) tenant="$OPTARG" ;;
   esac
 done
 
@@ -251,13 +260,42 @@ function urlencode {
   echo "$uri" | jq -s -R -r @uri | tr -d '\n'
 }
 
+# is_global_api_path tells whether an API path is a global endpoint (health, raft, leader checks...)
+# which is never scoped to a tenant. Only the first path segment is considered.
+function is_global_api_path {
+  local first="${1#/}"
+  first="${first%%[/?]*}"
+  case "$first" in
+    "headers"|"health"|"status"|"lb-check"|"_ping"|"leader-check"|"routed-leader-check"|"grab-election"|"reelect"|"metrics"|"tenants"|"raft-"*)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# validate_tenant makes sure the tenant is a valid tenant ID, so that it is safe to embed in a URL path
+function validate_tenant {
+  [ -z "$tenant" ] && return
+  [[ "$tenant" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || fail "invalid tenant '$tenant': must match [a-z0-9][a-z0-9_-]{0,62}"
+}
+
+# api_uri builds the URL for an API path. This is the one and only place where the tenant
+# is added to the URL: <api>/tenants/<tenant>/<path> for tenant-scoped paths, <api>/<path> otherwise.
+function api_uri {
+  local path="$1"
+  if [ -n "$tenant" ] && ! is_global_api_path "$path" ; then
+    echo "$leader_api/tenants/$tenant/${path#/}"
+  else
+    echo "$leader_api/$path"
+  fi
+}
+
 function api {
   local curl_auth_params="$(get_curl_auth_params)"
 
   path="$1"
   raw_output="${2:-}"
 
-  uri="$leader_api/$path"
+  uri="$(api_uri "$path")"
   # echo $uri
   set -o pipefail
 
@@ -379,6 +417,10 @@ function prompt_help {
     indicate host for resolve and raft operations
   -S <seconds> --seconds
     seconds for delaying replication
+  -T <tenant>, --tenant <tenant>
+    tenant ID, for multi-tenant installations (default: \$ORCHESTRATOR_TENANT).
+    Tenant-scoped calls go to <api>/tenants/<tenant>/...; global endpoints (health, raft-*, leader-check...)
+    are never scoped. Note: -t is the tag flag, the tenant flag is an uppercase -T.
 "
 
   cat "$0" | universal_sed -n '/run_command/,/esac/p' | egrep '".*"[)].*;;' | universal_sed -r -e 's/"(.*?)".*#(.*)/\1~\2/' | column -t -s "~"
@@ -394,6 +436,12 @@ function discover {
   assert_nonempty "instance" "$instance_hostport"
   api "discover/$instance_hostport"
   print_details | filter_key | print_key
+}
+
+# tenants lists the tenants configured in orchestrator (global endpoint, no tenant needed)
+function tenants {
+  api "tenants"
+  print_response | jq -r '.'
 }
 
 function ascii_topology {
@@ -912,6 +960,7 @@ function run_command {
 
     "which-api") which_api ;; # Output the HTTP API to be used
     "api") api_call ;;        # Invoke any API request; provide --path argument
+    "tenants") tenants ;;     # List the tenants configured in orchestrator (multi-tenant installations)
 
     "async-discover") async_discover ;;                         # Lookup an instance, investigate it asynchronously. Useful for bulk loads
                                                                 # of servers into an empty orchestrator cluster.
@@ -1036,6 +1085,7 @@ function run_command {
 
 function main {
   check_requirements
+  validate_tenant
   detect_leader_api
 
   instance_hostport=$(to_hostport $instance)
