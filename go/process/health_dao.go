@@ -138,6 +138,20 @@ func (c *Control) Heartbeat(nodeHealth *NodeHealth) *HeartbeatResult {
 		id string
 		hb BackendHeartbeat
 	}
+	// A mirror write can outlive this call (timeout) while the next Heartbeat
+	// calls nodeHealth.Update(): the goroutines get an immutable copy. The
+	// struct cannot be copied as a whole (it holds a sync.Once).
+	snapshot := &NodeHealth{
+		Hostname:        nodeHealth.Hostname,
+		Token:           nodeHealth.Token,
+		AppVersion:      nodeHealth.AppVersion,
+		FirstSeenActive: nodeHealth.FirstSeenActive,
+		LastSeenActive:  nodeHealth.LastSeenActive,
+		ExtraInfo:       nodeHealth.ExtraInfo,
+		Command:         nodeHealth.Command,
+		DBBackend:       nodeHealth.DBBackend,
+		LastReported:    nodeHealth.LastReported,
+	}
 	mirrors := c.mirrorTargets()
 	results := make(chan outcome, len(mirrors))
 	pending := make(map[string]*target)
@@ -155,7 +169,7 @@ func (c *Control) Heartbeat(nodeHealth *NodeHealth) *HeartbeatResult {
 		}
 		pending[t.id] = t
 		go func(t *target) {
-			healthy, err := c.writeMirror(t, nodeHealth)
+			healthy, err := c.writeMirror(t, snapshot)
 			hb := BackendHeartbeat{Healthy: healthy, Err: err}
 			t.record(hb)
 			t.finish()

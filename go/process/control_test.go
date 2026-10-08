@@ -484,3 +484,23 @@ func TestSetDefaultControl(t *testing.T) {
 		t.Errorf("custom control node_health = %d", n)
 	}
 }
+
+// A mirror write that outlives Heartbeat (timeout) must not share mutable
+// state with the next Heartbeat, which rewrites nodeHealth.LastReported.
+func TestHeartbeatSlowMirrorDoesNotRaceWithNextHeartbeat(t *testing.T) {
+	c, _, _, _ := newControlWithMirrors(t)
+	c.SetMirrorTimeout(20 * time.Millisecond)
+	c.writeMirror = func(tg *target, nh *NodeHealth) (bool, error) {
+		deadline := time.Now().Add(200 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			_ = nh.LastReported // what writeRegisterNode reads
+			time.Sleep(time.Millisecond)
+		}
+		return true, nil
+	}
+	nh := NewNodeHealth()
+	for i := 0; i < 10; i++ {
+		c.Heartbeat(nh)
+		time.Sleep(25 * time.Millisecond)
+	}
+}
