@@ -3,6 +3,9 @@ function shouldAutoShowProblemDropdown(problemCount, configured, anonymized, clu
 }
 
 $(document).ready(function() {
+  if (tenantSelectionRequired()) {
+    return;
+  }
   showLoader();
 
   var problemsURI = "/api/problems";

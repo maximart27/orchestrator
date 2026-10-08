@@ -8,6 +8,9 @@ const path = require('node:path');
 const root = path.join(__dirname, '..', '..', 'resources');
 const jsDir = path.join(root, 'public', 'js');
 const T = require(path.join(jsDir, 'tenant.js'));
+const tenantUiSource = fs.readFileSync(path.join(jsDir, 'tenant-ui.js'), 'utf8');
+const orchestratorSource = fs.readFileSync(path.join(jsDir, 'orchestrator.js'), 'utf8');
+const instanceProblemsSource = fs.readFileSync(path.join(jsDir, 'instance-problems.js'), 'utf8');
 
 let passed = 0;
 function test(name, fn) {
@@ -31,6 +34,10 @@ test('page without /web/: URL returned as is', () => {
 test('the tenants overview page (/web/tenants) has no tenant', () => {
   assert.strictEqual(T.currentTenant('/web/tenants'), '');
   assert.strictEqual(T.currentTenant('/web/tenants/'), '');
+  assert.strictEqual(T.isTenantOverview('/web/tenants'), true);
+  assert.strictEqual(T.isTenantOverview('/proxy/orc/web/tenants/'), true);
+  assert.strictEqual(T.isTenantOverview('/web/tenants/t1/clusters'), false);
+  assert.strictEqual(T.isTenantOverview('/web/clusters'), false);
   assert.strictEqual(T.rewriteUrl('/api/tenants', '/web/tenants'), '/api/tenants');
   assert.strictEqual(T.rewriteUrl('/web/tenants/t1/clusters', '/web/tenants'), '/web/tenants/t1/clusters');
 });
@@ -135,6 +142,19 @@ function loadAppUrl(pathname) {
 test('orchestrator.js appUrl() applies the tenant', () => {
   assert.strictEqual(loadAppUrl('/web/tenants/t1/clusters')('/api/clusters-info'), '/api/tenants/t1/clusters-info');
   assert.strictEqual(loadAppUrl('/web/clusters')('/api/clusters-info'), '/api/clusters-info');
+});
+
+test('tenant-less pages disable every tenant-dependent navigation control', () => {
+  for (const nav of ['cluster', 'audit', 'search', 'context', 'global-recoveries', 'problems']) {
+    assert.ok(tenantUiSource.includes('"[data-nav-page=' + nav + ']"'), nav + ' is not guarded');
+  }
+  for (const globalNav of ['user-id', 'read-only', 'refreshCountdown']) {
+    assert.ok(!tenantUiSource.includes('"[data-nav-page=' + globalNav + ']"'), globalNav + ' must remain visible without a tenant');
+  }
+  assert.ok(tenantUiSource.includes('setTenantRequiredNavigationEnabled(!tenantSelectionRequired())'));
+  assert.ok(tenantUiSource.includes('Boolean(currentTenant) || tenants.length === 1'));
+  assert.ok(orchestratorSource.includes('if (!tenantSelectionRequired()) {'));
+  assert.ok(instanceProblemsSource.includes('if (tenantSelectionRequired())'));
 });
 
 // --- static audit: no URL reaches the network or the location without going through appUrl() ---

@@ -100,6 +100,7 @@ func sampleTemplateData() map[string]interface{} {
 		"autoshow_problems":             false,
 		"authorizedForAction":           false,
 		"userId":                        "",
+		"tenantSelectionRequired":       false,
 		"removeTextFromHostnameDisplay": "",
 		"webMessage":                    "",
 		"clusterName":                   "test-cluster",

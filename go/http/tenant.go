@@ -356,5 +356,6 @@ func renderTenantHTML(w http.ResponseWriter, r *http.Request, name string, data 
 	if t := TenantFrom(r); t != nil {
 		data["tenantId"] = t.ID
 	}
+	data["tenantSelectionRequired"] = config.Config.TenantsConfigFile != "" && TenantFrom(r) == nil
 	renderHTML(w, http.StatusOK, name, data)
 }

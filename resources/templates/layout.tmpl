@@ -263,6 +263,10 @@
 			return "{{.userId}}";
 		}
 
+		function tenantSelectionRequired() {
+			return "{{.tenantSelectionRequired}}" == "true";
+		}
+
 		function webMessage() {
 			return "{{.webMessage}}";
 		}

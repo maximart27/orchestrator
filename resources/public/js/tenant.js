@@ -65,6 +65,11 @@
     return parsePathname(pathname).tenant;
   }
 
+  function isTenantOverview(pathname) {
+    var ctx = parsePathname(pathname);
+    return ctx.hasWeb && !ctx.tenant && firstSegment(ctx.page) === 'tenants';
+  }
+
   // scopeUrl adds the tenant to an application URL ("/api/..." or "/web/...").
   // Global API endpoints, the tenant list, already tenant-scoped URLs and static assets are left untouched.
   function scopeUrl(url, tenant) {
@@ -174,6 +179,7 @@
   return {
     parsePathname: parsePathname,
     currentTenant: currentTenant,
+    isTenantOverview: isTenantOverview,
     isGlobalApiPath: isGlobalApiPath,
     scopeUrl: scopeUrl,
     rewriteUrl: rewriteUrl,

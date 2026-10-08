@@ -27,9 +27,29 @@ function tenantLabel(tenant) {
   return tenant.provider ? tenant.id + " (" + tenant.provider + ")" : tenant.id;
 }
 
+// Pages without a tenant (currently the tenants overview) must not expose controls
+// whose destination or API calls require tenant context. The server deliberately
+// rejects those legacy URLs when several tenants exist, so letting the user click
+// them only leads to a JSON error page.
+function setTenantRequiredNavigationEnabled(enabled) {
+  var selector = [
+    "[data-nav-page=cluster]",
+    "[data-nav-page=audit]",
+    "[data-nav-page=search]",
+    "[data-nav-page=context]",
+    "[data-nav-page=global-recoveries]",
+    "[data-nav-page=problems]"
+  ].join(",");
+  $(selector).toggleClass("d-none", !enabled).attr("aria-hidden", enabled ? null : "true");
+}
+
 // The selector only appears when there is more than one tenant: single-tenant and legacy
 // installations see no change in the top bar.
 function displayTenantSelector(tenants, currentTenant) {
+  // A selected tenant, or a legacy/single-tenant installation, has an
+  // unambiguous context. With several tenants the controls stay hidden until
+  // the operator explicitly chooses one.
+  setTenantRequiredNavigationEnabled(Boolean(currentTenant) || tenants.length === 1);
   if (tenants.length <= 1) {
     return;
   }
@@ -62,6 +82,7 @@ function loadTenantSelector(currentTenant) {
     displayTenantSelector(OrchestratorTenant.normalizeTenantList(response), currentTenant);
   }, "json").fail(function() {
     // Legacy/single-tenant server without the tenants endpoint: no selector.
+    setTenantRequiredNavigationEnabled(true);
   });
 }
 
@@ -117,6 +138,9 @@ function initTenantsPage() {
 
 $(document).ready(function() {
   var tenant = currentTenantId();
+  // Hide tenant-dependent controls immediately on an unscoped page, avoiding
+  // both a clickable flash and invalid requests while /api/tenants is loading.
+  setTenantRequiredNavigationEnabled(!tenantSelectionRequired());
   if (tenant) {
     tenantizeServerRenderedLinks(tenant);
     document.title = tenant + " · " + document.title;

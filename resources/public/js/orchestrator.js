@@ -1152,7 +1152,8 @@ $(document).ready(function() {
   if (webMessage()) {
     addAlert(webMessage(), "warning")
   }
-  $.get(appUrl("/api/clusters-info"), function(clusters) {
+  if (!tenantSelectionRequired()) {
+    $.get(appUrl("/api/clusters-info"), function(clusters) {
     clusters = clusters || [];
 
     function sortAlphabetically(cluster1, cluster2) {
@@ -1176,12 +1177,13 @@ $(document).ready(function() {
     onClustersListeners.forEach(function(func) {
       func(clusters);
     });
-  }, "json");
+    }, "json");
 
-  $.get(appUrl("/api/check-global-recoveries"), function(response) {
-    var isEnabled = (response.Details == "enabled")
-    renderGlobalRecoveriesButton(isEnabled);
-  }, "json");
+    $.get(appUrl("/api/check-global-recoveries"), function(response) {
+      var isEnabled = (response.Details == "enabled")
+      renderGlobalRecoveriesButton(isEnabled);
+    }, "json");
+  }
 
   $(".ajaxLoader").click(function() {
     return false;
