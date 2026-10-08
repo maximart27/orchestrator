@@ -77,17 +77,19 @@ type Metric interface {
 // Collection contains a collection of Metrics
 type Collection struct {
 	sync.Mutex        // for locking the structure
-	monitoring   bool // am I monitoring the queue size?
+	monitoring   bool // is the auto-expiration loop running?
 	collection   []Metric
-	done         chan struct{} // to indicate that we are finishing expiry processing
+	stop         chan struct{} // closed to stop the current auto-expiration loop
 	expirePeriod time.Duration // time to keep the collection information for
 }
 
 // hard-coded at every second
 const defaultExpireTickerPeriod = time.Second
 
-// backendMetricCollection contains the last N backend "channelled"
-// metrics which can then be accessed via an API call for monitoring.
+// namedCollection contains the process-wide collections registered by name,
+// which can then be accessed via an API call for monitoring. This registry is
+// the legacy (single tenant) access path: per-tenant code should own its
+// collections via New() instead.
 var (
 	namedCollection     map[string](*Collection)
 	namedCollectionLock sync.Mutex
@@ -97,11 +99,35 @@ func init() {
 	namedCollection = make(map[string](*Collection))
 }
 
-// StopMonitoring stops monitoring all the collections
+// StopMonitoring stops monitoring all the named collections
 func StopMonitoring() {
+	namedCollectionLock.Lock()
+	collections := make([]*Collection, 0, len(namedCollection))
 	for _, q := range namedCollection {
+		collections = append(collections, q)
+	}
+	namedCollectionLock.Unlock()
+
+	for _, q := range collections {
 		q.StopAutoExpiration()
 	}
+}
+
+// New creates a Collection that is not registered by name and starts its
+// auto-expiration. It is meant to be owned by a single tenant; call Close()
+// when the owner stops.
+func New(expirePeriod time.Duration) *Collection {
+	c := &Collection{expirePeriod: expirePeriod}
+	if stop, ok := c.beginExpiration(); ok {
+		go c.expirationLoop(stop)
+	}
+	return c
+}
+
+// Close stops the auto-expiration of the collection. It is safe to call more
+// than once.
+func (c *Collection) Close() {
+	c.StopAutoExpiration()
 }
 
 // CreateOrReturnCollection allows for creation of a new collection or
@@ -114,13 +140,8 @@ func CreateOrReturnCollection(name string) *Collection {
 		return q
 	}
 
-	qmc := &Collection{
-		collection: nil,
-		done:       make(chan struct{}),
-		// WARNING: use a different configuration name
-		expirePeriod: time.Duration(config.Config.DiscoveryCollectionRetentionSeconds) * time.Second,
-	}
-	go qmc.StartAutoExpiration()
+	// WARNING: use a different configuration name
+	qmc := New(time.Duration(config.Config.DiscoveryCollectionRetentionSeconds) * time.Second)
 
 	namedCollection[name] = qmc
 
@@ -142,49 +163,59 @@ func (c *Collection) ExpirePeriod() time.Duration {
 	return c.expirePeriod
 }
 
-// StopAutoExpiration prepares to stop by terminating the auto-expiration process
+// StopAutoExpiration terminates the auto-expiration process, if running.
+// It never blocks and is safe to call more than once.
 func (c *Collection) StopAutoExpiration() {
 	if c == nil {
 		return
 	}
 	c.Lock()
+	defer c.Unlock()
 	if !c.monitoring {
-		c.Unlock()
 		return
 	}
 	c.monitoring = false
-	c.Unlock()
-
-	// no locking here deliberately
-	c.done <- struct{}{}
+	close(c.stop)
 }
 
-// StartAutoExpiration initiates the auto expiry procedure which
-// periodically checks for metrics in the collection which need to
-// be expired according to bc.ExpirePeriod.
-func (c *Collection) StartAutoExpiration() {
-	if c == nil {
-		return
-	}
+// beginExpiration marks the collection as monitoring and returns the channel
+// that stops the loop. ok is false if the loop is already running.
+func (c *Collection) beginExpiration() (stop chan struct{}, ok bool) {
 	c.Lock()
+	defer c.Unlock()
 	if c.monitoring {
-		c.Unlock()
-		return
+		return nil, false
 	}
 	c.monitoring = true
-	c.Unlock()
+	c.stop = make(chan struct{})
+	return c.stop, true
+}
 
-	// log.Infof("StartAutoExpiration: %p with expirePeriod: %v", c, c.expirePeriod)
+// expirationLoop periodically expires old metrics until stop is closed.
+func (c *Collection) expirationLoop(stop <-chan struct{}) {
 	ticker := time.NewTicker(defaultExpireTickerPeriod)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C: // do the periodic expiry
-			_ = c.removeBefore(time.Now().Add(-c.expirePeriod))
-		case <-c.done: // stop the ticker and return
-			ticker.Stop()
+			_ = c.removeBefore(time.Now().Add(-c.ExpirePeriod()))
+		case <-stop:
 			return
 		}
+	}
+}
+
+// StartAutoExpiration initiates the auto expiry procedure which
+// periodically checks for metrics in the collection which need to
+// be expired according to bc.ExpirePeriod. It blocks until
+// StopAutoExpiration is called.
+func (c *Collection) StartAutoExpiration() {
+	if c == nil {
+		return
+	}
+	if stop, ok := c.beginExpiration(); ok {
+		c.expirationLoop(stop)
 	}
 }
 
