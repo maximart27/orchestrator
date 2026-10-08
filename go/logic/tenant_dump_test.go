@@ -20,7 +20,7 @@ var dumpTables = []string{
 
 // nodeSpecificColumn matches the columns that legitimately differ between the nodes that applied
 // the same command: they are stamped with the clock of the node when it applies it.
-var nodeSpecificColumn = regexp.MustCompile(`(?i)(timestamp|_at$|^last_|_time$|time$|unixtime|first_seen|start_active_period|end_recovery|expiry|registered)`)
+var nodeSpecificColumn = regexp.MustCompile(`(?i)(timestamp|_at$|^last_|^time_|_time$|time$|unixtime|first_seen|start_active_period|end_recovery|expiry|registered)`)
 
 // tenantDump renders the replicated state of a tenant, canonically and without node-specific stamps.
 func tenantDump(t testing.TB, tn *Tenant) string {

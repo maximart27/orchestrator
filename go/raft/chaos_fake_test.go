@@ -146,15 +146,12 @@ func assertSameApplyOrder(t *testing.T, fakes []*fakeApp, tenants []string) {
 	}
 }
 
-// runChaos drives one randomized schedule for a seed and checks the invariants.
-func runChaos(t *testing.T, seed int64, nodes int, steps int, tune func(*raft.Config)) chaosOutcome {
+// driveChaos runs one randomized schedule of publishes (publishOnce, from 3 background
+// goroutines), partitions, one-way losses, crashes, restarts and leadership transfers, then
+// heals everything and restarts every node that is down. Same seed, same schedule of faults.
+func driveChaos(t *testing.T, c *chaosCluster, seed int64, nodes, steps int, publishOnce func(prng *rand.Rand)) {
 	t.Helper()
-	tenants := []string{"a", "b", "c"}
 	rng := rngFor(t, seed)
-	apps, fakes := newFakeApps(nodes, false, tenants...)
-	c := newChaosCluster(t, apps, tune)
-	tr := newTracker()
-	c.WaitLeader()
 	maxDown := (nodes - 1) / 2
 	down := map[int]bool{}
 
@@ -172,12 +169,7 @@ func runChaos(t *testing.T, seed int64, nodes int, steps int, tune func(*raft.Co
 					return
 				default:
 				}
-				tr.cat(c, tenants[prng.Intn(len(tenants))])
-				if prng.Intn(4) == 0 { // order-sensitive non-cat commands too
-					op := []string{"put", "del"}[prng.Intn(2)]
-					_, _ = c.PublishAny(tenants[prng.Intn(len(tenants))], op, fakeVal(fmt.Sprintf("k%d", prng.Intn(3)), fmt.Sprintf("v%d", prng.Intn(100))))
-				}
-				time.Sleep(time.Duration(prng.Intn(4)) * time.Millisecond)
+				publishOnce(prng)
 			}
 		}()
 	}
@@ -232,6 +224,24 @@ func runChaos(t *testing.T, seed int64, nodes int, steps int, tune func(*raft.Co
 		c.Restart(i)
 	}
 	c.Heal()
+}
+
+// runChaos drives one randomized schedule for a seed over the deterministic applier and checks the invariants.
+func runChaos(t *testing.T, seed int64, nodes int, steps int, tune func(*raft.Config)) chaosOutcome {
+	t.Helper()
+	tenants := []string{"a", "b", "c"}
+	apps, fakes := newFakeApps(nodes, false, tenants...)
+	c := newChaosCluster(t, apps, tune)
+	tr := newTracker()
+	c.WaitLeader()
+	driveChaos(t, c, seed, nodes, steps, func(prng *rand.Rand) {
+		tr.cat(c, tenants[prng.Intn(len(tenants))])
+		if prng.Intn(4) == 0 { // order-sensitive non-cat commands too
+			op := []string{"put", "del"}[prng.Intn(2)]
+			_, _ = c.PublishAny(tenants[prng.Intn(len(tenants))], op, fakeVal(fmt.Sprintf("k%d", prng.Intn(3)), fmt.Sprintf("v%d", prng.Intn(100))))
+		}
+		time.Sleep(time.Duration(prng.Intn(4)) * time.Millisecond)
+	})
 	c.WaitConverged(30 * time.Second)
 	c.AssertIdentical(tenants...)
 	c.AssertSingleLeaderPerTerm()
