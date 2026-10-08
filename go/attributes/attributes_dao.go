@@ -25,9 +25,21 @@ import (
 	"github.com/proxysql/orchestrator/go/db"
 )
 
+// Store gives access to the host_attributes table of ONE tenant backend.
+// host_attributes is tenant-scoped data: every tenant has its own table in its
+// own backend.
+type Store struct {
+	backend *db.Backend
+}
+
+// NewStore returns the attributes store of the given tenant backend.
+func NewStore(backend *db.Backend) *Store {
+	return &Store{backend: backend}
+}
+
 // SetHostAttributes
-func SetHostAttributes(hostname string, attributeName string, attributeValue string) error {
-	_, err := db.ExecOrchestrator(`
+func (s *Store) SetHostAttributes(hostname string, attributeName string, attributeValue string) error {
+	_, err := s.backend.Exec(`
 			replace
 				into host_attributes (
 					hostname, attribute_name, attribute_value, submit_timestamp, expire_timestamp
@@ -46,7 +58,7 @@ func SetHostAttributes(hostname string, attributeName string, attributeValue str
 	return err
 }
 
-func getHostAttributesByClause(whereClause string, args []interface{}) ([]HostAttributes, error) {
+func (s *Store) getHostAttributesByClause(whereClause string, args []interface{}) ([]HostAttributes, error) {
 	res := []HostAttributes{}
 	query := fmt.Sprintf(`
 		select
@@ -62,7 +74,7 @@ func getHostAttributesByClause(whereClause string, args []interface{}) ([]HostAt
 			hostname, attribute_name
 		`, whereClause)
 
-	err := db.QueryOrchestrator(query, args, func(m sqlutils.RowMap) error {
+	err := s.backend.Query(query, args, func(m sqlutils.RowMap) error {
 		hostAttributes := HostAttributes{}
 		hostAttributes.Hostname = m.GetString("hostname")
 		hostAttributes.AttributeName = m.GetString("attribute_name")
@@ -81,7 +93,7 @@ func getHostAttributesByClause(whereClause string, args []interface{}) ([]HostAt
 }
 
 // GetHostAttributesByMatch
-func GetHostAttributesByMatch(hostnameMatch string, attributeNameMatch string, attributeValueMatch string) ([]HostAttributes, error) {
+func (s *Store) GetHostAttributesByMatch(hostnameMatch string, attributeNameMatch string, attributeValueMatch string) ([]HostAttributes, error) {
 	terms := []string{}
 	args := sqlutils.Args()
 	if hostnameMatch != "" {
@@ -98,18 +110,18 @@ func GetHostAttributesByMatch(hostnameMatch string, attributeNameMatch string, a
 	}
 
 	if len(terms) == 0 {
-		return getHostAttributesByClause("", args)
+		return s.getHostAttributesByClause("", args)
 	}
 	whereCondition := fmt.Sprintf(" where %s ", strings.Join(terms, " and "))
 
-	return getHostAttributesByClause(whereCondition, args)
+	return s.getHostAttributesByClause(whereCondition, args)
 }
 
 // GetHostAttribute expects to return a single attribute for a given hostname/attribute-name combination
 // or error on empty result
-func GetHostAttribute(hostname string, attributeName string) (string, error) {
+func (s *Store) GetHostAttribute(hostname string, attributeName string) (string, error) {
 	whereClause := `where hostname=? and attribute_name=?`
-	attributes, err := getHostAttributesByClause(whereClause, sqlutils.Args(hostname, attributeName))
+	attributes, err := s.getHostAttributesByClause(whereClause, sqlutils.Args(hostname, attributeName))
 	if err != nil {
 		return "", err
 	}
@@ -120,24 +132,63 @@ func GetHostAttribute(hostname string, attributeName string) (string, error) {
 }
 
 // SetGeneralAttribute sets an attribute not associated with a host. Its a key-value thing
-func SetGeneralAttribute(attributeName string, attributeValue string) error {
+func (s *Store) SetGeneralAttribute(attributeName string, attributeValue string) error {
 	if attributeName == "" {
 		return nil
 	}
-	return SetHostAttributes("*", attributeName, attributeValue)
+	return s.SetHostAttributes("*", attributeName, attributeValue)
 }
 
 // GetGeneralAttribute expects to return a single attribute value (not associated with a specific hostname)
-func GetGeneralAttribute(attributeName string) (result string, err error) {
-	return GetHostAttribute("*", attributeName)
+func (s *Store) GetGeneralAttribute(attributeName string) (result string, err error) {
+	return s.GetHostAttribute("*", attributeName)
 }
 
 // GetHostAttributesByAttribute
-func GetHostAttributesByAttribute(attributeName string, valueMatch string) ([]HostAttributes, error) {
+func (s *Store) GetHostAttributesByAttribute(attributeName string, valueMatch string) ([]HostAttributes, error) {
 	if valueMatch == "" {
 		valueMatch = ".?"
 	}
 	whereClause := ` where attribute_name = ? and attribute_value rlike ?`
 
-	return getHostAttributesByClause(whereClause, sqlutils.Args(attributeName, valueMatch))
+	return s.getHostAttributesByClause(whereClause, sqlutils.Args(attributeName, valueMatch))
+}
+
+// DefaultStore returns the store of the legacy single-tenant backend
+// (db.DefaultBackend()).
+func DefaultStore() *Store {
+	return NewStore(db.DefaultBackend())
+}
+
+// Deprecated: package-level wrappers over DefaultStore(), kept so callers that
+// are not tenant-aware yet keep compiling. Use a Store.
+
+// SetHostAttributes is the legacy wrapper of (*Store).SetHostAttributes.
+func SetHostAttributes(hostname string, attributeName string, attributeValue string) error {
+	return DefaultStore().SetHostAttributes(hostname, attributeName, attributeValue)
+}
+
+// GetHostAttributesByMatch is the legacy wrapper of (*Store).GetHostAttributesByMatch.
+func GetHostAttributesByMatch(hostnameMatch string, attributeNameMatch string, attributeValueMatch string) ([]HostAttributes, error) {
+	return DefaultStore().GetHostAttributesByMatch(hostnameMatch, attributeNameMatch, attributeValueMatch)
+}
+
+// GetHostAttribute is the legacy wrapper of (*Store).GetHostAttribute.
+func GetHostAttribute(hostname string, attributeName string) (string, error) {
+	return DefaultStore().GetHostAttribute(hostname, attributeName)
+}
+
+// SetGeneralAttribute is the legacy wrapper of (*Store).SetGeneralAttribute.
+func SetGeneralAttribute(attributeName string, attributeValue string) error {
+	return DefaultStore().SetGeneralAttribute(attributeName, attributeValue)
+}
+
+// GetGeneralAttribute is the legacy wrapper of (*Store).GetGeneralAttribute.
+func GetGeneralAttribute(attributeName string) (result string, err error) {
+	return DefaultStore().GetGeneralAttribute(attributeName)
+}
+
+// GetHostAttributesByAttribute is the legacy wrapper of (*Store).GetHostAttributesByAttribute.
+func GetHostAttributesByAttribute(attributeName string, valueMatch string) ([]HostAttributes, error) {
+	return DefaultStore().GetHostAttributesByAttribute(attributeName, valueMatch)
 }

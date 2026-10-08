@@ -29,11 +29,11 @@ import (
 	"github.com/proxysql/orchestrator/go/raft"
 )
 
+// Node health timestamps. They are process-wide (there is one node health per
+// process) and are driven by the control heartbeat only, never by a tenant.
 var lastHealthCheckUnixNano int64
 var lastGoodHealthCheckUnixNano int64
 var LastContinousCheckHealthy int64
-
-var lastHealthCheckCache = cache.New(config.HealthPollSeconds*time.Second, time.Second)
 
 type NodeHealth struct {
 	Hostname        string
@@ -46,7 +46,6 @@ type NodeHealth struct {
 	DBBackend       string
 
 	LastReported time.Time
-	onceHistory  sync.Once
 	onceUpdate   sync.Once
 }
 
@@ -92,29 +91,33 @@ const (
 	OrchestratorExecutionHttpMode OrchestratorExecutionMode = "HttpMode"
 )
 
-var continuousRegistrationOnce sync.Once
-
-func RegisterNode(nodeHealth *NodeHealth) (healthy bool, err error) {
-	nodeHealth.Update()
-	healthy, err = WriteRegisterNode(nodeHealth)
+func markHealthCheck(healthy bool) {
 	atomic.StoreInt64(&lastHealthCheckUnixNano, time.Now().UnixNano())
 	if healthy {
 		atomic.StoreInt64(&lastGoodHealthCheckUnixNano, time.Now().UnixNano())
 	}
-	return healthy, err
 }
 
-// HealthTest attempts to write to the backend database and get a result
-func HealthTest() (health *HealthStatus, err error) {
+// RegisterNode writes the heartbeat of this node (see Heartbeat) and returns
+// the outcome of the control backend, which is the node health. Tenant mirror
+// failures are not part of this result: use Heartbeat to get them.
+func (c *Control) RegisterNode(nodeHealth *NodeHealth) (healthy bool, err error) {
+	res := c.Heartbeat(nodeHealth)
+	return res.Control.Healthy, res.Control.Err
+}
+
+// HealthTest attempts to write to the control backend and get a result. Tenant
+// mirror failures do not make the node unhealthy here; see TenantsHealth.
+func (c *Control) HealthTest() (health *HealthStatus, err error) {
 	cacheKey := util.ProcessToken.Hash
-	if healthStatus, found := lastHealthCheckCache.Get(cacheKey); found {
+	if healthStatus, found := c.healthCache.Get(cacheKey); found {
 		return healthStatus.(*HealthStatus), nil
 	}
 
 	health = &HealthStatus{Healthy: false, Hostname: ThisHostname, Token: util.ProcessToken.Hash, ActiveNode: &NodeHealth{}}
-	defer lastHealthCheckCache.Set(cacheKey, health, cache.DefaultExpiration)
+	defer c.healthCache.Set(cacheKey, health, cache.DefaultExpiration)
 
-	if healthy, err := RegisterNode(ThisNodeHealth); err != nil {
+	if healthy, err := c.RegisterNode(ThisNodeHealth); err != nil {
 		health.Error = err
 		return health, log.Errore(err)
 	} else {
@@ -127,43 +130,27 @@ func HealthTest() (health *HealthStatus, err error) {
 		health.RaftLeader = orcraft.GetLeader()
 		health.RaftLeaderURI = orcraft.LeaderURI.Get()
 		health.IsRaftLeader = orcraft.IsLeader()
-		health.RaftAdvertise = config.Config.RaftAdvertise
+		health.RaftAdvertise = c.control.backend.Config().RaftAdvertise
 		health.RaftHealthyMembers = orcraft.HealthyMembers()
 	} else {
-		if health.ActiveNode, health.IsActiveNode, err = ElectedNode(); err != nil {
+		if health.ActiveNode, health.IsActiveNode, err = c.ElectedNode(); err != nil {
 			health.Error = err
 			return health, log.Errore(err)
 		}
 	}
-	health.AvailableNodes, _ = ReadAvailableNodes(true)
+	health.AvailableNodes, _ = c.ReadAvailableNodes(true)
 
 	return health, nil
 }
 
-func SinceLastHealthCheck() time.Duration {
-	timeNano := atomic.LoadInt64(&lastHealthCheckUnixNano)
-	if timeNano == 0 {
-		return 0
-	}
-	return time.Since(time.Unix(0, timeNano))
-}
-
-func SinceLastGoodHealthCheck() time.Duration {
-	timeNano := atomic.LoadInt64(&lastGoodHealthCheckUnixNano)
-	if timeNano == 0 {
-		return 0
-	}
-	return time.Since(time.Unix(0, timeNano))
-}
-
 // ContinuousRegistration will continuously update the node_health
 // table showing that the current process is still running.
-func ContinuousRegistration(extraInfo string, command string) {
+func (c *Control) ContinuousRegistration(extraInfo string, command string) {
 	ThisNodeHealth.ExtraInfo = extraInfo
 	ThisNodeHealth.Command = command
-	continuousRegistrationOnce.Do(func() {
+	c.registerOnce.Do(func() {
 		tickOperation := func() {
-			healthy, err := RegisterNode(ThisNodeHealth)
+			healthy, err := c.RegisterNode(ThisNodeHealth)
 			if err != nil {
 				_ = log.Errorf("ContinuousRegistration: RegisterNode failed: %+v", err)
 			}
@@ -187,4 +174,36 @@ func ContinuousRegistration(extraInfo string, command string) {
 			}
 		}()
 	})
+}
+
+// RegisterNode is the legacy wrapper of (*Control).RegisterNode on the default control.
+func RegisterNode(nodeHealth *NodeHealth) (healthy bool, err error) {
+	return DefaultControl().RegisterNode(nodeHealth)
+}
+
+// HealthTest is the legacy wrapper of (*Control).HealthTest on the default control.
+func HealthTest() (health *HealthStatus, err error) {
+	return DefaultControl().HealthTest()
+}
+
+// ContinuousRegistration is the legacy wrapper of (*Control).ContinuousRegistration
+// on the default control.
+func ContinuousRegistration(extraInfo string, command string) {
+	DefaultControl().ContinuousRegistration(extraInfo, command)
+}
+
+func SinceLastHealthCheck() time.Duration {
+	timeNano := atomic.LoadInt64(&lastHealthCheckUnixNano)
+	if timeNano == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, timeNano))
+}
+
+func SinceLastGoodHealthCheck() time.Duration {
+	timeNano := atomic.LoadInt64(&lastGoodHealthCheckUnixNano)
+	if timeNano == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, timeNano))
 }

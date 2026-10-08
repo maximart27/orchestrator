@@ -17,17 +17,26 @@
 package process
 
 import (
+	"errors"
+	"fmt"
+	"sync"
 	"time"
 
-	"fmt"
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
 	"github.com/proxysql/orchestrator/go/config"
 	"github.com/proxysql/orchestrator/go/db"
 )
 
-// RegisterNode writes down this node in the node_health table
-func WriteRegisterNode(nodeHealth *NodeHealth) (healthy bool, err error) {
+var (
+	errHeartbeatNotRegistered = errors.New("heartbeat was not registered")
+	errMirrorBusy             = errors.New("previous heartbeat write is still running")
+	errMirrorTimeout          = errors.New("heartbeat write timed out")
+)
+
+// writeRegisterNode writes the heartbeat of nodeHealth into the backend of t.
+func writeRegisterNode(t *target, nodeHealth *NodeHealth) (healthy bool, err error) {
+	b := t.backend
 	timeNow := time.Now()
 	reportedAgo := timeNow.Sub(nodeHealth.LastReported)
 	reportedSecondsAgo := int64(reportedAgo.Seconds())
@@ -36,8 +45,8 @@ func WriteRegisterNode(nodeHealth *NodeHealth) (healthy bool, err error) {
 		return false, nil
 	}
 
-	nodeHealth.onceHistory.Do(func() {
-		_, _ = db.ExecOrchestrator(`
+	if t.firstHistory(nodeHealth) {
+		_, _ = b.Exec(`
 			insert ignore into node_health_history
 				(hostname, token, first_seen_active, extra_info, command, app_version)
 			values
@@ -46,9 +55,9 @@ func WriteRegisterNode(nodeHealth *NodeHealth) (healthy bool, err error) {
 			nodeHealth.Hostname, nodeHealth.Token, nodeHealth.ExtraInfo, nodeHealth.Command,
 			nodeHealth.AppVersion,
 		)
-	})
+	}
 	{
-		sqlResult, err := db.ExecOrchestrator(`
+		sqlResult, err := b.Exec(`
 			update node_health set
 				last_seen_active = now() - interval ? second,
 				extra_info = case when ? != '' then ? else extra_info end,
@@ -76,14 +85,15 @@ func WriteRegisterNode(nodeHealth *NodeHealth) (healthy bool, err error) {
 	}
 	// Got here? The UPDATE didn't work. Row isn't there.
 	{
+		cfg := b.Config()
 		dbBackend := ""
-		if config.Config.IsSQLite() {
-			dbBackend = config.Config.SQLite3DataFile
+		if cfg.IsSQLite() {
+			dbBackend = cfg.SQLite3DataFile
 		} else {
-			dbBackend = fmt.Sprintf("%s:%d", config.Config.MySQLOrchestratorHost,
-				config.Config.MySQLOrchestratorPort)
+			dbBackend = fmt.Sprintf("%s:%d", cfg.MySQLOrchestratorHost,
+				cfg.MySQLOrchestratorPort)
 		}
-		sqlResult, err := db.ExecOrchestrator(`
+		sqlResult, err := b.Exec(`
 			insert ignore into node_health
 				(hostname, token, first_seen_active, last_seen_active, extra_info, command, app_version, db_backend)
 			values (
@@ -110,37 +120,138 @@ func WriteRegisterNode(nodeHealth *NodeHealth) (healthy bool, err error) {
 	return false, nil
 }
 
+// Heartbeat writes this node into node_health: first, synchronously, in the
+// control backend, whose outcome is the node health; then in every tenant
+// mirror, concurrently. A mirror that fails, is still busy with the previous
+// heartbeat or does not answer within the mirror timeout is reported in the
+// result under its tenant; it never affects the control outcome.
+func (c *Control) Heartbeat(nodeHealth *NodeHealth) *HeartbeatResult {
+	nodeHealth.Update()
+	res := &HeartbeatResult{At: time.Now(), Tenants: make(map[string]BackendHeartbeat)}
+
+	healthy, err := writeRegisterNode(c.control, nodeHealth)
+	res.Control = BackendHeartbeat{Healthy: healthy, Err: err}
+	c.control.record(res.Control)
+	markHealthCheck(healthy)
+
+	type outcome struct {
+		id string
+		hb BackendHeartbeat
+	}
+	mirrors := c.mirrorTargets()
+	results := make(chan outcome, len(mirrors))
+	pending := make(map[string]*target)
+	for _, t := range mirrors {
+		if t.viaControl {
+			res.Tenants[t.id] = res.Control
+			t.record(res.Control)
+			continue
+		}
+		if !t.tryStart() {
+			hb := BackendHeartbeat{Err: errMirrorBusy}
+			t.record(hb)
+			res.Tenants[t.id] = hb
+			continue
+		}
+		pending[t.id] = t
+		go func(t *target) {
+			healthy, err := c.writeMirror(t, nodeHealth)
+			hb := BackendHeartbeat{Healthy: healthy, Err: err}
+			t.record(hb)
+			t.finish()
+			results <- outcome{t.id, hb}
+		}(t)
+	}
+	if len(pending) > 0 {
+		timeout := time.NewTimer(c.mirrorTimeout)
+		defer timeout.Stop()
+		for len(pending) > 0 {
+			select {
+			case o := <-results:
+				res.Tenants[o.id] = o.hb
+				delete(pending, o.id)
+			case <-timeout.C:
+				for id, t := range pending {
+					hb := BackendHeartbeat{Err: errMirrorTimeout}
+					t.record(hb)
+					res.Tenants[id] = hb
+					delete(pending, id)
+				}
+			}
+		}
+	}
+	c.lastHeartbeat.Store(res)
+	return res
+}
+
+// forEachBackend runs fn on the control backend and on every mirror backend
+// (concurrently). The control error is returned as is; the tenant errors are
+// wrapped in *TenantHealthError. All of them are joined.
+func (c *Control) forEachBackend(fn func(b *db.Backend) error) error {
+	mirrors := c.mirrorTargets()
+	errs := make([]error, 1+len(mirrors))
+	var wg sync.WaitGroup
+	wg.Add(1 + len(mirrors))
+	go func() {
+		defer wg.Done()
+		errs[0] = fn(c.control.backend)
+	}()
+	for i, t := range mirrors {
+		go func(i int, t *target) {
+			defer wg.Done()
+			if t.viaControl {
+				return
+			}
+			if err := fn(t.backend); err != nil {
+				errs[i+1] = &TenantHealthError{TenantID: t.id, Err: err}
+			}
+		}(i, t)
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
 // ExpireAvailableNodes is an aggressive purging method to remove
-// node entries who have skipped their keepalive for two times.
-func ExpireAvailableNodes() {
-	_, err := db.ExecOrchestrator(`
+// node entries who have skipped their keepalive for two times. It purges the
+// control backend and every tenant mirror.
+func (c *Control) ExpireAvailableNodes() error {
+	err := c.forEachBackend(func(b *db.Backend) error {
+		_, err := b.Exec(`
 			delete
 				from node_health
 			where
 				last_seen_active < now() - interval ? second
 			`,
-		config.HealthPollSeconds*5,
-	)
+			config.HealthPollSeconds*5,
+		)
+		return err
+	})
 	if err != nil {
 		_ = log.Errorf("ExpireAvailableNodes: failed to remove old entries: %+v", err)
 	}
+	return err
 }
 
 // ExpireNodesHistory cleans up the nodes history and is run by
-// the orchestrator active node.
-func ExpireNodesHistory() error {
-	_, err := db.ExecOrchestrator(`
+// the orchestrator active node. It purges the control backend and every tenant
+// mirror, each with the UnseenInstanceForgetHours of its own configuration.
+func (c *Control) ExpireNodesHistory() error {
+	err := c.forEachBackend(func(b *db.Backend) error {
+		_, err := b.Exec(`
 			delete
 				from node_health_history
 			where
 				first_seen_active < now() - interval ? hour
 			`,
-		config.Config.UnseenInstanceForgetHours,
-	)
+			b.Config().UnseenInstanceForgetHours,
+		)
+		return err
+	})
 	return log.Errore(err)
 }
 
-func ReadAvailableNodes(onlyHttpNodes bool) (nodes [](*NodeHealth), err error) {
+// ReadAvailableNodes lists the live nodes, as seen by the control backend.
+func (c *Control) ReadAvailableNodes(onlyHttpNodes bool) (nodes [](*NodeHealth), err error) {
 	extraInfo := ""
 	if onlyHttpNodes {
 		extraInfo = string(OrchestratorExecutionHttpMode)
@@ -157,7 +268,7 @@ func ReadAvailableNodes(onlyHttpNodes bool) (nodes [](*NodeHealth), err error) {
 			hostname
 		`
 
-	err = db.QueryOrchestrator(query, sqlutils.Args(config.HealthPollSeconds*2, extraInfo), func(m sqlutils.RowMap) error {
+	err = c.control.backend.Query(query, sqlutils.Args(config.HealthPollSeconds*2, extraInfo), func(m sqlutils.RowMap) error {
 		nodeHealth := &NodeHealth{
 			Hostname:        m.GetString("hostname"),
 			Token:           m.GetString("token"),
@@ -172,7 +283,8 @@ func ReadAvailableNodes(onlyHttpNodes bool) (nodes [](*NodeHealth), err error) {
 	return nodes, log.Errore(err)
 }
 
-func TokenBelongsToHealthyHttpService(token string) (result bool, err error) {
+// TokenBelongsToHealthyHttpService reads the control backend.
+func (c *Control) TokenBelongsToHealthyHttpService(token string) (result bool, err error) {
 	extraInfo := string(OrchestratorExecutionHttpMode)
 
 	query := `
@@ -185,10 +297,38 @@ func TokenBelongsToHealthyHttpService(token string) (result bool, err error) {
 			and extra_info = ?
 		`
 
-	err = db.QueryOrchestrator(query, sqlutils.Args(token, extraInfo), func(m sqlutils.RowMap) error {
+	err = c.control.backend.Query(query, sqlutils.Args(token, extraInfo), func(m sqlutils.RowMap) error {
 		// Row exists? We're happy
 		result = true
 		return nil
 	})
 	return result, log.Errore(err)
+}
+
+// WriteRegisterNode writes down this node in the node_health table of the
+// default control. Legacy wrapper: it only writes the control backend (it
+// updates no health timestamps and writes no mirrors); use Heartbeat.
+func WriteRegisterNode(nodeHealth *NodeHealth) (healthy bool, err error) {
+	return writeRegisterNode(DefaultControl().control, nodeHealth)
+}
+
+// ExpireAvailableNodes is the legacy wrapper of (*Control).ExpireAvailableNodes.
+func ExpireAvailableNodes() {
+	_ = DefaultControl().ExpireAvailableNodes()
+}
+
+// ExpireNodesHistory is the legacy wrapper of (*Control).ExpireNodesHistory.
+func ExpireNodesHistory() error {
+	return DefaultControl().ExpireNodesHistory()
+}
+
+// ReadAvailableNodes is the legacy wrapper of (*Control).ReadAvailableNodes.
+func ReadAvailableNodes(onlyHttpNodes bool) (nodes [](*NodeHealth), err error) {
+	return DefaultControl().ReadAvailableNodes(onlyHttpNodes)
+}
+
+// TokenBelongsToHealthyHttpService is the legacy wrapper of
+// (*Control).TokenBelongsToHealthyHttpService.
+func TokenBelongsToHealthyHttpService(token string) (result bool, err error) {
+	return DefaultControl().TokenBelongsToHealthyHttpService(token)
 }
