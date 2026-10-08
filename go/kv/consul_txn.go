@@ -41,7 +41,9 @@ func groupKVPairsByKeyPrefix(kvPairs consulapi.KVPairs) (groups []consulapi.KVPa
 // groupKVPairsByKeyPrefixWithConfig is groupKVPairsByKeyPrefix for the given (tenant) configuration
 func groupKVPairsByKeyPrefixWithConfig(cfg *config.Configuration, kvPairs consulapi.KVPairs) (groups []consulapi.KVPairs) {
 	maxOpsPerTxn := cfg.ConsulMaxKVsPerTransaction
-	clusterMasterPrefix := cfg.KVClusterMasterPrefix + "/"
+	// KVClusterMasterPrefix is normally already normalized with a trailing "/" (see
+	// config.Configuration.postReadAdjustments): do not add another one, or no key would match.
+	clusterMasterPrefix := strings.TrimRight(cfg.KVClusterMasterPrefix, "/") + "/"
 	groupsMap := map[string]consulapi.KVPairs{}
 	for _, pair := range kvPairs {
 		prefix := pair.Key

@@ -252,3 +252,27 @@ func TestNewStoresRequiresBackendForNonDefaultTenant(t *testing.T) {
 		t.Fatalf("the default tenant may use the default backend: %v", err)
 	}
 }
+
+// TestClusterMasterKeyPublishedWithoutDoubleSlash checks the key a tenant's master is published under:
+// <prefix><alias> with the normalized prefix ("mysql/master/"), no "//".
+func TestClusterMasterKeyPublishedWithoutDoubleSlash(t *testing.T) {
+	server := newConsulFake(false)
+	defer server.Close()
+	cfg := server.config()
+	cfg.KVClusterMasterPrefix = "mysql/master/"
+
+	s, err := NewStores(cfg, "tenant-a", WithBackend(newFakeBackend()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := s.ClusterMasterKey("alias1")
+	if key != "mysql/master/alias1" {
+		t.Fatalf("ClusterMasterKey = %q", key)
+	}
+	if err := s.DistributePairs([]*KVPair{NewKVPair(key, "db1:3306")}); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := server.putValue("mysql/master/alias1"); !ok || v != "db1:3306" {
+		t.Fatalf("master not published under %q: %q ok=%v", key, v, ok)
+	}
+}
