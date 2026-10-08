@@ -45,6 +45,7 @@ type Queue struct {
 	sync.Mutex
 
 	name         string
+	cfg          *config.Configuration // read for statistics size and poll warning threshold
 	done         chan struct{}
 	stopOnce     sync.Once
 	queue        chan inst.InstanceKey
@@ -53,9 +54,9 @@ type Queue struct {
 	metrics      []QueueMetric
 }
 
-// DiscoveryQueue contains the discovery queue which can then be accessed via an API call for monitoring.
-// Currently this is accessed by ContinuousDiscovery() but also from http api calls.
-// I may need to protect this better?
+// discoveryQueue is the legacy process-wide registry of named queues, which can
+// be accessed via an API call for monitoring. Per-tenant code should own its
+// queues via NewQueue()/NewQueueFromConfig() instead of registering them here.
 var discoveryQueue map[string](*Queue)
 var dcLock sync.Mutex
 
@@ -63,9 +64,16 @@ func init() {
 	discoveryQueue = make(map[string](*Queue))
 }
 
-// StopMonitoring stops monitoring all the queues
+// StopMonitoring stops monitoring all the registered (named) queues
 func StopMonitoring() {
+	dcLock.Lock()
+	queues := make([]*Queue, 0, len(discoveryQueue))
 	for _, q := range discoveryQueue {
+		queues = append(queues, q)
+	}
+	dcLock.Unlock()
+
+	for _, q := range queues {
 		q.stopMonitoring()
 	}
 }
@@ -80,7 +88,9 @@ func ReturnQueue(name string) *Queue {
 }
 
 // CreateOrReturnQueue allows for creation of a new discovery queue or
-// returning a pointer to an existing one given the name.
+// returning a pointer to an existing one given the name. It is the legacy
+// (single tenant) shim: queues are registered in a process-wide map and are
+// sized from config.Config.
 func CreateOrReturnQueue(name string) *Queue {
 	dcLock.Lock()
 	defer dcLock.Unlock()
@@ -88,24 +98,56 @@ func CreateOrReturnQueue(name string) *Queue {
 		return q
 	}
 
-	q := &Queue{
-		name:         name,
-		done:         make(chan struct{}),
-		queuedKeys:   make(map[inst.InstanceKey]time.Time),
-		consumedKeys: make(map[inst.InstanceKey]time.Time),
-		queue:        make(chan inst.InstanceKey, config.Config.DiscoveryQueueCapacity),
-	}
-	go q.startMonitoring()
-
+	q := NewQueueFromConfig(name, config.Config)
 	discoveryQueue[name] = q
 
 	return q
+}
+
+// NewQueue creates a queue that is NOT registered in the process-wide map, with
+// the given channel capacity. Statistics size and the slow-key warning threshold
+// are read from config.Config; use NewQueueFromConfig for a tenant config.
+// The caller owns the queue and must Close() it.
+func NewQueue(name string, capacity int) *Queue {
+	return newQueue(name, capacity, config.Config)
+}
+
+// NewQueueFromConfig creates an unregistered queue sized and tuned by cfg
+// (DiscoveryQueueCapacity, DiscoveryQueueMaxStatisticsSize, InstancePollSeconds).
+// The caller owns the queue and must Close() it.
+func NewQueueFromConfig(name string, cfg *config.Configuration) *Queue {
+	return newQueue(name, int(cfg.DiscoveryQueueCapacity), cfg)
+}
+
+func newQueue(name string, capacity int, cfg *config.Configuration) *Queue {
+	q := &Queue{
+		name:         name,
+		cfg:          cfg,
+		done:         make(chan struct{}),
+		queuedKeys:   make(map[inst.InstanceKey]time.Time),
+		consumedKeys: make(map[inst.InstanceKey]time.Time),
+		queue:        make(chan inst.InstanceKey, capacity),
+	}
+	go q.startMonitoring()
+	return q
+}
+
+// Name returns the name the queue was created with
+func (q *Queue) Name() string {
+	return q.name
+}
+
+// Close stops the queue's statistics collection. It is safe to call more than
+// once. Keys already queued can still be consumed.
+func (q *Queue) Close() {
+	q.stopMonitoring()
 }
 
 // monitoring queue sizes until we are told to stop
 func (q *Queue) startMonitoring() {
 	log.Debugf("Queue.startMonitoring(%s)", q.name)
 	ticker := time.NewTicker(time.Second) // hard-coded at every second
+	defer ticker.Stop()
 
 	for {
 		select {
@@ -130,8 +172,8 @@ func (q *Queue) collectStatistics() {
 	q.metrics = append(q.metrics, QueueMetric{Queued: len(q.queuedKeys), Active: len(q.consumedKeys)})
 
 	// remove old entries if we get too big
-	if len(q.metrics) > config.Config.DiscoveryQueueMaxStatisticsSize {
-		q.metrics = q.metrics[len(q.metrics)-config.Config.DiscoveryQueueMaxStatisticsSize:]
+	if len(q.metrics) > q.cfg.DiscoveryQueueMaxStatisticsSize {
+		q.metrics = q.metrics[len(q.metrics)-q.cfg.DiscoveryQueueMaxStatisticsSize:]
 	}
 }
 
@@ -166,18 +208,15 @@ func (q *Queue) Push(key inst.InstanceKey) {
 // Consume fetches a key to process; blocks if queue is empty.
 // Release must be called once after Consume.
 func (q *Queue) Consume() inst.InstanceKey {
-	q.Lock()
-	queue := q.queue
-	q.Unlock()
-
-	key := <-queue
+	// q.queue is never reassigned, so it can be read without the lock
+	key := <-q.queue
 
 	q.Lock()
 	defer q.Unlock()
 
 	// alarm if have been waiting for too long
 	timeOnQueue := time.Since(q.queuedKeys[key])
-	if timeOnQueue > time.Duration(config.Config.InstancePollSeconds)*time.Second {
+	if timeOnQueue > time.Duration(q.cfg.InstancePollSeconds)*time.Second {
 		_ = log.Warningf("key %v spent %.4fs waiting on a discoveryQueue", key, timeOnQueue.Seconds())
 	}
 
