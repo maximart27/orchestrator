@@ -36,7 +36,10 @@ type fsm Store
 func (f *fsm) Apply(l *raft.Log) interface{} {
 	var c storeCommand
 	if err := json.Unmarshal(l.Data, &c); err != nil {
-		_ = log.Errorf("failed to unmarshal command: %s", err.Error())
+		// Nothing of an entry that does not decode is trustworthy -- json.Unmarshal can
+		// leave op and tenant filled in when only the value is malformed. Apply nothing.
+		_ = log.Errorf("orchestrator/raft: index=%d: failed to unmarshal command: %s", l.Index, err.Error())
+		return fmt.Errorf("%w: %v", ErrUndecodableCommand, err)
 	}
 
 	// Global ops never carry a tenant. Reject it for every one of them -- including the

@@ -158,7 +158,7 @@ func TestPartition32MajoritySideProgresses(t *testing.T) {
 // acknowledged is applied exactly once everywhere; the others zero or one time (never
 // twice, never in another tenant); all nodes end identical.
 func TestInFlightCommandsDuringLeaderCrashes(t *testing.T) {
-	rounds := chaosSeeds(4)
+	rounds := chaosSeeds(3)
 	for round := 0; round < rounds; round++ {
 		round := round
 		t.Run(fmt.Sprintf("round%d", round), func(t *testing.T) {

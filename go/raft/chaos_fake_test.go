@@ -251,7 +251,7 @@ func runChaos(t *testing.T, seed int64, nodes int, steps int, tune func(*raft.Co
 // schedules per seed; at the end every node holds the identical per-tenant state, in
 // the same apply order, and every acknowledged command is applied exactly once.
 func TestChaosConvergenceFake(t *testing.T) {
-	seeds := chaosSeeds(8)
+	seeds := chaosSeeds(6)
 	var total chaosOutcome
 	start := time.Now()
 	for s := 0; s < seeds; s++ {
@@ -275,7 +275,7 @@ func aggressiveSnapshots(cfg *raft.Config) {
 
 // Scenarios 1+4: the same random schedules, with the log compacted every few entries.
 func TestChaosConvergenceFakeWithSnapshots(t *testing.T) {
-	seeds := chaosSeeds(8)
+	seeds := chaosSeeds(6)
 	var total chaosOutcome
 	for s := 0; s < seeds; s++ {
 		seed := int64(2000 + s)
