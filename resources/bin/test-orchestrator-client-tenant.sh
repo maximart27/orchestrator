@@ -177,6 +177,16 @@ else
   failures=$((failures+1)); echo "FAIL - help lacks tenant documentation"
 fi
 
+# --- -h / -help / --help print the usage (getopts used to demand an argument for -h) ---
+for flag in -h -help --help; do
+  help_flag_out="$(ORCHESTRATOR_API="$api_a" $C $flag 2>&1)"; rc=$?
+  if [ $rc -eq 0 ] && echo "$help_flag_out" | grep -q '^Usage: orchestrator-client' && ! echo "$help_flag_out" | grep -qi 'requires an argument\|requiere un argumento'; then
+    passes=$((passes+1)); echo "ok   - $flag prints the usage"
+  else
+    failures=$((failures+1)); echo "FAIL - $flag (rc=$rc): $(echo $help_flag_out | head -c 200)"
+  fi
+done
+
 echo
 echo "passed: $passes, failed: $failures"
 [ $failures -eq 0 ]

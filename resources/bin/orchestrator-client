@@ -106,7 +106,7 @@ for arg in "$@"; do
   esac
 done
 
-while getopts "c:i:d:s:a:D:U:o:r:u:R:t:l:H:P:q:b:e:n:h:S:T:" OPTION
+while getopts "c:i:d:s:a:D:U:o:r:u:R:t:l:H:P:q:b:e:n:hS:T:" OPTION
 do
   case $OPTION in
     h) command="help" ;;
