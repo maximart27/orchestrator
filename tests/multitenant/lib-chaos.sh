@@ -333,3 +333,12 @@ traffic_verify() {
     done
   done
 }
+
+# fp_detail NODE TENANT -> the rows behind tenant_fp, on one line per set (diagnostics for a failed convergence)
+fp_detail() {
+  local n="$1" t="$2" d; d="$(tdb "$t")"
+  echo "tags=$(sql "$n" "$d" "select count(*) from database_instance_tags") non-bulk-tags=[$(sql "$n" "$d" "select tag_name from database_instance_tags where tag_name not like 'r5-%' and tag_name not like 's6-%' and tag_name not like 'w6-%' and tag_name not like 'k6-%' and tag_name not like 'soak-%' order by 1" | tr '\n' ',')]" \
+       "downtime=[$(sql "$n" "$d" "select hostname,reason from database_instance_downtime where reason <> 'lost-in-recovery'" | tr '\n' ';')]" \
+       "recoveries=[$(sql "$n" "$d" "select recovery_id,hostname,ifnull(successor_hostname,'-'),acknowledged,in_active_period from topology_recovery order by recovery_id" | tr '\n' ';')]"
+}
+diverge_report() { local t="$1" n; shift; for n in "$@"; do echo "$n fp=$(tenant_fp "$n" "$t") $(fp_detail "$n" "$t")"; done; }

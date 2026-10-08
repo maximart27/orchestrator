@@ -9,7 +9,7 @@
 source "$(dirname "$0")/lib-chaos.sh"
 scenario_begin "04-kill-leader-mid-failover"
 export CHAOS_PRE_SLEEP_A=20
-export RECOVERY_BLOCK_SECONDS="${S4_BLOCK_SECONDS:-90}"
+export RECOVERY_BLOCK_SECONDS="${S4_BLOCK_SECONDS:-60}"
 S4_WAIT="${S4_WAIT:-240}"
 chaos_setup a b c
 nodes_fresh

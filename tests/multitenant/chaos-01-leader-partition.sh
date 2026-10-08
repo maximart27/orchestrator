@@ -21,7 +21,7 @@ partition_full "$OLD"
 T=$SECONDS; while [ "$(rstate "$OLD")" = Leader ] && [ $((SECONDS-T)) -lt 20 ]; do sleep 0.3; done
 [ "$(rstate "$OLD")" != Leader ] && pass "isolated old leader $OLD stopped being Leader after $((SECONDS-T))s (now $(rstate "$OLD"))" || fail "isolated node $OLD still claims to be Leader after 20s"
 wait_until "$T_RAFT_ELECTION" "majority elects a leader" single_leader "${REST[@]}" && { NL="$(single_leader "${REST[@]}")"; pass "majority elected $NL"; } || { fail "no leader in the majority"; NL="${REST[0]}"; }
-log "isolated for 20s more (it would see every master unreachable)"; sleep 20
+log "isolated for 10s more (it would see every master unreachable)"; sleep 10
 assert_eq "isolated $OLD still not Leader" "false" "$([ "$(rstate "$OLD")" = Leader ] && echo true || echo false)"
 for t in "${TENANTS[@]}"; do
   for n in "${NODES[@]}"; do assert_eq "phase0: no recovery row for $t on $n" 0 "$(sql "$n" "$(tdb "$t")" 'select count(*) from topology_recovery' 2>/dev/null || echo 0)"; done

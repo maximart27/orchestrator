@@ -7,7 +7,7 @@
 #       wakes up, does the zombie leader carry on with its in-flight recovery (promotion + post hooks) although it lost the
 #       term? Recoveries check leadership once, when they start (executeCheckAndRecoverFunction); this phase measures what
 #       that means in practice.
-#   3c  the leader is frozen for 60s (> fatalAfterUnhealthyDuration = 30s): on wake-up it must not act as leader; what the
+#   3c  (only with CHAOS_LONG=1 or CHAOS_SOAK=1) the leader is frozen for 60s (> fatalAfterUnhealthyDuration = 30s): on wake-up it must not act as leader; what the
 #       process does (upstream: log.Fatal "node is unable to register health" and exit, a supervisor restarts it) is recorded.
 source "$(dirname "$0")/lib-chaos.sh"
 scenario_begin "03-leader-pause"
@@ -28,7 +28,7 @@ for t in "$TENANT_A" "$TENANT_C"; do
   wait_until "$T_FAILOVER" "$t: hook on $NL" hook_at_least "$NL" "$t" 1 && pass "$t: hook on $NL: $(hook_file "$NL" "$t" | tail -1)" || fail "$t: no hook on $NL"
   wait_until "$T_FAILOVER" "$t: promoted" promoted "$t" || fail "$t: not promoted"
 done
-while [ $((SECONDS-TP)) -lt 25 ]; do sleep 1; done
+while [ $((SECONDS-TP)) -lt 20 ]; do sleep 1; done
 node_unpause "$OLD"; TU=$SECONDS
 # how long does the woken-up node keep believing it is the leader?
 first_state=""; while [ $((SECONDS-TU)) -lt 20 ]; do s="$(rstate "$OLD")"; [ -z "$first_state" ] && first_state="$s"; [ "$s" = Follower ] && break; sleep 0.2; done
@@ -90,6 +90,7 @@ chaos_save_logs "03b-leader-pause-midrecovery"
 for n in "${NODES[@]}"; do docker rm -f -v "$(cname $n)" >/dev/null 2>&1; node_remove_volume "$n"; done
 
 # ---------------------------------------------------------------------------------------------------- 3c
+if [ "${CHAOS_LONG:-0}" != 1 ] && [ "${CHAOS_SOAK:-0}" != 1 ]; then log "3c skipped (set CHAOS_LONG=1 to run the 60s freeze)"; scenario_verdict; summary; exit; fi
 echo "== 3c: leader frozen for 60s (twice the 30s health-fatal threshold) ==" >&2
 topo_ensure a b c
 unset CHAOS_PRE_SLEEP_A

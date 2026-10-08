@@ -2,12 +2,13 @@
 """Tenant-command traffic generator of the chaos suite (host side, plain HTTP against the nodes' database-network IPs).
 
   chaos-traffic.py run --nodes IP[,IP...] --tenants id=host:port[,id=host:port...] --prefix P --log FILE
-                       [--workers 4] [--max N] [--seconds S] [--stop-file F] [--untag-every 10]
+                       [--workers 4] [--max N] [--seconds S] [--stop-file F] [--untag-every 0]
   chaos-traffic.py expected --log FILE --tenant ID      # sorted "name|value" lines that MUST exist (accepted, not untagged)
   chaos-traffic.py stats --log FILE
 
 Every request is a tenant command that goes through Raft: GET /api/tenants/<t>/tag/<host>/<port>/<name>/<value> or
-/untag/<host>/<port>/<name> (the API of this orchestrator mutates with GET). A command counts as ACCEPTED only when the
+/untag/<host>/<port>/<name> (the API of this orchestrator mutates with GET). Untag is OFF by default: the Untag/UntagAll
+handlers do not go through Raft (go/http/api.go: tenant.Store.Untag), see README-chaos.md "Findings". A command counts as ACCEPTED only when the
 HTTP answer is 200 with {"Code":"OK"}; a failed attempt is retried on the next node. A request that died after being
 sent (timeout, connection reset) is AMBIGUOUS: it may or may not have been applied, so a node holding it is not an error
 but a node missing an ACCEPTED one is.
@@ -17,10 +18,12 @@ import argparse, http.client, json, os, random, sys, threading, time, urllib.par
 
 def one_request(node, path, timeout):
     """Returns (kind, http_status, body) kind in ok|rejected|ambiguous|unreached."""
-    conn = http.client.HTTPConnection(node, 3000, timeout=timeout)
+    # a stopped container's IP does not refuse, it just never answers: keep the connect timeout short, the request one long
+    conn = http.client.HTTPConnection(node, 3000, timeout=1.5)
     try:
         try:
             conn.connect()
+            conn.sock.settimeout(timeout)
         except Exception:
             return "unreached", 0, ""
         try:
@@ -70,11 +73,11 @@ def run(a):
             if mine and a.untag_every and i % a.untag_every == 0:
                 op, tname, tval = "untag", mine.pop(rnd.randrange(len(mine)))[0], ""
                 # the tenant of the tag decides the instance
-                tid, host, port = next(x for x in tenants if tname.endswith("@" + x[0]))
+                tid, host, port = next(x for x in tenants if tname.endswith("_" + x[0]))
                 path = "/api/tenants/%s/untag/%s/%s/%s" % (tid, host, port, urllib.parse.quote(tname))
             else:
                 op = "tag"
-                tname = "%s-%07d@%s" % (a.prefix, i, tid)
+                tname = "%s-%07d_%s" % (a.prefix, i, tid)
                 tval = "%s-%d" % (tid, i)
                 path = "/api/tenants/%s/tag/%s/%s/%s/%s" % (tid, host, port, urllib.parse.quote(tname), urllib.parse.quote(tval))
             kind, status, body = "unreached", 0, ""
@@ -150,7 +153,7 @@ if __name__ == "__main__":
     r = sub.add_parser("run")
     r.add_argument("--nodes", required=True); r.add_argument("--tenants", required=True); r.add_argument("--prefix", default="g")
     r.add_argument("--log", required=True); r.add_argument("--workers", type=int, default=4); r.add_argument("--max", type=int, default=0)
-    r.add_argument("--seconds", type=float, default=0); r.add_argument("--stop-file", default=""); r.add_argument("--untag-every", type=int, default=10)
+    r.add_argument("--seconds", type=float, default=0); r.add_argument("--stop-file", default=""); r.add_argument("--untag-every", type=int, default=0)
     r.add_argument("--timeout", type=float, default=8.0); r.add_argument("--pace", type=float, default=0.0); r.add_argument("--seed", type=int, default=1)
     e = sub.add_parser("expected"); e.add_argument("--log", required=True); e.add_argument("--tenant", required=True)
     s = sub.add_parser("stats"); s.add_argument("--log", required=True)
