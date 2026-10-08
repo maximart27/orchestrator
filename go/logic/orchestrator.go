@@ -330,6 +330,6 @@ func ContinuousAgentsPoll() {
 func discoverSeededAgents() {
 	for seededAgent := range agent.SeededAgents {
 		instanceKey := &inst.InstanceKey{Hostname: seededAgent.Hostname, Port: int(seededAgent.MySQLPort)}
-		go func() { _, _ = inst.ReadTopologyInstance(instanceKey) }()
+		go func() { _, _ = DefaultTenant().Store.ReadTopologyInstance(instanceKey) }()
 	}
 }

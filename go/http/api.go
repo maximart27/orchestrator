@@ -1607,7 +1607,7 @@ func (this *HttpAPI) CanReplicateFrom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	canReplicate, err := instance.CanReplicateFromEx(belowInstance, "CanReplicateFrom()")
+	canReplicate, err := tenant.Store.InstanceCanReplicateFromEx(instance, belowInstance, "CanReplicateFrom()")
 	if err != nil {
 		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
@@ -1640,7 +1640,7 @@ func (this *HttpAPI) CanReplicateFromGTID(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	canReplicate, err := instance.CanReplicateFromEx(belowInstance, "CanReplicateFromGTID()")
+	canReplicate, err := tenant.Store.InstanceCanReplicateFromEx(instance, belowInstance, "CanReplicateFromGTID()")
 	if err != nil {
 		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
@@ -3575,7 +3575,7 @@ func (this *HttpAPI) RegisterCandidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	candidate := inst.NewCandidateDatabaseInstance(&instanceKey, promotionRule).WithCurrentTime()
+	candidate := tenant.Store.CandidateDatabaseInstanceWithCurrentTime(inst.NewCandidateDatabaseInstance(&instanceKey, promotionRule))
 
 	if orcraft.IsRaftEnabled() {
 		_, err = orcraft.PublishTenantCommand(tenant.ID, "register-candidate", candidate)
