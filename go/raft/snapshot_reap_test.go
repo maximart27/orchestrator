@@ -10,7 +10,7 @@ import (
 	orcraft "github.com/proxysql/orchestrator/go/raft"
 )
 
-func persistSnapshot(t *testing.T, store *orcraft.FileSnapshotStore, index, term uint64, state []byte) {
+func persistSnapshot(t *testing.T, store *orcraft.FileSnapshotStore, index, term uint64, state []byte) string {
 	t.Helper()
 	_, trans := raft.NewInmemTransport("node0")
 	conf := raft.Configuration{Servers: []raft.Server{{ID: "node0", Address: "node0"}}}
@@ -24,6 +24,7 @@ func persistSnapshot(t *testing.T, store *orcraft.FileSnapshotStore, index, term
 	if err := sink.Close(); err != nil {
 		t.Fatal(err)
 	}
+	return sink.ID()
 }
 
 func snapshotIndexes(t *testing.T, store *orcraft.FileSnapshotStore) []uint64 {
@@ -49,8 +50,16 @@ func TestReapNeverDeletesANewerSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	persistSnapshot(t, store, 200, 3, []byte("state")) // installed from the leader
-	persistSnapshot(t, store, 150, 3, []byte("state")) // the local snapshot that was taking longer
+	installed := persistSnapshot(t, store, 200, 3, []byte("state")) // installed from the leader
+	persistSnapshot(t, store, 150, 3, []byte("state"))              // the local snapshot that was taking longer
+	// Raft restores an installed snapshot by opening it by ID AFTER closing it (installSnapshot
+	// -> restoreFuture{ID}): a concurrent older close must not make that fail, or the
+	// InstallSnapshot fails and the follower stays behind.
+	if _, rc, err := store.Open(installed); err != nil {
+		t.Fatalf("the installed snapshot cannot be opened after an older one closed: %v", err)
+	} else {
+		_ = rc.Close()
+	}
 	if got := snapshotIndexes(t, store); len(got) != 2 || got[0] != 200 || got[1] != 150 {
 		t.Fatalf("the newest snapshot (index 200) must survive the close of an older one; snapshots now: %v", got)
 	}
