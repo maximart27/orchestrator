@@ -523,3 +523,35 @@ func TestConcurrentHeartbeatsOfTheSameNodeHealth(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestTokenBelongsToHealthyHttpService(t *testing.T) {
+	control := newTestBackend(t, "control")
+	c := NewControl(control)
+
+	insert := func(token, extraInfo, age string) {
+		t.Helper()
+		_, err := control.Exec(fmt.Sprintf(`insert into node_health (hostname, token, first_seen_active, last_seen_active, extra_info)
+			values ('h-%s', ?, now() - interval %s, now() - interval %s, ?)`, token, age, age), token, extraInfo)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert("http-fresh", string(OrchestratorExecutionHttpMode), "1 second")
+	insert("http-stale", string(OrchestratorExecutionHttpMode), "1 hour")
+	insert("cli-fresh", string(OrchestratorExecutionCliMode), "1 second")
+
+	for token, want := range map[string]bool{
+		"http-fresh": true,
+		"http-stale": false,
+		"cli-fresh":  false,
+		"unknown":    false,
+	} {
+		got, err := c.TokenBelongsToHealthyHttpService(token)
+		if err != nil {
+			t.Errorf("%s: %v", token, err)
+		}
+		if got != want {
+			t.Errorf("TokenBelongsToHealthyHttpService(%q) = %v, want %v", token, got, want)
+		}
+	}
+}
