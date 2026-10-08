@@ -177,7 +177,7 @@ type tenantOptions struct {
 
 // newTenant builds the runtime of tenant tc. It does not start anything; call Run.
 // On error nothing is left open.
-func newTenant(tc *config.TenantConfig, opts tenantOptions) (t *Tenant, err error) {
+func newTenant(tc *config.TenantConfig, opts tenantOptions) (_ *Tenant, err error) {
 	if tc == nil || tc.Cfg == nil {
 		return nil, errors.New("nil tenant configuration")
 	}
@@ -185,7 +185,7 @@ func newTenant(tc *config.TenantConfig, opts tenantOptions) (t *Tenant, err erro
 	if err != nil {
 		return nil, err
 	}
-	t = &Tenant{
+	t := &Tenant{
 		ID:       tc.ID,
 		Cfg:      tc.Cfg,
 		Provider: provider,
@@ -198,7 +198,6 @@ func newTenant(tc *config.TenantConfig, opts tenantOptions) (t *Tenant, err erro
 	defer func() {
 		if err != nil {
 			t.release()
-			t = nil
 		}
 	}()
 

@@ -2004,7 +2004,7 @@ func (t *Tenant) CheckAndRecover(specificInstance *inst.InstanceKey, candidateIn
 	if err != nil {
 		return false, nil, log.Errore(err)
 	}
-	if *config.RuntimeCLIFlags.Noop {
+	if noop := config.RuntimeCLIFlags.Noop; noop != nil && *noop {
 		log.Infof("--noop provided; will not execute processes")
 		skipProcesses = true
 	}

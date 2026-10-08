@@ -119,14 +119,14 @@ func NewTenantManager(base *config.Configuration, opts ...ManagerOption) (*Tenan
 }
 
 // NewTenantManagerFor is NewTenantManager over already resolved tenant configurations.
-func NewTenantManagerFor(base *config.Configuration, tenantConfigs []*config.TenantConfig, opts ...ManagerOption) (m *TenantManager, err error) {
+func NewTenantManagerFor(base *config.Configuration, tenantConfigs []*config.TenantConfig, opts ...ManagerOption) (_ *TenantManager, err error) {
 	if base == nil {
 		return nil, errors.New("tenant manager: nil base configuration")
 	}
 	if len(tenantConfigs) == 0 {
 		return nil, errors.New("tenant manager: no tenants")
 	}
-	m = &TenantManager{
+	m := &TenantManager{
 		base:             base,
 		byID:             make(map[string]*Tenant),
 		leader:           processLeadership{},
@@ -148,7 +148,6 @@ func NewTenantManagerFor(base *config.Configuration, tenantConfigs []*config.Ten
 	defer func() {
 		if err != nil {
 			m.release()
-			m = nil
 		}
 	}()
 
