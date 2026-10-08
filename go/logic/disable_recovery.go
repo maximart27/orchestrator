@@ -32,11 +32,10 @@ package logic
 import (
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
-	"github.com/proxysql/orchestrator/go/db"
 )
 
 // IsRecoveryDisabled returns true if Recoveries are disabled globally
-func IsRecoveryDisabled() (disabled bool, err error) {
+func (t *Tenant) IsRecoveryDisabled() (disabled bool, err error) {
 	query := `
 		SELECT
 			COUNT(*) as mycount
@@ -45,7 +44,7 @@ func IsRecoveryDisabled() (disabled bool, err error) {
 		WHERE
 			disable_recovery=?
 		`
-	err = db.QueryOrchestrator(query, sqlutils.Args(1), func(m sqlutils.RowMap) error {
+	err = t.Backend.Query(query, sqlutils.Args(1), func(m sqlutils.RowMap) error {
 		mycount := m.GetInt("mycount")
 		disabled = (mycount > 0)
 		return nil
@@ -57,8 +56,8 @@ func IsRecoveryDisabled() (disabled bool, err error) {
 }
 
 // DisableRecovery ensures recoveries are disabled globally
-func DisableRecovery() error {
-	_, err := db.ExecOrchestrator(`
+func (t *Tenant) DisableRecovery() error {
+	_, err := t.Backend.Exec(`
 		INSERT IGNORE INTO global_recovery_disable
 			(disable_recovery)
 		VALUES  (1)
@@ -68,18 +67,18 @@ func DisableRecovery() error {
 }
 
 // EnableRecovery ensures recoveries are enabled globally
-func EnableRecovery() error {
+func (t *Tenant) EnableRecovery() error {
 	// The "WHERE" clause is just to avoid full-scan reports by monitoring tools
-	_, err := db.ExecOrchestrator(`
+	_, err := t.Backend.Exec(`
 		DELETE FROM global_recovery_disable WHERE disable_recovery >= 0
 	`,
 	)
 	return err
 }
 
-func SetRecoveryDisabled(disabled bool) error {
+func (t *Tenant) SetRecoveryDisabled(disabled bool) error {
 	if disabled {
-		return DisableRecovery()
+		return t.DisableRecovery()
 	}
-	return EnableRecovery()
+	return t.EnableRecovery()
 }

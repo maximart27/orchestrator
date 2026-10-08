@@ -161,11 +161,13 @@ func TestSnapshotRestoreRetainsRecentlySeenInstances(t *testing.T) {
 	setInstanceLastSeen(t, "stale", 3306, 300)
 
 	snapshotData := NewSnapshotData()
-	snapshotData.MinimalInstances = []inst.MinimalInstance{
-		{Key: inst.InstanceKey{Hostname: "in-snapshot", Port: 3306}},
+	snapshotData.Tenants[config.DefaultTenantID] = &TenantSnapshot{
+		MinimalInstances: []inst.MinimalInstance{
+			{Key: inst.InstanceKey{Hostname: "in-snapshot", Port: 3306}},
+		},
 	}
 
-	applier := NewSnapshotDataCreatorApplier()
+	applier := NewSnapshotDataCreatorApplier(nil)
 	test.S(t).ExpectNil(applier.Restore(mkSnapshotReader(t, snapshotData)))
 
 	keyMap := readInstanceKeyMap(t)
@@ -192,8 +194,9 @@ func TestSnapshotRestoreForgetsUnseenStaleInstances(t *testing.T) {
 	setInstanceLastSeen(t, "stale-b", 3307, 2)
 
 	snapshotData := NewSnapshotData()
+	snapshotData.Tenants[config.DefaultTenantID] = &TenantSnapshot{}
 
-	applier := NewSnapshotDataCreatorApplier()
+	applier := NewSnapshotDataCreatorApplier(nil)
 	test.S(t).ExpectNil(applier.Restore(mkSnapshotReader(t, snapshotData)))
 
 	keyMap := readInstanceKeyMap(t)
