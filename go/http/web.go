@@ -91,7 +91,7 @@ func (this *HttpWeb) ClustersAnalysis(w http.ResponseWriter, r *http.Request) {
 }
 
 func (this *HttpWeb) Cluster(w http.ResponseWriter, r *http.Request) {
-	clusterName, _ := figureClusterName(chi.URLParam(r, "clusterName"))
+	clusterName, _ := figureClusterName(tenantOf(r), chi.URLParam(r, "clusterName"))
 
 	renderHTML(w, 200, "templates/cluster", map[string]interface{}{
 		"agentsHttpActive":              config.Config.ServeAgentsHttp,
@@ -160,7 +160,7 @@ func (this *HttpWeb) clusterWithName(w http.ResponseWriter, r *http.Request, clu
 }
 
 func (this *HttpWeb) ClusterPools(w http.ResponseWriter, r *http.Request) {
-	clusterName, _ := figureClusterName(chi.URLParam(r, "clusterName"))
+	clusterName, _ := figureClusterName(tenantOf(r), chi.URLParam(r, "clusterName"))
 	renderHTML(w, 200, "templates/cluster_pools", map[string]interface{}{
 		"agentsHttpActive":              config.Config.ServeAgentsHttp,
 		"title":                         "cluster pools",
@@ -246,7 +246,7 @@ func (this *HttpWeb) AuditRecovery(w http.ResponseWriter, r *http.Request) {
 	recoveryUid := chi.URLParam(r, "uid")
 	clusterAlias := chi.URLParam(r, "clusterAlias")
 
-	clusterName, _ := figureClusterName(chi.URLParam(r, "clusterName"))
+	clusterName, _ := figureClusterName(tenantOf(r), chi.URLParam(r, "clusterName"))
 	renderHTML(w, 200, "templates/audit_recovery", map[string]interface{}{
 		"agentsHttpActive":    config.Config.ServeAgentsHttp,
 		"title":               "audit-recovery",

@@ -34,14 +34,12 @@ import (
 
 	fqdn "github.com/Showmax/go-fqdn"
 	"github.com/proxysql/orchestrator/go/agent"
-	"github.com/proxysql/orchestrator/go/collection"
 	"github.com/proxysql/orchestrator/go/config"
 	"github.com/proxysql/orchestrator/go/discovery"
 	"github.com/proxysql/orchestrator/go/inst"
 	"github.com/proxysql/orchestrator/go/logic"
 	"github.com/proxysql/orchestrator/go/metrics/query"
 	"github.com/proxysql/orchestrator/go/process"
-	"github.com/proxysql/orchestrator/go/proxysql"
 	orcraft "github.com/proxysql/orchestrator/go/raft"
 )
 
@@ -114,6 +112,8 @@ type APIResponse struct {
 	Code    APIResponseCode
 	Message string
 	Details interface{}
+	// TenantId is the tenant the response is about; set on every tenant-scoped response.
+	TenantId string `json:"TenantId,omitempty"`
 }
 
 var messagePrefix string
@@ -162,27 +162,30 @@ func setupMessagePrefix() {
 	}
 }
 
+// HttpAPI is the API v1 server. Every tenant-scoped handler works on the tenant
+// that the tenant middleware resolved for the request (see tenant.go); the
+// Raft, health and leader-check handlers are global to the process.
 type HttpAPI struct {
 	URLPrefix string
+	// Manager is the TenantManager the requests resolve their tenant in. Nil means
+	// the one given to SetTenantManager or, failing that, logic.DefaultManager().
+	Manager *logic.TenantManager
 }
 
 var API HttpAPI = HttpAPI{}
-var discoveryMetrics = collection.CreateOrReturnCollection("DISCOVERY_METRICS")
-var queryMetrics = collection.CreateOrReturnCollection("BACKEND_WRITES")
-var writeBufferMetrics = collection.CreateOrReturnCollection("WRITE_BUFFER")
 
-func (this *HttpAPI) getInstanceKeyInternal(host string, port string, resolve bool) (inst.InstanceKey, error) {
+func (this *HttpAPI) getInstanceKeyInternal(tenant *logic.Tenant, host string, port string, resolve bool) (inst.InstanceKey, error) {
 	var instanceKey *inst.InstanceKey
 	var err error
 	if resolve {
-		instanceKey, err = inst.NewResolveInstanceKeyStrings(host, port)
+		instanceKey, err = tenant.Store.NewResolveInstanceKeyStrings(host, port)
 	} else {
-		instanceKey, err = inst.NewRawInstanceKeyStrings(host, port)
+		instanceKey, err = tenant.Store.NewRawInstanceKeyStrings(host, port)
 	}
 	if err != nil {
 		return emptyInstanceKey, err
 	}
-	instanceKey, err = inst.FigureInstanceKey(instanceKey, nil)
+	instanceKey, err = tenant.Store.FigureInstanceKey(instanceKey, nil)
 	if err != nil {
 		return emptyInstanceKey, err
 	}
@@ -192,12 +195,12 @@ func (this *HttpAPI) getInstanceKeyInternal(host string, port string, resolve bo
 	return *instanceKey, nil
 }
 
-func (this *HttpAPI) getInstanceKey(host string, port string) (inst.InstanceKey, error) {
-	return this.getInstanceKeyInternal(host, port, true)
+func (this *HttpAPI) getInstanceKey(tenant *logic.Tenant, host string, port string) (inst.InstanceKey, error) {
+	return this.getInstanceKeyInternal(tenant, host, port, true)
 }
 
-func (this *HttpAPI) getNoResolveInstanceKey(host string, port string) (inst.InstanceKey, error) {
-	return this.getInstanceKeyInternal(host, port, false)
+func (this *HttpAPI) getNoResolveInstanceKey(tenant *logic.Tenant, host string, port string) (inst.InstanceKey, error) {
+	return this.getInstanceKeyInternal(tenant, host, port, false)
 }
 
 func getTag(r *http.Request) (tag *inst.Tag, err error) {
@@ -220,185 +223,194 @@ func (this *HttpAPI) getBinlogCoordinates(logFile string, logPos string) (inst.B
 
 // InstanceReplicas lists all replicas of given instance
 func (this *HttpAPI) InstanceReplicas(w http.ResponseWriter, r *http.Request) {
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	tenant := tenantOf(r)
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	replicas, err := inst.ReadReplicaInstances(&instanceKey)
+	replicas, err := tenant.Store.ReadReplicaInstances(&instanceKey)
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", instanceKey)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", instanceKey)})
 		return
 	}
-	renderJSON(w, http.StatusOK, replicas)
+	renderTenantJSON(w, r, http.StatusOK, replicas)
 }
 
 // Instance reads and returns an instance's details.
 func (this *HttpAPI) Instance(w http.ResponseWriter, r *http.Request) {
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	tenant := tenantOf(r)
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, found, err := inst.ReadInstance(&instanceKey)
+	instance, found, err := tenant.Store.ReadInstance(&instanceKey)
 	if (!found) || (err != nil) {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", instanceKey)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", instanceKey)})
 		return
 	}
-	renderJSON(w, http.StatusOK, instance)
+	renderTenantJSON(w, r, http.StatusOK, instance)
 }
 
 // InstanceChannels returns the replication channels for a given instance.
 // For multi-source replicas, this returns all named replication channels and their status.
 func (this *HttpAPI) InstanceChannels(w http.ResponseWriter, r *http.Request) {
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	tenant := tenantOf(r)
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, found, err := inst.ReadInstance(&instanceKey)
+	instance, found, err := tenant.Store.ReadInstance(&instanceKey)
 	if (!found) || (err != nil) {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", instanceKey)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", instanceKey)})
 		return
 	}
-	renderJSON(w, http.StatusOK, instance.ReplicationChannels)
+	renderTenantJSON(w, r, http.StatusOK, instance.ReplicationChannels)
 }
 
 // AsyncDiscover issues an asynchronous read on an instance. This is
 // useful for bulk loads of a new set of instances and will not block
 // if the instance is slow to respond or not reachable.
 func (this *HttpAPI) AsyncDiscover(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	go this.Discover(w, r)
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Asynchronous discovery initiated for Instance: %+v", instanceKey)})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Asynchronous discovery initiated for Instance: %+v", instanceKey)})
 }
 
 // Discover issues a synchronous read on an instance
 func (this *HttpAPI) Discover(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.ReadTopologyInstance(&instanceKey)
+	instance, err := tenant.Store.ReadTopologyInstance(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
 	if orcraft.IsRaftEnabled() {
-		_, _ = orcraft.PublishCommand("discover", instanceKey)
+		_, _ = orcraft.PublishTenantCommand(tenant.ID, "discover", instanceKey)
 	} else {
-		logic.DiscoverInstance(instanceKey)
+		tenant.DiscoverInstance(instanceKey)
 	}
 
 	if instance != nil {
-		Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance discovered: %+v", instance.Key), Details: instance})
+		respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance discovered: %+v", instance.Key), Details: instance})
 	} else {
-		Respond(w, &APIResponse{Code: OK, Message: "No instances discovered", Details: nil})
+		respondTenant(w, r, &APIResponse{Code: OK, Message: "No instances discovered", Details: nil})
 	}
 }
 
 // Refresh synchronuously re-reads a topology instance
 func (this *HttpAPI) Refresh(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	_, err = inst.RefreshTopologyInstance(&instanceKey)
+	_, err = tenant.Store.RefreshTopologyInstance(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance refreshed: %+v", instanceKey), Details: instanceKey})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance refreshed: %+v", instanceKey), Details: instanceKey})
 }
 
 // Forget removes an instance entry fro backend database
 func (this *HttpAPI) Forget(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getNoResolveInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getNoResolveInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
 	if orcraft.IsRaftEnabled() {
-		_, err = orcraft.PublishCommand("forget", instanceKey)
+		_, err = orcraft.PublishTenantCommand(tenant.ID, "forget", instanceKey)
 	} else {
-		err = inst.ForgetInstance(&instanceKey)
+		err = tenant.Store.ForgetInstance(&instanceKey)
 	}
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance forgotten: %+v", instanceKey), Details: instanceKey})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance forgotten: %+v", instanceKey), Details: instanceKey})
 }
 
 // ForgetCluster forgets all instacnes of a cluster
 func (this *HttpAPI) ForgetCluster(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	clusterName, err := figureClusterName(getClusterHintFromRequest(r))
+	clusterName, err := figureClusterName(tenant, getClusterHintFromRequest(r))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
 	if orcraft.IsRaftEnabled() {
-		_, _ = orcraft.PublishCommand("forget-cluster", clusterName)
+		_, _ = orcraft.PublishTenantCommand(tenant.ID, "forget-cluster", clusterName)
 	} else {
-		_ = inst.ForgetCluster(clusterName)
+		_ = tenant.Store.ForgetCluster(clusterName)
 	}
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Cluster forgotten: %+v", clusterName)})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Cluster forgotten: %+v", clusterName)})
 }
 
 // Resolve tries to resolve hostname and then checks to see if port is open on that host.
 func (this *HttpAPI) Resolve(w http.ResponseWriter, r *http.Request) {
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	tenant := tenantOf(r)
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
 	if conn, err := net.Dial("tcp", instanceKey.DisplayString()); err == nil {
 		_ = conn.Close()
 	} else {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: "Instance resolved", Details: instanceKey})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Instance resolved", Details: instanceKey})
 }
 
 // BeginMaintenance begins maintenance mode for given instance
@@ -413,107 +425,113 @@ func maintenanceBegunResponse(instanceKey inst.InstanceKey, maintenanceKey int64
 }
 
 func (this *HttpAPI) BeginMaintenance(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	key, err := inst.BeginBoundedMaintenance(&instanceKey, chi.URLParam(r, "owner"), chi.URLParam(r, "reason"), 0, true)
+	key, err := tenant.Store.BeginBoundedMaintenance(&instanceKey, chi.URLParam(r, "owner"), chi.URLParam(r, "reason"), 0, true)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error(), Details: key})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error(), Details: key})
 		return
 	}
 
-	Respond(w, maintenanceBegunResponse(instanceKey, key))
+	respondTenant(w, r, maintenanceBegunResponse(instanceKey, key))
 }
 
 // EndMaintenance terminates maintenance mode
 func (this *HttpAPI) EndMaintenance(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
 	maintenanceKey, err := strconv.ParseInt(chi.URLParam(r, "maintenanceKey"), 10, 0)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	_, err = inst.EndMaintenance(maintenanceKey)
+	_, err = tenant.Store.EndMaintenance(maintenanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Maintenance ended: %+v", maintenanceKey), Details: maintenanceKey})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Maintenance ended: %+v", maintenanceKey), Details: maintenanceKey})
 }
 
 // EndMaintenanceByInstanceKey terminates maintenance mode for given instance
 func (this *HttpAPI) EndMaintenanceByInstanceKey(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	_, err = inst.EndMaintenanceByInstanceKey(&instanceKey)
+	_, err = tenant.Store.EndMaintenanceByInstanceKey(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Maintenance ended: %+v", instanceKey), Details: instanceKey})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Maintenance ended: %+v", instanceKey), Details: instanceKey})
 }
 
 // EndMaintenanceByInstanceKey terminates maintenance mode for given instance
 func (this *HttpAPI) InMaintenance(w http.ResponseWriter, r *http.Request) {
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	tenant := tenantOf(r)
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	inMaintenance, err := inst.InMaintenance(&instanceKey)
+	inMaintenance, err := tenant.Store.InMaintenance(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	responseDetails := ""
 	if inMaintenance {
 		responseDetails = instanceKey.StringCode()
 	}
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("%+v", inMaintenance), Details: responseDetails})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("%+v", inMaintenance), Details: responseDetails})
 }
 
 // Maintenance provides list of instance under active maintenance
 func (this *HttpAPI) Maintenance(w http.ResponseWriter, r *http.Request) {
-	maintenanceList, err := inst.ReadActiveMaintenance()
+	tenant := tenantOf(r)
+	maintenanceList, err := tenant.Store.ReadActiveMaintenance()
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, maintenanceList)
+	renderTenantJSON(w, r, http.StatusOK, maintenanceList)
 }
 
 // BeginDowntime sets a downtime flag with default duration
 func (this *HttpAPI) BeginDowntime(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
@@ -524,1098 +542,1143 @@ func (this *HttpAPI) BeginDowntime(w http.ResponseWriter, r *http.Request) {
 			err = fmt.Errorf("Duration value must be non-negative. Given value: %d", durationSeconds)
 		}
 		if err != nil {
-			Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+			respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 			return
 		}
 	}
 	duration := time.Duration(durationSeconds) * time.Second
 	downtime := inst.NewDowntime(&instanceKey, chi.URLParam(r, "owner"), chi.URLParam(r, "reason"), duration)
 	if orcraft.IsRaftEnabled() {
-		_, err = orcraft.PublishCommand("begin-downtime", downtime)
+		_, err = orcraft.PublishTenantCommand(tenant.ID, "begin-downtime", downtime)
 	} else {
-		err = inst.BeginDowntime(downtime)
+		err = tenant.Store.BeginDowntime(downtime)
 	}
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error(), Details: instanceKey})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error(), Details: instanceKey})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Downtime begun: %+v", instanceKey), Details: instanceKey})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Downtime begun: %+v", instanceKey), Details: instanceKey})
 }
 
 // EndDowntime terminates downtime (removes downtime flag) for an instance
 func (this *HttpAPI) EndDowntime(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	if orcraft.IsRaftEnabled() {
-		_, err = orcraft.PublishCommand("end-downtime", instanceKey)
+		_, err = orcraft.PublishTenantCommand(tenant.ID, "end-downtime", instanceKey)
 	} else {
-		_, err = inst.EndDowntime(&instanceKey)
+		_, err = tenant.Store.EndDowntime(&instanceKey)
 	}
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Downtime ended: %+v", instanceKey), Details: instanceKey})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Downtime ended: %+v", instanceKey), Details: instanceKey})
 }
 
 // MoveUp attempts to move an instance up the topology
 func (this *HttpAPI) MoveUp(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.MoveUp(&instanceKey)
+	instance, err := tenant.Store.MoveUp(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v moved up", instanceKey), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v moved up", instanceKey), Details: instance})
 }
 
 // MoveUpReplicas attempts to move up all replicas of an instance
 func (this *HttpAPI) MoveUpReplicas(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	replicas, newMaster, errs, err := inst.MoveUpReplicas(&instanceKey, r.URL.Query().Get("pattern"))
+	replicas, newMaster, errs, err := tenant.Store.MoveUpReplicas(&instanceKey, r.URL.Query().Get("pattern"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Moved up %d replicas of %+v below %+v; %d errors: %+v", len(replicas), instanceKey, newMaster.Key, len(errs), errs), Details: replicas})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Moved up %d replicas of %+v below %+v; %d errors: %+v", len(replicas), instanceKey, newMaster.Key, len(errs), errs), Details: replicas})
 }
 
 // Repoint positiones a replica under another (or same) master with exact same coordinates.
 // Useful for binlog servers
 func (this *HttpAPI) Repoint(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	belowKey, err := this.getInstanceKey(chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
+	belowKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	instance, err := inst.Repoint(&instanceKey, &belowKey, inst.GTIDHintNeutral)
+	instance, err := tenant.Store.Repoint(&instanceKey, &belowKey, inst.GTIDHintNeutral)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v repointed below %+v", instanceKey, belowKey), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v repointed below %+v", instanceKey, belowKey), Details: instance})
 }
 
 // MoveUpReplicas attempts to move up all replicas of an instance
 func (this *HttpAPI) RepointReplicas(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	replicas, _, err := inst.RepointReplicas(&instanceKey, r.URL.Query().Get("pattern"))
+	replicas, _, err := tenant.Store.RepointReplicas(&instanceKey, r.URL.Query().Get("pattern"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Repointed %d replicas of %+v", len(replicas), instanceKey), Details: replicas})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Repointed %d replicas of %+v", len(replicas), instanceKey), Details: replicas})
 }
 
 // MakeCoMaster attempts to make an instance co-master with its own master
 func (this *HttpAPI) MakeCoMaster(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.MakeCoMaster(&instanceKey)
+	instance, err := tenant.Store.MakeCoMaster(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance made co-master: %+v", instance.Key), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance made co-master: %+v", instance.Key), Details: instance})
 }
 
 // ResetReplication makes a replica forget about its master, effectively breaking the replication
 func (this *HttpAPI) ResetReplication(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.ResetReplicationOperation(&instanceKey)
+	instance, err := tenant.Store.ResetReplicationOperation(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica reset on %+v", instance.Key), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica reset on %+v", instance.Key), Details: instance})
 }
 
 // DetachReplicaMasterHost detaches a replica from its master by setting an invalid
 // (yet revertible) host name
 func (this *HttpAPI) DetachReplicaMasterHost(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.DetachReplicaMasterHost(&instanceKey)
+	instance, err := tenant.Store.DetachReplicaMasterHost(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica detached: %+v", instance.Key), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica detached: %+v", instance.Key), Details: instance})
 }
 
 // ReattachReplicaMasterHost reverts a detachReplicaMasterHost command
 // by resoting the original master hostname in CHANGE MASTER TO
 func (this *HttpAPI) ReattachReplicaMasterHost(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.ReattachReplicaMasterHost(&instanceKey)
+	instance, err := tenant.Store.ReattachReplicaMasterHost(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica reattached: %+v", instance.Key), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica reattached: %+v", instance.Key), Details: instance})
 }
 
 // EnableGTID attempts to enable GTID on a replica
 func (this *HttpAPI) EnableGTID(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.EnableGTID(&instanceKey)
+	instance, err := tenant.Store.EnableGTID(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Enabled GTID on %+v", instance.Key), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Enabled GTID on %+v", instance.Key), Details: instance})
 }
 
 // DisableGTID attempts to disable GTID on a replica, and revert to binlog file:pos
 func (this *HttpAPI) DisableGTID(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.DisableGTID(&instanceKey)
+	instance, err := tenant.Store.DisableGTID(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Disabled GTID on %+v", instance.Key), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Disabled GTID on %+v", instance.Key), Details: instance})
 }
 
 // LocateErrantGTID identifies the binlog positions for errant GTIDs on an instance
 func (this *HttpAPI) LocateErrantGTID(w http.ResponseWriter, r *http.Request) {
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	tenant := tenantOf(r)
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	errantBinlogs, err := inst.LocateErrantGTID(&instanceKey)
+	errantBinlogs, err := tenant.Store.LocateErrantGTID(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	Respond(w, &APIResponse{Code: OK, Message: "located errant GTID", Details: errantBinlogs})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "located errant GTID", Details: errantBinlogs})
 }
 
 // ErrantGTIDResetMaster removes errant transactions on a server by way of RESET MASTER
 func (this *HttpAPI) ErrantGTIDResetMaster(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.ErrantGTIDResetMaster(&instanceKey)
+	instance, err := tenant.Store.ErrantGTIDResetMaster(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Removed errant GTID on %+v and issued a RESET MASTER", instance.Key), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Removed errant GTID on %+v and issued a RESET MASTER", instance.Key), Details: instance})
 }
 
 // ErrantGTIDInjectEmpty removes errant transactions by injecting and empty transaction on the cluster's master
 func (this *HttpAPI) ErrantGTIDInjectEmpty(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, clusterMaster, countInjectedTransactions, err := inst.ErrantGTIDInjectEmpty(&instanceKey)
+	instance, clusterMaster, countInjectedTransactions, err := tenant.Store.ErrantGTIDInjectEmpty(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Have injected %+v transactions on cluster master %+v", countInjectedTransactions, clusterMaster.Key), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Have injected %+v transactions on cluster master %+v", countInjectedTransactions, clusterMaster.Key), Details: instance})
 }
 
 // MoveBelow attempts to move an instance below its supposed sibling
 func (this *HttpAPI) MoveBelow(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	siblingKey, err := this.getInstanceKey(chi.URLParam(r, "siblingHost"), chi.URLParam(r, "siblingPort"))
+	siblingKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "siblingHost"), chi.URLParam(r, "siblingPort"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	instance, err := inst.MoveBelow(&instanceKey, &siblingKey)
+	instance, err := tenant.Store.MoveBelow(&instanceKey, &siblingKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v moved below %+v", instanceKey, siblingKey), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v moved below %+v", instanceKey, siblingKey), Details: instance})
 }
 
 // MoveBelowGTID attempts to move an instance below another, via GTID
 func (this *HttpAPI) MoveBelowGTID(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	belowKey, err := this.getInstanceKey(chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
+	belowKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	instance, err := inst.MoveBelowGTID(&instanceKey, &belowKey)
+	instance, err := tenant.Store.MoveBelowGTID(&instanceKey, &belowKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v moved below %+v via GTID", instanceKey, belowKey), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v moved below %+v via GTID", instanceKey, belowKey), Details: instance})
 }
 
 // MoveReplicasGTID attempts to move an instance below another, via GTID
 func (this *HttpAPI) MoveReplicasGTID(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	belowKey, err := this.getInstanceKey(chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
+	belowKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	movedReplicas, _, errs, err := inst.MoveReplicasGTID(&instanceKey, &belowKey, r.URL.Query().Get("pattern"))
+	movedReplicas, _, errs, err := tenant.Store.MoveReplicasGTID(&instanceKey, &belowKey, r.URL.Query().Get("pattern"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Moved %d replicas of %+v below %+v via GTID; %d errors: %+v", len(movedReplicas), instanceKey, belowKey, len(errs), errs), Details: belowKey})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Moved %d replicas of %+v below %+v via GTID; %d errors: %+v", len(movedReplicas), instanceKey, belowKey, len(errs), errs), Details: belowKey})
 }
 
 // TakeSiblings
 func (this *HttpAPI) TakeSiblings(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	instance, count, err := inst.TakeSiblings(&instanceKey)
+	instance, count, err := tenant.Store.TakeSiblings(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Took %d siblings of %+v", count, instanceKey), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Took %d siblings of %+v", count, instanceKey), Details: instance})
 }
 
 // TakeMaster
 func (this *HttpAPI) TakeMaster(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	instance, err := inst.TakeMaster(&instanceKey, false)
+	instance, err := tenant.Store.TakeMaster(&instanceKey, false)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("%+v took its master", instanceKey), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("%+v took its master", instanceKey), Details: instance})
 }
 
 // RelocateBelow attempts to move an instance below another, orchestrator choosing the best (potentially multi-step)
 // relocation method
 func (this *HttpAPI) RelocateBelow(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	belowKey, err := this.getInstanceKey(chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
+	belowKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	instance, err := inst.RelocateBelow(&instanceKey, &belowKey)
+	instance, err := tenant.Store.RelocateBelow(&instanceKey, &belowKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v relocated below %+v", instanceKey, belowKey), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v relocated below %+v", instanceKey, belowKey), Details: instance})
 }
 
 // Relocates attempts to smartly relocate replicas of a given instance below another
 func (this *HttpAPI) RelocateReplicas(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	belowKey, err := this.getInstanceKey(chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
+	belowKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	replicas, _, errs, err := inst.RelocateReplicas(&instanceKey, &belowKey, r.URL.Query().Get("pattern"))
+	replicas, _, errs, err := tenant.Store.RelocateReplicas(&instanceKey, &belowKey, r.URL.Query().Get("pattern"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Relocated %d replicas of %+v below %+v; %d errors: %+v", len(replicas), instanceKey, belowKey, len(errs), errs), Details: replicas})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Relocated %d replicas of %+v below %+v; %d errors: %+v", len(replicas), instanceKey, belowKey, len(errs), errs), Details: replicas})
 }
 
 // MoveEquivalent attempts to move an instance below another, baseed on known equivalence master coordinates
 func (this *HttpAPI) MoveEquivalent(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	belowKey, err := this.getInstanceKey(chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
+	belowKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	instance, err := inst.MoveEquivalent(&instanceKey, &belowKey)
+	instance, err := tenant.Store.MoveEquivalent(&instanceKey, &belowKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v relocated via equivalence coordinates below %+v", instanceKey, belowKey), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v relocated via equivalence coordinates below %+v", instanceKey, belowKey), Details: instance})
 }
 
 // LastPseudoGTID attempts to find the last pseugo-gtid entry in an instance
 func (this *HttpAPI) LastPseudoGTID(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	instance, found, err := inst.ReadInstance(&instanceKey)
+	instance, found, err := tenant.Store.ReadInstance(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	if instance == nil || !found {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Instance not found: %+v", instanceKey)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Instance not found: %+v", instanceKey)})
 		return
 	}
-	coordinates, text, err := inst.FindLastPseudoGTIDEntry(instance, instance.RelaylogCoordinates, nil, false, nil)
+	coordinates, text, err := tenant.Store.FindLastPseudoGTIDEntry(instance, instance.RelaylogCoordinates, nil, false, nil)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("%+v", *coordinates), Details: text})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("%+v", *coordinates), Details: text})
 }
 
 // MatchBelow attempts to move an instance below another via pseudo GTID matching of binlog entries
 func (this *HttpAPI) MatchBelow(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	belowKey, err := this.getInstanceKey(chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
+	belowKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	instance, matchedCoordinates, err := inst.MatchBelow(&instanceKey, &belowKey, true)
+	instance, matchedCoordinates, err := tenant.Store.MatchBelow(&instanceKey, &belowKey, true)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v matched below %+v at %+v", instanceKey, belowKey, *matchedCoordinates), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v matched below %+v at %+v", instanceKey, belowKey, *matchedCoordinates), Details: instance})
 }
 
 // MatchBelow attempts to move an instance below another via pseudo GTID matching of binlog entries
 func (this *HttpAPI) MatchUp(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	instance, matchedCoordinates, err := inst.MatchUp(&instanceKey, true)
+	instance, matchedCoordinates, err := tenant.Store.MatchUp(&instanceKey, true)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v matched up at %+v", instanceKey, *matchedCoordinates), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v matched up at %+v", instanceKey, *matchedCoordinates), Details: instance})
 }
 
 // MultiMatchReplicas attempts to match all replicas of a given instance below another, efficiently
 func (this *HttpAPI) MultiMatchReplicas(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	belowKey, err := this.getInstanceKey(chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
+	belowKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	replicas, newMaster, errs, err := inst.MultiMatchReplicas(&instanceKey, &belowKey, r.URL.Query().Get("pattern"))
+	replicas, newMaster, errs, err := tenant.Store.MultiMatchReplicas(&instanceKey, &belowKey, r.URL.Query().Get("pattern"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Matched %d replicas of %+v below %+v; %d errors: %+v", len(replicas), instanceKey, newMaster.Key, len(errs), errs), Details: newMaster.Key})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Matched %d replicas of %+v below %+v; %d errors: %+v", len(replicas), instanceKey, newMaster.Key, len(errs), errs), Details: newMaster.Key})
 }
 
 // MatchUpReplicas attempts to match up all replicas of an instance
 func (this *HttpAPI) MatchUpReplicas(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	replicas, newMaster, errs, err := inst.MatchUpReplicas(&instanceKey, r.URL.Query().Get("pattern"))
+	replicas, newMaster, errs, err := tenant.Store.MatchUpReplicas(&instanceKey, r.URL.Query().Get("pattern"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Matched up %d replicas of %+v below %+v; %d errors: %+v", len(replicas), instanceKey, newMaster.Key, len(errs), errs), Details: newMaster.Key})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Matched up %d replicas of %+v below %+v; %d errors: %+v", len(replicas), instanceKey, newMaster.Key, len(errs), errs), Details: newMaster.Key})
 }
 
 // RegroupReplicas attempts to pick a replica of a given instance and make it take its siblings, using any
 // method possible (GTID, Pseudo-GTID, binlog servers)
 func (this *HttpAPI) RegroupReplicas(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	lostReplicas, equalReplicas, aheadReplicas, cannotReplicateReplicas, promotedReplica, err := inst.RegroupReplicas(&instanceKey, false, nil, nil)
+	lostReplicas, equalReplicas, aheadReplicas, cannotReplicateReplicas, promotedReplica, err := tenant.Store.RegroupReplicas(&instanceKey, false, nil, nil)
 	lostReplicas = append(lostReplicas, cannotReplicateReplicas...)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("promoted replica: %s, lost: %d, trivial: %d, pseudo-gtid: %d",
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("promoted replica: %s, lost: %d, trivial: %d, pseudo-gtid: %d",
 		promotedReplica.Key.DisplayString(), len(lostReplicas), len(equalReplicas), len(aheadReplicas)), Details: promotedReplica.Key})
 }
 
 // RegroupReplicas attempts to pick a replica of a given instance and make it take its siblings, efficiently,
 // using pseudo-gtid if necessary
 func (this *HttpAPI) RegroupReplicasPseudoGTID(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	lostReplicas, equalReplicas, aheadReplicas, cannotReplicateReplicas, promotedReplica, err := inst.RegroupReplicasPseudoGTID(&instanceKey, false, nil, nil, nil)
+	lostReplicas, equalReplicas, aheadReplicas, cannotReplicateReplicas, promotedReplica, err := tenant.Store.RegroupReplicasPseudoGTID(&instanceKey, false, nil, nil, nil)
 	lostReplicas = append(lostReplicas, cannotReplicateReplicas...)
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("promoted replica: %s, lost: %d, trivial: %d, pseudo-gtid: %d",
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("promoted replica: %s, lost: %d, trivial: %d, pseudo-gtid: %d",
 		promotedReplica.Key.DisplayString(), len(lostReplicas), len(equalReplicas), len(aheadReplicas)), Details: promotedReplica.Key})
 }
 
 // RegroupReplicasGTID attempts to pick a replica of a given instance and make it take its siblings, efficiently, using GTID
 func (this *HttpAPI) RegroupReplicasGTID(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	lostReplicas, movedReplicas, cannotReplicateReplicas, promotedReplica, err := inst.RegroupReplicasGTID(&instanceKey, false, true, nil, nil, nil)
+	lostReplicas, movedReplicas, cannotReplicateReplicas, promotedReplica, err := tenant.Store.RegroupReplicasGTID(&instanceKey, false, true, nil, nil, nil)
 	lostReplicas = append(lostReplicas, cannotReplicateReplicas...)
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("promoted replica: %s, lost: %d, moved: %d",
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("promoted replica: %s, lost: %d, moved: %d",
 		promotedReplica.Key.DisplayString(), len(lostReplicas), len(movedReplicas)), Details: promotedReplica.Key})
 }
 
 // RegroupReplicasBinlogServers attempts to pick a replica of a given instance and make it take its siblings, efficiently, using GTID
 func (this *HttpAPI) RegroupReplicasBinlogServers(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	_, promotedBinlogServer, err := inst.RegroupReplicasBinlogServers(&instanceKey, false)
+	_, promotedBinlogServer, err := tenant.Store.RegroupReplicasBinlogServers(&instanceKey, false)
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("promoted binlog server: %s",
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("promoted binlog server: %s",
 		promotedBinlogServer.Key.DisplayString()), Details: promotedBinlogServer.Key})
 }
 
 // MakeMaster attempts to make the given instance a master, and match its siblings to be its replicas
 func (this *HttpAPI) MakeMaster(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	instance, err := inst.MakeMaster(&instanceKey)
+	instance, err := tenant.Store.MakeMaster(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v now made master", instanceKey), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v now made master", instanceKey), Details: instance})
 }
 
 // MakeLocalMaster attempts to make the given instance a local master: take over its master by
 // enslaving its siblings and replicating from its grandparent.
 func (this *HttpAPI) MakeLocalMaster(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	instance, err := inst.MakeLocalMaster(&instanceKey)
+	instance, err := tenant.Store.MakeLocalMaster(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v now made local master", instanceKey), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance %+v now made local master", instanceKey), Details: instance})
 }
 
 // SkipQuery skips a single query on a failed replication instance
 func (this *HttpAPI) SkipQuery(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.SkipQuery(&instanceKey)
+	instance, err := tenant.Store.SkipQuery(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Query skipped on %+v", instance.Key), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Query skipped on %+v", instance.Key), Details: instance})
 }
 
 // StartReplication starts replication on given instance
 func (this *HttpAPI) StartReplication(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.StartReplication(&instanceKey)
+	instance, err := tenant.Store.StartReplication(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica started: %+v", instance.Key), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica started: %+v", instance.Key), Details: instance})
 }
 
 // RestartReplication stops & starts replication on given instance
 func (this *HttpAPI) RestartReplication(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.RestartReplication(&instanceKey)
+	instance, err := tenant.Store.RestartReplication(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica restarted: %+v", instance.Key), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica restarted: %+v", instance.Key), Details: instance})
 }
 
 // StopReplication stops replication on given instance
 func (this *HttpAPI) StopReplication(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.StopReplication(&instanceKey)
+	instance, err := tenant.Store.StopReplication(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica stopped: %+v", instance.Key), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica stopped: %+v", instance.Key), Details: instance})
 }
 
 // StopReplicationNicely stops replication on given instance, such that sql thead is aligned with IO thread
 func (this *HttpAPI) StopReplicationNicely(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.StopReplicationNicely(&instanceKey, 0)
+	instance, err := tenant.Store.StopReplicationNicely(&instanceKey, 0)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica stopped nicely: %+v", instance.Key), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica stopped nicely: %+v", instance.Key), Details: instance})
 }
 
 // FlushBinaryLogs runs a single FLUSH BINARY LOGS
 func (this *HttpAPI) FlushBinaryLogs(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.FlushBinaryLogs(&instanceKey, 1)
+	instance, err := tenant.Store.FlushBinaryLogs(&instanceKey, 1)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Binary logs flushed on: %+v", instance.Key), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Binary logs flushed on: %+v", instance.Key), Details: instance})
 }
 
 // PurgeBinaryLogs purges binary logs up to given binlog file
 func (this *HttpAPI) PurgeBinaryLogs(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	logFile := chi.URLParam(r, "logFile")
 	if logFile == "" {
-		Respond(w, &APIResponse{Code: ERROR, Message: "purge-binary-logs: expected log file name or 'latest'"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "purge-binary-logs: expected log file name or 'latest'"})
 		return
 	}
 	force := (r.URL.Query().Get("force") == "true") || (chi.URLParam(r, "force") == "true")
 	var instance *inst.Instance
 	if logFile == "latest" {
-		instance, err = inst.PurgeBinaryLogsToLatest(&instanceKey, force)
+		instance, err = tenant.Store.PurgeBinaryLogsToLatest(&instanceKey, force)
 	} else {
-		instance, err = inst.PurgeBinaryLogsTo(&instanceKey, logFile, force)
+		instance, err = tenant.Store.PurgeBinaryLogsTo(&instanceKey, logFile, force)
 	}
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Binary logs flushed on: %+v", instance.Key), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Binary logs flushed on: %+v", instance.Key), Details: instance})
 }
 
 // RestartReplicationStatements receives a query to execute that requires a replication restart to apply.
 // As an example, this may be `set global rpl_semi_sync_slave_enabled=1`. orchestrator will check
 // replication status on given host and will wrap with appropriate stop/start statements, if need be.
 func (this *HttpAPI) RestartReplicationStatements(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
 	query := r.URL.Query().Get("q")
-	statements, err := inst.GetReplicationRestartPreserveStatements(&instanceKey, query)
+	statements, err := tenant.Store.GetReplicationRestartPreserveStatements(&instanceKey, query)
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("statements for: %+v", instanceKey), Details: statements})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("statements for: %+v", instanceKey), Details: statements})
 }
 
 // MasterEquivalent provides (possibly empty) list of master coordinates equivalent to the given ones
 func (this *HttpAPI) MasterEquivalent(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	coordinates, err := this.getBinlogCoordinates(chi.URLParam(r, "logFile"), chi.URLParam(r, "logPos"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	instanceCoordinates := &inst.InstanceBinlogCoordinates{Key: instanceKey, Coordinates: coordinates}
 
-	equivalentCoordinates, err := inst.GetEquivalentMasterCoordinates(instanceCoordinates)
+	equivalentCoordinates, err := tenant.Store.GetEquivalentMasterCoordinates(instanceCoordinates)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Found %+v equivalent coordinates", len(equivalentCoordinates)), Details: equivalentCoordinates})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Found %+v equivalent coordinates", len(equivalentCoordinates)), Details: equivalentCoordinates})
 }
 
 // CanReplicateFrom attempts to move an instance below another via pseudo GTID matching of binlog entries
 func (this *HttpAPI) CanReplicateFrom(w http.ResponseWriter, r *http.Request) {
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	tenant := tenantOf(r)
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, found, err := inst.ReadInstance(&instanceKey)
+	instance, found, err := tenant.Store.ReadInstance(&instanceKey)
 	if (!found) || (err != nil) {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", instanceKey)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", instanceKey)})
 		return
 	}
-	belowKey, err := this.getInstanceKey(chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
+	belowKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	belowInstance, found, err := inst.ReadInstance(&belowKey)
+	belowInstance, found, err := tenant.Store.ReadInstance(&belowKey)
 	if (!found) || (err != nil) {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", belowKey)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", belowKey)})
 		return
 	}
 
 	canReplicate, err := instance.CanReplicateFromEx(belowInstance, "CanReplicateFrom()")
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("%t", canReplicate), Details: belowKey})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("%t", canReplicate), Details: belowKey})
 }
 
 // CanReplicateFromGTID attempts to move an instance below another via GTID.
 func (this *HttpAPI) CanReplicateFromGTID(w http.ResponseWriter, r *http.Request) {
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	tenant := tenantOf(r)
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, found, err := inst.ReadInstance(&instanceKey)
+	instance, found, err := tenant.Store.ReadInstance(&instanceKey)
 	if (!found) || (err != nil) {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", instanceKey)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", instanceKey)})
 		return
 	}
-	belowKey, err := this.getInstanceKey(chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
+	belowKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "belowHost"), chi.URLParam(r, "belowPort"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	belowInstance, found, err := inst.ReadInstance(&belowKey)
+	belowInstance, found, err := tenant.Store.ReadInstance(&belowKey)
 	if (!found) || (err != nil) {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", belowKey)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", belowKey)})
 		return
 	}
 
 	canReplicate, err := instance.CanReplicateFromEx(belowInstance, "CanReplicateFromGTID()")
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	if !canReplicate {
-		Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("%t", canReplicate), Details: belowKey})
+		respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("%t", canReplicate), Details: belowKey})
 		return
 	}
-	err = inst.CheckMoveViaGTID(instance, belowInstance)
+	err = tenant.Store.CheckMoveViaGTID(instance, belowInstance)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	canReplicate = (err == nil)
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("%t", canReplicate), Details: belowKey})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("%t", canReplicate), Details: belowKey})
 }
 
 // setSemiSyncMaster
 func (this *HttpAPI) setSemiSyncMaster(w http.ResponseWriter, r *http.Request, enable bool) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.SetSemiSyncMaster(&instanceKey, enable)
+	instance, err := tenant.Store.SetSemiSyncMaster(&instanceKey, enable)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("master semi-sync set to %t", enable), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("master semi-sync set to %t", enable), Details: instance})
 }
 
 func (this *HttpAPI) EnableSemiSyncMaster(w http.ResponseWriter, r *http.Request) {
@@ -1627,23 +1690,24 @@ func (this *HttpAPI) DisableSemiSyncMaster(w http.ResponseWriter, r *http.Reques
 
 // setSemiSyncMaster
 func (this *HttpAPI) setSemiSyncReplica(w http.ResponseWriter, r *http.Request, enable bool) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.SetSemiSyncReplica(&instanceKey, enable)
+	instance, err := tenant.Store.SetSemiSyncReplica(&instanceKey, enable)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("replica semi-sync set to %t", enable), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("replica semi-sync set to %t", enable), Details: instance})
 }
 
 func (this *HttpAPI) EnableSemiSyncReplica(w http.ResponseWriter, r *http.Request) {
@@ -1656,123 +1720,129 @@ func (this *HttpAPI) DisableSemiSyncReplica(w http.ResponseWriter, r *http.Reque
 
 // DelayReplication delays replication on given instance with given seconds
 func (this *HttpAPI) DelayReplication(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	seconds, err := strconv.Atoi(chi.URLParam(r, "seconds"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Invalid value provided for seconds"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Invalid value provided for seconds"})
 		return
 	}
-	err = inst.DelayReplication(&instanceKey, seconds)
+	err = tenant.Store.DelayReplication(&instanceKey, seconds)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Replication delayed: %+v", instanceKey), Details: seconds})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Replication delayed: %+v", instanceKey), Details: seconds})
 }
 
 // SetReadOnly sets the global read_only variable
 func (this *HttpAPI) SetReadOnly(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.SetReadOnly(&instanceKey, true)
+	instance, err := tenant.Store.SetReadOnly(&instanceKey, true)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: "Server set as read-only", Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Server set as read-only", Details: instance})
 }
 
 // SetWriteable clear the global read_only variable
 func (this *HttpAPI) SetWriteable(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.SetReadOnly(&instanceKey, false)
+	instance, err := tenant.Store.SetReadOnly(&instanceKey, false)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: "Server set as writeable", Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Server set as writeable", Details: instance})
 }
 
 // KillQuery kills a query running on a server
 func (this *HttpAPI) KillQuery(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	processId, err := strconv.ParseInt(chi.URLParam(r, "process"), 10, 0)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.KillQuery(&instanceKey, processId)
+	instance, err := tenant.Store.KillQuery(&instanceKey, processId)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Query killed on : %+v", instance.Key), Details: instance})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Query killed on : %+v", instance.Key), Details: instance})
 }
 
 // AsciiTopology returns an ascii graph of cluster's instances
 func (this *HttpAPI) asciiTopology(w http.ResponseWriter, r *http.Request, tabulated bool, printTags bool) {
-	clusterName, err := figureClusterName(getClusterHintFromRequest(r))
+	tenant := tenantOf(r)
+	clusterName, err := figureClusterName(tenant, getClusterHintFromRequest(r))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	asciiOutput, err := inst.ASCIITopology(clusterName, "", tabulated, printTags)
+	asciiOutput, err := tenant.Store.ASCIITopology(clusterName, "", tabulated, printTags)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Topology for cluster %s", clusterName), Details: asciiOutput})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Topology for cluster %s", clusterName), Details: asciiOutput})
 }
 
 // SnapshotTopologies triggers orchestrator to record a snapshot of host/master for all known hosts.
 func (this *HttpAPI) SnapshotTopologies(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	start := time.Now()
-	if err := inst.SnapshotTopologies(); err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err), Details: fmt.Sprintf("Took %v", time.Since(start))})
+	if err := tenant.Store.SnapshotTopologies(); err != nil {
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err), Details: fmt.Sprintf("Took %v", time.Since(start))})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: "Topology Snapshot completed", Details: fmt.Sprintf("Took %v", time.Since(start))})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Topology Snapshot completed", Details: fmt.Sprintf("Took %v", time.Since(start))})
 }
 
 // AsciiTopology returns an ascii graph of cluster's instances
@@ -1791,109 +1861,116 @@ func (this *HttpAPI) AsciiTopologyTags(w http.ResponseWriter, r *http.Request) {
 }
 
 // clusterByName provides list of instances in given cluster by cluster name
-func (this *HttpAPI) clusterByName(w http.ResponseWriter, clusterName string) {
-	instances, err := inst.ReadClusterInstances(clusterName)
+func (this *HttpAPI) clusterByName(w http.ResponseWriter, r *http.Request, tenant *logic.Tenant, clusterName string) {
+	instances, err := tenant.Store.ReadClusterInstances(clusterName)
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, instances)
+	renderTenantJSON(w, r, http.StatusOK, instances)
 }
 
 // Cluster provides list of instances in given cluster
 func (this *HttpAPI) Cluster(w http.ResponseWriter, r *http.Request) {
-	clusterName, err := figureClusterName(getClusterHintFromRequest(r))
+	tenant := tenantOf(r)
+	clusterName, err := figureClusterName(tenant, getClusterHintFromRequest(r))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	this.clusterByName(w, clusterName)
+	this.clusterByName(w, r, tenant, clusterName)
 }
 
 // ClusterByAlias provides list of instances in given cluster
 func (this *HttpAPI) ClusterByAlias(w http.ResponseWriter, r *http.Request) {
-	clusterName, err := inst.GetClusterByAlias(chi.URLParam(r, "clusterAlias"))
+	tenant := tenantOf(r)
+	clusterName, err := tenant.Store.GetClusterByAlias(chi.URLParam(r, "clusterAlias"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	this.clusterByName(w, clusterName)
+	this.clusterByName(w, r, tenant, clusterName)
 }
 
 // ClusterByInstance provides list of instances in cluster an instance belongs to
 func (this *HttpAPI) ClusterByInstance(w http.ResponseWriter, r *http.Request) {
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	tenant := tenantOf(r)
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, found, err := inst.ReadInstance(&instanceKey)
+	instance, found, err := tenant.Store.ReadInstance(&instanceKey)
 	if (!found) || (err != nil) {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", instanceKey)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", instanceKey)})
 		return
 	}
 
-	this.clusterByName(w, instance.ClusterName)
+	this.clusterByName(w, r, tenant, instance.ClusterName)
 }
 
 // clusterInfoByName provides details of a given cluster by name
-func (this *HttpAPI) clusterInfoByName(w http.ResponseWriter, clusterName string) {
-	clusterInfo, err := inst.ReadClusterInfo(clusterName)
+func (this *HttpAPI) clusterInfoByName(w http.ResponseWriter, r *http.Request, tenant *logic.Tenant, clusterName string) {
+	clusterInfo, err := tenant.Store.ReadClusterInfo(clusterName)
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, clusterInfo)
+	renderTenantJSON(w, r, http.StatusOK, clusterInfo)
 }
 
 // ClusterInfo provides details of a given cluster
 func (this *HttpAPI) ClusterInfo(w http.ResponseWriter, r *http.Request) {
-	clusterName, err := figureClusterName(getClusterHintFromRequest(r))
+	tenant := tenantOf(r)
+	clusterName, err := figureClusterName(tenant, getClusterHintFromRequest(r))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
-	this.clusterInfoByName(w, clusterName)
+	this.clusterInfoByName(w, r, tenant, clusterName)
 }
 
 // ClusterInfoByAlias provides details of a given cluster by alias
 func (this *HttpAPI) ClusterInfoByAlias(w http.ResponseWriter, r *http.Request) {
-	clusterName, err := inst.GetClusterByAlias(chi.URLParam(r, "clusterAlias"))
+	tenant := tenantOf(r)
+	clusterName, err := tenant.Store.GetClusterByAlias(chi.URLParam(r, "clusterAlias"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	this.clusterInfoByName(w, clusterName)
+	this.clusterInfoByName(w, r, tenant, clusterName)
 }
 
 // ClusterOSCReplicas returns heuristic list of OSC replicas
 func (this *HttpAPI) ClusterOSCReplicas(w http.ResponseWriter, r *http.Request) {
-	clusterName, err := figureClusterName(getClusterHintFromRequest(r))
+	tenant := tenantOf(r)
+	clusterName, err := figureClusterName(tenant, getClusterHintFromRequest(r))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	instances, err := inst.GetClusterOSCReplicas(clusterName)
+	instances, err := tenant.Store.GetClusterOSCReplicas(clusterName)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, instances)
+	renderTenantJSON(w, r, http.StatusOK, instances)
 }
 
 // SetClusterAlias will change an alias for a given clustername
 func (this *HttpAPI) SetClusterAliasManualOverride(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
 	clusterName := chi.URLParam(r, "clusterName")
@@ -1901,354 +1978,374 @@ func (this *HttpAPI) SetClusterAliasManualOverride(w http.ResponseWriter, r *htt
 
 	var err error
 	if orcraft.IsRaftEnabled() {
-		_, err = orcraft.PublishCommand("set-cluster-alias-manual-override", []string{clusterName, alias})
+		_, err = orcraft.PublishTenantCommand(tenant.ID, "set-cluster-alias-manual-override", []string{clusterName, alias})
 	} else {
-		err = inst.SetClusterAliasManualOverride(clusterName, alias)
+		err = tenant.Store.SetClusterAliasManualOverride(clusterName, alias)
 	}
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Cluster %s now has alias '%s'", clusterName, alias)})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Cluster %s now has alias '%s'", clusterName, alias)})
 }
 
 // Clusters provides list of known clusters
 func (this *HttpAPI) Clusters(w http.ResponseWriter, r *http.Request) {
-	clusterNames, err := inst.ReadClusters()
+	tenant := tenantOf(r)
+	clusterNames, err := tenant.Store.ReadClusters()
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, clusterNames)
+	renderTenantJSON(w, r, http.StatusOK, clusterNames)
 }
 
 // ClustersInfo provides list of known clusters, along with some added metadata per cluster
 func (this *HttpAPI) ClustersInfo(w http.ResponseWriter, r *http.Request) {
-	clustersInfo, err := inst.ReadClustersInfo("")
+	tenant := tenantOf(r)
+	clustersInfo, err := tenant.Store.ReadClustersInfo("")
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, clustersInfo)
+	renderTenantJSON(w, r, http.StatusOK, clustersInfo)
 }
 
 // Tags lists existing tags for a given instance
 func (this *HttpAPI) Tags(w http.ResponseWriter, r *http.Request) {
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	tenant := tenantOf(r)
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	tags, err := inst.ReadInstanceTags(&instanceKey)
+	tags, err := tenant.Store.ReadInstanceTags(&instanceKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	tagStrings := []string{}
 	for _, tag := range tags {
 		tagStrings = append(tagStrings, tag.String())
 	}
-	renderJSON(w, http.StatusOK, tagStrings)
+	renderTenantJSON(w, r, http.StatusOK, tagStrings)
 }
 
 // TagValue returns a given tag's value for a specific instance
 func (this *HttpAPI) TagValue(w http.ResponseWriter, r *http.Request) {
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	tenant := tenantOf(r)
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	tag, err := getTag(r)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	tagExists, err := inst.ReadInstanceTag(&instanceKey, tag)
+	tagExists, err := tenant.Store.ReadInstanceTag(&instanceKey, tag)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	if tagExists {
-		renderJSON(w, http.StatusOK, tag.TagValue)
+		renderTenantJSON(w, r, http.StatusOK, tag.TagValue)
 	} else {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("tag %s not found for %+v", tag.TagName, instanceKey)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("tag %s not found for %+v", tag.TagName, instanceKey)})
 	}
 }
 
 // Tagged return instance keys tagged by "tag" query param
 func (this *HttpAPI) Tagged(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	tagsString := r.URL.Query().Get("tag")
-	instanceKeyMap, err := inst.GetInstanceKeysByTags(tagsString)
+	instanceKeyMap, err := tenant.Store.GetInstanceKeysByTags(tagsString)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, instanceKeyMap.GetInstanceKeys())
+	renderTenantJSON(w, r, http.StatusOK, instanceKeyMap.GetInstanceKeys())
 }
 
 // Tags adds a tag to a given instance
 func (this *HttpAPI) Tag(w http.ResponseWriter, r *http.Request) {
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	tenant := tenantOf(r)
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
 	tag, err := getTag(r)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	if orcraft.IsRaftEnabled() {
-		_, err = orcraft.PublishCommand("put-instance-tag", inst.InstanceTag{Key: instanceKey, T: *tag})
+		_, err = orcraft.PublishTenantCommand(tenant.ID, "put-instance-tag", inst.InstanceTag{Key: instanceKey, T: *tag})
 	} else {
-		err = inst.PutInstanceTag(&instanceKey, tag)
+		err = tenant.Store.PutInstanceTag(&instanceKey, tag)
 	}
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("%+v tagged with %s", instanceKey, tag.String()), Details: instanceKey})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("%+v tagged with %s", instanceKey, tag.String()), Details: instanceKey})
 }
 
 // Untag removes a tag from an instance
 func (this *HttpAPI) Untag(w http.ResponseWriter, r *http.Request) {
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	tenant := tenantOf(r)
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
 	tag, err := getTag(r)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	untagged, err := inst.Untag(&instanceKey, tag)
+	untagged, err := tenant.Store.Untag(&instanceKey, tag)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("%s removed from %+v instances", tag.TagName, len(*untagged)), Details: untagged.GetInstanceKeys()})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("%s removed from %+v instances", tag.TagName, len(*untagged)), Details: untagged.GetInstanceKeys()})
 }
 
 // UntagAll removes a tag from all matching instances
 func (this *HttpAPI) UntagAll(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	tag, err := getTag(r)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	untagged, err := inst.Untag(nil, tag)
+	untagged, err := tenant.Store.Untag(nil, tag)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("%s removed from %+v instances", tag.TagName, len(*untagged)), Details: untagged.GetInstanceKeys()})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("%s removed from %+v instances", tag.TagName, len(*untagged)), Details: untagged.GetInstanceKeys()})
 }
 
 // Write a cluster's master (or all clusters masters) to kv stores.
 // This should generally only happen once in a lifetime of a cluster. Otherwise KV
 // stores are updated via failovers.
 func (this *HttpAPI) SubmitMastersToKvStores(w http.ResponseWriter, r *http.Request) {
-	clusterName, err := getClusterNameIfExistsFromRequest(r)
+	tenant := tenantOf(r)
+	clusterName, err := getClusterNameIfExistsFromRequest(tenant, r)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
-	kvPairs, submittedCount, err := logic.SubmitMastersToKvStores(clusterName, true)
+	kvPairs, submittedCount, err := tenant.SubmitMastersToKvStores(clusterName, true)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Submitted %d masters", submittedCount), Details: kvPairs})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Submitted %d masters", submittedCount), Details: kvPairs})
 }
 
 // Clusters provides list of known masters
 func (this *HttpAPI) Masters(w http.ResponseWriter, r *http.Request) {
-	instances, err := inst.ReadWriteableClustersMasters()
+	tenant := tenantOf(r)
+	instances, err := tenant.Store.ReadWriteableClustersMasters()
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, instances)
+	renderTenantJSON(w, r, http.StatusOK, instances)
 }
 
 // ClusterMaster returns the writable master of a given cluster
 func (this *HttpAPI) ClusterMaster(w http.ResponseWriter, r *http.Request) {
-	clusterName, err := figureClusterName(getClusterHintFromRequest(r))
+	tenant := tenantOf(r)
+	clusterName, err := figureClusterName(tenant, getClusterHintFromRequest(r))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	masters, err := inst.ReadClusterMaster(clusterName)
+	masters, err := tenant.Store.ReadClusterMaster(clusterName)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 	if len(masters) == 0 {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("No masters found for %+v", clusterName)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("No masters found for %+v", clusterName)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, masters[0])
+	renderTenantJSON(w, r, http.StatusOK, masters[0])
 }
 
 // Downtimed lists downtimed instances, potentially filtered by cluster
 func (this *HttpAPI) Downtimed(w http.ResponseWriter, r *http.Request) {
-	clusterName, err := getClusterNameIfExistsFromRequest(r)
+	tenant := tenantOf(r)
+	clusterName, err := getClusterNameIfExistsFromRequest(tenant, r)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	instances, err := inst.ReadDowntimedInstances(clusterName)
+	instances, err := tenant.Store.ReadDowntimedInstances(clusterName)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, instances)
+	renderTenantJSON(w, r, http.StatusOK, instances)
 }
 
 // AllInstances lists all known instances
 func (this *HttpAPI) AllInstances(w http.ResponseWriter, r *http.Request) {
-	instances, err := inst.SearchInstances("")
+	tenant := tenantOf(r)
+	instances, err := tenant.Store.SearchInstances("")
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, instances)
+	renderTenantJSON(w, r, http.StatusOK, instances)
 }
 
 // Search provides list of instances matching given search param via various criteria.
 func (this *HttpAPI) Search(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	searchString := chi.URLParam(r, "searchString")
 	if searchString == "" {
 		searchString = r.URL.Query().Get("s")
 	}
-	instances, err := inst.SearchInstances(searchString)
+	instances, err := tenant.Store.SearchInstances(searchString)
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, instances)
+	renderTenantJSON(w, r, http.StatusOK, instances)
 }
 
 // Problems provides list of instances with known problems
 func (this *HttpAPI) Problems(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	clusterName := chi.URLParam(r, "clusterName")
-	instances, err := inst.ReadProblemInstances(clusterName)
+	instances, err := tenant.Store.ReadProblemInstances(clusterName)
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, instances)
+	renderTenantJSON(w, r, http.StatusOK, instances)
 }
 
 // Audit provides list of audit entries by given page number
 func (this *HttpAPI) Audit(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	page, err := strconv.Atoi(chi.URLParam(r, "page"))
 	if err != nil || page < 0 {
 		page = 0
 	}
 	var auditedInstanceKey *inst.InstanceKey
-	if instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port")); err == nil {
+	if instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port")); err == nil {
 		auditedInstanceKey = &instanceKey
 	}
 
-	audits, err := inst.ReadRecentAudit(auditedInstanceKey, page)
+	audits, err := tenant.Store.ReadRecentAudit(auditedInstanceKey, page)
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, audits)
+	renderTenantJSON(w, r, http.StatusOK, audits)
 }
 
 // HostnameResolveCache shows content of in-memory hostname cache
 func (this *HttpAPI) HostnameResolveCache(w http.ResponseWriter, r *http.Request) {
-	content, err := inst.HostnameResolveCache()
+	tenant := tenantOf(r)
+	content, err := tenant.Store.HostnameResolveCache()
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: "Cache retrieved", Details: content})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Cache retrieved", Details: content})
 }
 
 // ResetHostnameResolveCache clears in-memory hostname resovle cache
 func (this *HttpAPI) ResetHostnameResolveCache(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	err := inst.ResetHostnameResolveCache()
+	err := tenant.Store.ResetHostnameResolveCache()
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: "Hostname cache cleared"})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Hostname cache cleared"})
 }
 
 // DeregisterHostnameUnresolve deregisters the unresolve name used previously
 func (this *HttpAPI) DeregisterHostnameUnresolve(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
 
 	var instanceKey *inst.InstanceKey
-	if instKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port")); err == nil {
+	if instKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port")); err == nil {
 		instanceKey = &instKey
 	}
 
 	var err error
 	registration := inst.NewHostnameDeregistration(instanceKey)
 	if orcraft.IsRaftEnabled() {
-		_, err = orcraft.PublishCommand("register-hostname-unresolve", registration)
+		_, err = orcraft.PublishTenantCommand(tenant.ID, "register-hostname-unresolve", registration)
 	} else {
-		err = inst.RegisterHostnameUnresolve(registration)
+		err = tenant.Store.RegisterHostnameUnresolve(registration)
 	}
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
-	Respond(w, &APIResponse{Code: OK, Message: "Hostname deregister unresolve completed", Details: instanceKey})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Hostname deregister unresolve completed", Details: instanceKey})
 }
 
 // RegisterHostnameUnresolve registers the unresolve name to use
 func (this *HttpAPI) RegisterHostnameUnresolve(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
 
 	var instanceKey *inst.InstanceKey
-	if instKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port")); err == nil {
+	if instKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port")); err == nil {
 		instanceKey = &instKey
 	}
 
@@ -2256,21 +2353,22 @@ func (this *HttpAPI) RegisterHostnameUnresolve(w http.ResponseWriter, r *http.Re
 	var err error
 	registration := inst.NewHostnameRegistration(instanceKey, hostname)
 	if orcraft.IsRaftEnabled() {
-		_, err = orcraft.PublishCommand("register-hostname-unresolve", registration)
+		_, err = orcraft.PublishTenantCommand(tenant.ID, "register-hostname-unresolve", registration)
 	} else {
-		err = inst.RegisterHostnameUnresolve(registration)
+		err = tenant.Store.RegisterHostnameUnresolve(registration)
 	}
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
-	Respond(w, &APIResponse{Code: OK, Message: "Hostname register unresolve completed", Details: instanceKey})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Hostname register unresolve completed", Details: instanceKey})
 }
 
 // SubmitPoolInstances (re-)applies the list of hostnames for a given pool
 func (this *HttpAPI) SubmitPoolInstances(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
 	pool := chi.URLParam(r, "pool")
@@ -2279,139 +2377,144 @@ func (this *HttpAPI) SubmitPoolInstances(w http.ResponseWriter, r *http.Request)
 	var err error
 	submission := inst.NewPoolInstancesSubmission(pool, instances)
 	if orcraft.IsRaftEnabled() {
-		_, err = orcraft.PublishCommand("submit-pool-instances", submission)
+		_, err = orcraft.PublishTenantCommand(tenant.ID, "submit-pool-instances", submission)
 	} else {
-		err = inst.ApplyPoolInstances(submission)
+		err = tenant.Store.ApplyPoolInstances(submission)
 	}
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Applied %s pool instances", pool), Details: pool})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Applied %s pool instances", pool), Details: pool})
 }
 
 // SubmitPoolHostnames (re-)applies the list of hostnames for a given pool
 func (this *HttpAPI) ReadClusterPoolInstancesMap(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
 	clusterName := chi.URLParam(r, "clusterName")
 	pool := chi.URLParam(r, "pool")
 
-	poolInstancesMap, err := inst.ReadClusterPoolInstancesMap(clusterName, pool)
+	poolInstancesMap, err := tenant.Store.ReadClusterPoolInstancesMap(clusterName, pool)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Read pool instances for cluster %s", clusterName), Details: poolInstancesMap})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Read pool instances for cluster %s", clusterName), Details: poolInstancesMap})
 }
 
 // GetHeuristicClusterPoolInstances returns instances belonging to a cluster's pool
 func (this *HttpAPI) GetHeuristicClusterPoolInstances(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	clusterName, err := figureClusterName(getClusterHintFromRequest(r))
+	clusterName, err := figureClusterName(tenant, getClusterHintFromRequest(r))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 	pool := chi.URLParam(r, "pool")
 
-	instances, err := inst.GetHeuristicClusterPoolInstances(clusterName, pool)
+	instances, err := tenant.Store.GetHeuristicClusterPoolInstances(clusterName, pool)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Heuristic pool instances for cluster %s", clusterName), Details: instances})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Heuristic pool instances for cluster %s", clusterName), Details: instances})
 }
 
 // GetHeuristicClusterPoolInstances returns instances belonging to a cluster's pool
 func (this *HttpAPI) GetHeuristicClusterPoolInstancesLag(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	clusterName, err := inst.ReadClusterNameByAlias(chi.URLParam(r, "clusterName"))
+	clusterName, err := tenant.Store.ReadClusterNameByAlias(chi.URLParam(r, "clusterName"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 	pool := chi.URLParam(r, "pool")
 
-	lag, err := inst.GetHeuristicClusterPoolInstancesLag(clusterName, pool)
+	lag, err := tenant.Store.GetHeuristicClusterPoolInstancesLag(clusterName, pool)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Heuristic pool lag for cluster %s", clusterName), Details: lag})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Heuristic pool lag for cluster %s", clusterName), Details: lag})
 }
 
 // ReloadClusterAlias clears in-memory hostname resovle cache
 func (this *HttpAPI) ReloadClusterAlias(w http.ResponseWriter, r *http.Request) {
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: ERROR, Message: "This API call has been retired"})
+	respondTenant(w, r, &APIResponse{Code: ERROR, Message: "This API call has been retired"})
 }
 
 // BulkPromotionRules returns a list of the known promotion rules for each instance
 func (this *HttpAPI) BulkPromotionRules(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
 
-	promotionRules, err := inst.BulkReadCandidateDatabaseInstance()
+	promotionRules, err := tenant.Store.BulkReadCandidateDatabaseInstance()
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, promotionRules)
+	renderTenantJSON(w, r, http.StatusOK, promotionRules)
 }
 
 // BulkInstances returns a list of all known instances
 func (this *HttpAPI) BulkInstances(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
 
-	instances, err := inst.BulkReadInstance()
+	instances, err := tenant.Store.BulkReadInstance()
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, instances)
+	renderTenantJSON(w, r, http.StatusOK, instances)
 }
 
 // DiscoveryMetricsRaw will return the last X seconds worth of discovery information in time based order as a JSON array
 func (this *HttpAPI) DiscoveryMetricsRaw(w http.ResponseWriter, r *http.Request) {
 	seconds, err := strconv.Atoi(chi.URLParam(r, "seconds"))
 	if err != nil || seconds <= 0 {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Invalid value provided for seconds"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Invalid value provided for seconds"})
 		return
 	}
 
 	refTime := time.Now().Add(-time.Duration(seconds) * time.Second)
-	json, err := discovery.JSONSince(discoveryMetrics, refTime)
+	json, err := discovery.JSONSince(tenantOf(r).DiscoveryMetrics(), refTime)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unable to determine start time. Perhaps seconds value is wrong?"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unable to determine start time. Perhaps seconds value is wrong?"})
 		return
 	}
 	log.Debugf("DiscoveryMetricsRaw data: retrieved %d entries from discovery.MC", len(json))
 
-	renderJSON(w, http.StatusOK, json)
+	renderTenantJSON(w, r, http.StatusOK, json)
 }
 
 // DiscoveryMetricsAggregated will return a single set of aggregated metrics for raw values collected since the
@@ -2420,51 +2523,65 @@ func (this *HttpAPI) DiscoveryMetricsAggregated(w http.ResponseWriter, r *http.R
 	seconds, err := strconv.Atoi(chi.URLParam(r, "seconds"))
 
 	refTime := time.Now().Add(-time.Duration(seconds) * time.Second)
-	aggregated, err := discovery.AggregatedSince(discoveryMetrics, refTime)
+	aggregated, err := discovery.AggregatedSince(tenantOf(r).DiscoveryMetrics(), refTime)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unable to generate aggregated discovery metrics"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unable to generate aggregated discovery metrics"})
 		return
 	}
 	// log.Debugf("DiscoveryMetricsAggregated data: %+v", aggregated)
-	renderJSON(w, http.StatusOK, aggregated)
+	renderTenantJSON(w, r, http.StatusOK, aggregated)
+}
+
+// tenantQueue returns the discovery queue of the tenant known as name ("DEFAULT"
+// or "DEADINSTANCES"), or nil if the tenant has no such queue.
+func tenantQueue(tenant *logic.Tenant, name string) *discovery.Queue {
+	switch name {
+	case "DEFAULT":
+		return tenant.DiscoveryQueue()
+	case "DEADINSTANCES":
+		if tenant.DeadInstancesDiscoveryQueue() != tenant.DiscoveryQueue() {
+			return tenant.DeadInstancesDiscoveryQueue()
+		}
+	}
+	return nil
 }
 
 func (this *HttpAPI) discoveryQueueMetricsAggregatedCommon(w http.ResponseWriter, r *http.Request, queueName string) {
 	seconds, err := strconv.Atoi(chi.URLParam(r, "seconds"))
 	log.Debugf("DiscoveryQueueMetricsAggregated: queue: %s, seconds: %d", queueName, seconds)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unable to generate discovery queue aggregated metrics"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unable to generate discovery queue aggregated metrics"})
 		return
 	}
 
-	queue := discovery.ReturnQueue(queueName)
+	queue := tenantQueue(tenantOf(r), queueName)
 	if queue == nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unable to generate discovery queue aggregated metrics for unknown queue"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unable to generate discovery queue aggregated metrics for unknown queue"})
 		return
 	}
 	aggregated := queue.AggregatedDiscoveryQueueMetrics(seconds)
 	log.Debugf("DiscoveryQueueMetricsAggregated data: %+v", aggregated)
 
-	renderJSON(w, http.StatusOK, aggregated)
+	renderTenantJSON(w, r, http.StatusOK, aggregated)
 }
 
 func (this *HttpAPI) discoveryQueueMetricsRawCommon(w http.ResponseWriter, r *http.Request, queueName string) {
 	seconds, err := strconv.Atoi(chi.URLParam(r, "seconds"))
 	log.Debugf("DiscoveryQueueMetricsRaw: seconds: %d", seconds)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unable to generate discovery queue raw metrics"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unable to generate discovery queue raw metrics"})
 		return
 	}
 
-	queue := discovery.ReturnQueue(queueName)
+	queue := tenantQueue(tenantOf(r), queueName)
 	if queue == nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unable to generate discovery queue aggregated metrics for unknown queue"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unable to generate discovery queue aggregated metrics for unknown queue"})
 		return
 	}
 	metrics := queue.DiscoveryQueueMetrics(seconds)
 	log.Debugf("DiscoveryQueueMetricsRaw data: %+v", metrics)
 
-	renderJSON(w, http.StatusOK, metrics)
+	renderTenantJSON(w, r, http.StatusOK, metrics)
 }
 
 // DiscoveryQueueMetricsRaw returns the raw queue metrics (active and
@@ -2485,7 +2602,7 @@ func (this *HttpAPI) DiscoveryQueueMetricsAggregated(w http.ResponseWriter, r *h
 func (this *HttpAPI) DiscoveryQueueMetricsRaw2(w http.ResponseWriter, r *http.Request) {
 	queue := chi.URLParam(r, "queue")
 	if queue == "" {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unable to generate discovery queue raw metrics"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unable to generate discovery queue raw metrics"})
 		return
 	}
 
@@ -2498,7 +2615,7 @@ func (this *HttpAPI) DiscoveryQueueMetricsRaw2(w http.ResponseWriter, r *http.Re
 func (this *HttpAPI) DiscoveryQueueMetricsAggregated2(w http.ResponseWriter, r *http.Request) {
 	queue := chi.URLParam(r, "queue")
 	if queue == "" {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unable to generate discovery queue aggregated metrics"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unable to generate discovery queue aggregated metrics"})
 		return
 	}
 
@@ -2510,35 +2627,35 @@ func (this *HttpAPI) BackendQueryMetricsRaw(w http.ResponseWriter, r *http.Reque
 	seconds, err := strconv.Atoi(chi.URLParam(r, "seconds"))
 	log.Debugf("BackendQueryMetricsRaw: seconds: %d", seconds)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unable to generate raw backend query metrics"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unable to generate raw backend query metrics"})
 		return
 	}
 
 	refTime := time.Now().Add(-time.Duration(seconds) * time.Second)
-	m, err := queryMetrics.Since(refTime)
+	m, err := tenantOf(r).Store.BackendWrites().Since(refTime)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unable to return backend query metrics"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unable to return backend query metrics"})
 		return
 	}
 
 	log.Debugf("BackendQueryMetricsRaw data: %+v", m)
 
-	renderJSON(w, http.StatusOK, m)
+	renderTenantJSON(w, r, http.StatusOK, m)
 }
 
 func (this *HttpAPI) BackendQueryMetricsAggregated(w http.ResponseWriter, r *http.Request) {
 	seconds, err := strconv.Atoi(chi.URLParam(r, "seconds"))
 	log.Debugf("BackendQueryMetricsAggregated: seconds: %d", seconds)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unable to aggregated generate backend query metrics"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unable to aggregated generate backend query metrics"})
 		return
 	}
 
 	refTime := time.Now().Add(-time.Duration(seconds) * time.Second)
-	aggregated := query.AggregatedSince(queryMetrics, refTime)
+	aggregated := query.AggregatedSince(tenantOf(r).Store.BackendWrites(), refTime)
 	log.Debugf("BackendQueryMetricsAggregated data: %+v", aggregated)
 
-	renderJSON(w, http.StatusOK, aggregated)
+	renderTenantJSON(w, r, http.StatusOK, aggregated)
 }
 
 // WriteBufferMetricsRaw returns the raw instance write buffer metrics
@@ -2546,36 +2663,37 @@ func (this *HttpAPI) WriteBufferMetricsRaw(w http.ResponseWriter, r *http.Reques
 	seconds, err := strconv.Atoi(chi.URLParam(r, "seconds"))
 	log.Debugf("WriteBufferMetricsRaw: seconds: %d", seconds)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unable to generate raw instance write buffer metrics"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unable to generate raw instance write buffer metrics"})
 		return
 	}
 
 	refTime := time.Now().Add(-time.Duration(seconds) * time.Second)
-	m, err := writeBufferMetrics.Since(refTime)
+	m, err := tenantOf(r).Store.WriteBufferMetrics().Since(refTime)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unable to return instance write buffermetrics"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unable to return instance write buffermetrics"})
 		return
 	}
 
 	log.Debugf("WriteBufferMetricsRaw data: %+v", m)
 
-	renderJSON(w, http.StatusOK, m)
+	renderTenantJSON(w, r, http.StatusOK, m)
 }
 
 // WriteBufferMetricsAggregated provides aggregate metrics of instance write buffer metrics
 func (this *HttpAPI) WriteBufferMetricsAggregated(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	seconds, err := strconv.Atoi(chi.URLParam(r, "seconds"))
 	log.Debugf("WriteBufferMetricsAggregated: seconds: %d", seconds)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unable to aggregated instance write buffer metrics"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unable to aggregated instance write buffer metrics"})
 		return
 	}
 
 	refTime := time.Now().Add(-time.Duration(seconds) * time.Second)
-	aggregated := inst.AggregatedSince(writeBufferMetrics, refTime)
+	aggregated := tenant.Store.AggregatedSince(tenant.Store.WriteBufferMetrics(), refTime)
 	log.Debugf("WriteBufferMetricsAggregated data: %+v", aggregated)
 
-	renderJSON(w, http.StatusOK, aggregated)
+	renderTenantJSON(w, r, http.StatusOK, aggregated)
 }
 
 // Agents provides complete list of registered agents (See https://github.com/proxysql/orchestrator-agent)
@@ -2922,9 +3040,25 @@ func (this *HttpAPI) Headers(w http.ResponseWriter, r *http.Request) {
 	renderJSON(w, http.StatusOK, r.Header)
 }
 
+// healthDetails is the Details of the health and status responses: the
+// HealthStatus of the node, as ever, plus the health of each tenant. A tenant
+// that fails does not change the health of the node (see process.Control).
+type healthDetails struct {
+	*process.HealthStatus
+	Tenants []TenantStatus
+}
+
+// nodeHealth runs the self test of the node (global: control backend and Raft)
+// and gathers the health of the tenants.
+func (this *HttpAPI) nodeHealth() (*healthDetails, error) {
+	m := managerOf(this.Manager)
+	health, err := m.Control().HealthTest()
+	return &healthDetails{HealthStatus: health, Tenants: tenantStatuses(m)}, err
+}
+
 // Health performs a self test
 func (this *HttpAPI) Health(w http.ResponseWriter, r *http.Request) {
-	health, err := process.HealthTest()
+	health, err := this.nodeHealth()
 	if err != nil {
 		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Application node is unhealthy %+v", err), Details: health})
 		return
@@ -2959,7 +3093,7 @@ func (this *HttpAPI) LeaderCheck(w http.ResponseWriter, r *http.Request) {
 // It might be a good idea to deprecate the current Health() behavior and roll this in at some
 // point
 func (this *HttpAPI) StatusCheck(w http.ResponseWriter, r *http.Request) {
-	health, err := process.HealthTest()
+	health, err := this.nodeHealth()
 	if err != nil {
 		renderJSON(w, 500, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Application node is unhealthy %+v", err), Details: health})
 		return
@@ -2973,7 +3107,7 @@ func (this *HttpAPI) GrabElection(w http.ResponseWriter, r *http.Request) {
 		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	err := process.GrabElection()
+	err := managerOf(this.Manager).Control().GrabElection()
 	if err != nil {
 		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Unable to grab election: %+v", err)})
 		return
@@ -2988,7 +3122,7 @@ func (this *HttpAPI) Reelect(w http.ResponseWriter, r *http.Request) {
 		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	err := process.Reelect()
+	err := managerOf(this.Manager).Control().Reelect()
 	if err != nil {
 		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Unable to re-elect: %+v", err)})
 		return
@@ -3187,16 +3321,20 @@ func (this *HttpAPI) ReloadConfiguration(w http.ResponseWriter, r *http.Request)
 	}
 	extraConfigFile := r.URL.Query().Get("config")
 	config.Reload(extraConfigFile)
-	_ = inst.AuditOperation("reload-configuration", nil, "Triggered via API")
+	// config.Reload reloads the global configuration; it is audited in every tenant
+	for _, tenant := range managerOf(this.Manager).All() {
+		_ = tenant.Store.AuditOperation("reload-configuration", nil, "Triggered via API")
+	}
 
 	Respond(w, &APIResponse{Code: OK, Message: "Config reloaded", Details: extraConfigFile})
 }
 
 // ReplicationAnalysis retuens list of issues
 func (this *HttpAPI) replicationAnalysis(clusterName string, instanceKey *inst.InstanceKey, w http.ResponseWriter, r *http.Request) {
-	analysis, err := inst.GetReplicationAnalysis(clusterName, &inst.ReplicationAnalysisHints{IncludeDowntimed: true})
+	tenant := tenantOf(r)
+	analysis, err := tenant.Store.GetReplicationAnalysis(clusterName, &inst.ReplicationAnalysisHints{IncludeDowntimed: true})
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot get analysis: %+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot get analysis: %+v", err)})
 		return
 	}
 	// Possibly filter single instance
@@ -3210,7 +3348,7 @@ func (this *HttpAPI) replicationAnalysis(clusterName string, instanceKey *inst.I
 		analysis = filtered
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: "Analysis", Details: analysis})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Analysis", Details: analysis})
 }
 
 // ReplicationAnalysis retuens list of issues
@@ -3220,14 +3358,15 @@ func (this *HttpAPI) ReplicationAnalysis(w http.ResponseWriter, r *http.Request)
 
 // ReplicationAnalysis retuens list of issues
 func (this *HttpAPI) ReplicationAnalysisForCluster(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	var err error
 	clusterName := ""
-	if clusterName, err = inst.DeduceClusterName(chi.URLParam(r, "clusterName")); err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot get analysis: %+v", err)})
+	if clusterName, err = tenant.Store.DeduceClusterName(chi.URLParam(r, "clusterName")); err != nil {
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot get analysis: %+v", err)})
 		return
 	}
 	if clusterName == "" {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot get cluster name: %+v", chi.URLParam(r, "clusterName"))})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot get cluster name: %+v", chi.URLParam(r, "clusterName"))})
 		return
 	}
 	this.replicationAnalysis(clusterName, nil, w, r)
@@ -3235,13 +3374,14 @@ func (this *HttpAPI) ReplicationAnalysisForCluster(w http.ResponseWriter, r *htt
 
 // ReplicationAnalysis retuens list of issues
 func (this *HttpAPI) ReplicationAnalysisForKey(w http.ResponseWriter, r *http.Request) {
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	tenant := tenantOf(r)
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot get analysis: %+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot get analysis: %+v", err)})
 		return
 	}
 	if !instanceKey.IsValid() {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot get analysis: invalid key %+v", instanceKey)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot get analysis: invalid key %+v", instanceKey)})
 		return
 	}
 	this.replicationAnalysis("", &instanceKey, w, r)
@@ -3259,60 +3399,62 @@ func (this *HttpAPI) Recover(w http.ResponseWriter, r *http.Request) {
 
 // recoverInternal is the shared implementation for Recover and RecoverLite.
 func (this *HttpAPI) recoverInternal(w http.ResponseWriter, r *http.Request, forceSkipProcesses bool) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	var candidateKey *inst.InstanceKey
-	if key, err := this.getInstanceKey(chi.URLParam(r, "candidateHost"), chi.URLParam(r, "candidatePort")); err == nil {
+	if key, err := this.getInstanceKey(tenant, chi.URLParam(r, "candidateHost"), chi.URLParam(r, "candidatePort")); err == nil {
 		candidateKey = &key
 	}
 
 	skipProcesses := forceSkipProcesses || (r.URL.Query().Get("skipProcesses") == "true")
-	recoveryAttempted, promotedInstanceKey, err := logic.CheckAndRecover(&instanceKey, candidateKey, skipProcesses)
+	recoveryAttempted, promotedInstanceKey, err := tenant.CheckAndRecover(&instanceKey, candidateKey, skipProcesses)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error(), Details: instanceKey})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error(), Details: instanceKey})
 		return
 	}
 	if !recoveryAttempted {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Recovery not attempted", Details: instanceKey})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Recovery not attempted", Details: instanceKey})
 		return
 	}
 	if promotedInstanceKey == nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Recovery attempted but no instance promoted", Details: instanceKey})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Recovery attempted but no instance promoted", Details: instanceKey})
 		return
 	}
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Recovery executed on %+v", instanceKey), Details: *promotedInstanceKey})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Recovery executed on %+v", instanceKey), Details: *promotedInstanceKey})
 }
 
 // GracefulMasterTakeover gracefully fails over a master onto its single replica.
 func (this *HttpAPI) gracefulMasterTakeover(w http.ResponseWriter, r *http.Request, auto bool) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	clusterName, err := figureClusterName(getClusterHintFromRequest(r))
+	clusterName, err := figureClusterName(tenant, getClusterHintFromRequest(r))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	designatedKey, _ := this.getInstanceKey(chi.URLParam(r, "designatedHost"), chi.URLParam(r, "designatedPort"))
+	designatedKey, _ := this.getInstanceKey(tenant, chi.URLParam(r, "designatedHost"), chi.URLParam(r, "designatedPort"))
 	// designatedKey may be empty/invalid
-	topologyRecovery, _, err := logic.GracefulMasterTakeover(clusterName, &designatedKey, auto)
+	topologyRecovery, _, err := tenant.GracefulMasterTakeover(clusterName, &designatedKey, auto)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error(), Details: topologyRecovery})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error(), Details: topologyRecovery})
 		return
 	}
 	if topologyRecovery == nil || topologyRecovery.SuccessorKey == nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: "graceful-master-takeover: no successor promoted", Details: topologyRecovery})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "graceful-master-takeover: no successor promoted", Details: topologyRecovery})
 		return
 	}
-	Respond(w, &APIResponse{Code: OK, Message: "graceful-master-takeover: successor promoted", Details: topologyRecovery})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "graceful-master-takeover: successor promoted", Details: topologyRecovery})
 }
 
 // GracefulMasterTakeover gracefully fails over a master, either:
@@ -3329,162 +3471,170 @@ func (this *HttpAPI) GracefulMasterTakeoverAuto(w http.ResponseWriter, r *http.R
 
 // ForceMasterFailover fails over a master (even if there's no particular problem with the master)
 func (this *HttpAPI) ForceMasterFailover(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	clusterName, err := figureClusterName(getClusterHintFromRequest(r))
+	clusterName, err := figureClusterName(tenant, getClusterHintFromRequest(r))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	topologyRecovery, err := logic.ForceMasterFailover(clusterName)
+	topologyRecovery, err := tenant.ForceMasterFailover(clusterName)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	if topologyRecovery.SuccessorKey != nil {
-		Respond(w, &APIResponse{Code: OK, Message: "Master failed over", Details: topologyRecovery})
+		respondTenant(w, r, &APIResponse{Code: OK, Message: "Master failed over", Details: topologyRecovery})
 	} else {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Master not failed over", Details: topologyRecovery})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Master not failed over", Details: topologyRecovery})
 	}
 }
 
 // ForceMasterTakeover fails over a master (even if there's no particular problem with the master)
 func (this *HttpAPI) ForceMasterTakeover(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	clusterName, err := figureClusterName(getClusterHintFromRequest(r))
+	clusterName, err := figureClusterName(tenant, getClusterHintFromRequest(r))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	designatedKey, _ := this.getInstanceKey(chi.URLParam(r, "designatedHost"), chi.URLParam(r, "designatedPort"))
-	designatedInstance, _, err := inst.ReadInstance(&designatedKey)
+	designatedKey, _ := this.getInstanceKey(tenant, chi.URLParam(r, "designatedHost"), chi.URLParam(r, "designatedPort"))
+	designatedInstance, _, err := tenant.Store.ReadInstance(&designatedKey)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	if designatedInstance == nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Instance not found"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Instance not found"})
 		return
 	}
 
-	topologyRecovery, err := logic.ForceMasterTakeover(clusterName, designatedInstance)
+	topologyRecovery, err := tenant.ForceMasterTakeover(clusterName, designatedInstance)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	if topologyRecovery.SuccessorKey != nil {
-		Respond(w, &APIResponse{Code: OK, Message: "Master failed over", Details: topologyRecovery})
+		respondTenant(w, r, &APIResponse{Code: OK, Message: "Master failed over", Details: topologyRecovery})
 	} else {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Master not failed over", Details: topologyRecovery})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Master not failed over", Details: topologyRecovery})
 	}
 }
 
 // Registers promotion preference for given instance
 func (this *HttpAPI) RegisterCandidate(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 	promotionRule, err := inst.ParseCandidatePromotionRule(chi.URLParam(r, "promotionRule"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
 	candidate := inst.NewCandidateDatabaseInstance(&instanceKey, promotionRule).WithCurrentTime()
 
 	if orcraft.IsRaftEnabled() {
-		_, err = orcraft.PublishCommand("register-candidate", candidate)
+		_, err = orcraft.PublishTenantCommand(tenant.ID, "register-candidate", candidate)
 	} else {
-		err = inst.RegisterCandidateInstance(candidate)
+		err = tenant.Store.RegisterCandidateInstance(candidate)
 	}
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: "Registered candidate", Details: instanceKey})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Registered candidate", Details: instanceKey})
 }
 
 // AutomatedRecoveryFilters retuens list of clusters which are configured with automated recovery
 func (this *HttpAPI) AutomatedRecoveryFilters(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	automatedRecoveryMap := make(map[string]interface{})
-	automatedRecoveryMap["RecoverMasterClusterFilters"] = config.Config.RecoverMasterClusterFilters
-	automatedRecoveryMap["RecoverIntermediateMasterClusterFilters"] = config.Config.RecoverIntermediateMasterClusterFilters
-	automatedRecoveryMap["RecoveryIgnoreHostnameFilters"] = config.Config.RecoveryIgnoreHostnameFilters
+	automatedRecoveryMap["RecoverMasterClusterFilters"] = tenant.Cfg.RecoverMasterClusterFilters
+	automatedRecoveryMap["RecoverIntermediateMasterClusterFilters"] = tenant.Cfg.RecoverIntermediateMasterClusterFilters
+	automatedRecoveryMap["RecoveryIgnoreHostnameFilters"] = tenant.Cfg.RecoveryIgnoreHostnameFilters
 
-	Respond(w, &APIResponse{Code: OK, Message: "Automated recovery configuration details", Details: automatedRecoveryMap})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Automated recovery configuration details", Details: automatedRecoveryMap})
 }
 
 // AuditFailureDetection provides list of topology_failure_detection entries
 func (this *HttpAPI) AuditFailureDetection(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 
 	var audits []*logic.TopologyRecovery
 	var err error
 
 	if detectionId, derr := strconv.ParseInt(chi.URLParam(r, "id"), 10, 0); derr == nil && detectionId > 0 {
-		audits, err = logic.ReadFailureDetection(detectionId)
+		audits, err = tenant.ReadFailureDetection(detectionId)
 	} else {
 		page, derr := strconv.Atoi(chi.URLParam(r, "page"))
 		if derr != nil || page < 0 {
 			page = 0
 		}
-		audits, err = logic.ReadRecentFailureDetections(chi.URLParam(r, "clusterAlias"), page)
+		audits, err = tenant.ReadRecentFailureDetections(chi.URLParam(r, "clusterAlias"), page)
 	}
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, audits)
+	renderTenantJSON(w, r, http.StatusOK, audits)
 }
 
 // AuditRecoverySteps returns audited steps of a given recovery
 func (this *HttpAPI) AuditRecoverySteps(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	recoveryUID := chi.URLParam(r, "uid")
-	audits, err := logic.ReadTopologyRecoverySteps(recoveryUID)
+	audits, err := tenant.ReadTopologyRecoverySteps(recoveryUID)
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, audits)
+	renderTenantJSON(w, r, http.StatusOK, audits)
 }
 
 // ReadReplicationAnalysisChangelog lists instances and their analysis changelog
 func (this *HttpAPI) ReadReplicationAnalysisChangelog(w http.ResponseWriter, r *http.Request) {
-	changelogs, err := inst.ReadReplicationAnalysisChangelog()
+	tenant := tenantOf(r)
+	changelogs, err := tenant.Store.ReadReplicationAnalysisChangelog()
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, changelogs)
+	renderTenantJSON(w, r, http.StatusOK, changelogs)
 }
 
 // AuditRecovery provides list of topology-recovery entries
 func (this *HttpAPI) AuditRecovery(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	var audits []*logic.TopologyRecovery
 	var err error
 
 	if recoveryUID := chi.URLParam(r, "uid"); recoveryUID != "" {
-		audits, err = logic.ReadRecoveryByUID(recoveryUID)
+		audits, err = tenant.ReadRecoveryByUID(recoveryUID)
 	} else if recoveryId, derr := strconv.ParseInt(chi.URLParam(r, "id"), 10, 0); derr == nil && recoveryId > 0 {
-		audits, err = logic.ReadRecovery(recoveryId)
+		audits, err = tenant.ReadRecovery(recoveryId)
 	} else {
 		page, derr := strconv.Atoi(chi.URLParam(r, "page"))
 		if derr != nil || page < 0 {
@@ -3492,82 +3642,86 @@ func (this *HttpAPI) AuditRecovery(w http.ResponseWriter, r *http.Request) {
 		}
 		unacknowledgedOnly := (r.URL.Query().Get("unacknowledged") == "true")
 
-		audits, err = logic.ReadRecentRecoveries(chi.URLParam(r, "clusterName"), chi.URLParam(r, "clusterAlias"), unacknowledgedOnly, page)
+		audits, err = tenant.ReadRecentRecoveries(chi.URLParam(r, "clusterName"), chi.URLParam(r, "clusterAlias"), unacknowledgedOnly, page)
 	}
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, audits)
+	renderTenantJSON(w, r, http.StatusOK, audits)
 }
 
 // ActiveClusterRecovery returns recoveries in-progress for a given cluster
 func (this *HttpAPI) ActiveClusterRecovery(w http.ResponseWriter, r *http.Request) {
-	recoveries, err := logic.ReadActiveClusterRecovery(chi.URLParam(r, "clusterName"))
+	tenant := tenantOf(r)
+	recoveries, err := tenant.ReadActiveClusterRecovery(chi.URLParam(r, "clusterName"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, recoveries)
+	renderTenantJSON(w, r, http.StatusOK, recoveries)
 }
 
 // RecentlyActiveClusterRecovery returns recoveries in-progress for a given cluster
 func (this *HttpAPI) RecentlyActiveClusterRecovery(w http.ResponseWriter, r *http.Request) {
-	recoveries, err := logic.ReadRecentlyActiveClusterRecovery(chi.URLParam(r, "clusterName"))
+	tenant := tenantOf(r)
+	recoveries, err := tenant.ReadRecentlyActiveClusterRecovery(chi.URLParam(r, "clusterName"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, recoveries)
+	renderTenantJSON(w, r, http.StatusOK, recoveries)
 }
 
 // RecentlyActiveClusterRecovery returns recoveries in-progress for a given cluster
 func (this *HttpAPI) RecentlyActiveInstanceRecovery(w http.ResponseWriter, r *http.Request) {
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	tenant := tenantOf(r)
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
-	recoveries, err := logic.ReadRecentlyActiveInstanceRecovery(&instanceKey)
+	recoveries, err := tenant.ReadRecentlyActiveInstanceRecovery(&instanceKey)
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, recoveries)
+	renderTenantJSON(w, r, http.StatusOK, recoveries)
 }
 
 // ClusterInfo provides details of a given cluster
 func (this *HttpAPI) AcknowledgeClusterRecoveries(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
 
 	var clusterName string
 	var err error
 	if chi.URLParam(r, "clusterAlias") != "" {
-		clusterName, err = inst.GetClusterByAlias(chi.URLParam(r, "clusterAlias"))
+		clusterName, err = tenant.Store.GetClusterByAlias(chi.URLParam(r, "clusterAlias"))
 	} else {
-		clusterName, err = figureClusterName(getClusterHintFromRequest(r))
+		clusterName, err = figureClusterName(tenant, getClusterHintFromRequest(r))
 	}
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
 	comment := strings.TrimSpace(r.URL.Query().Get("comment"))
 	if comment == "" {
-		Respond(w, &APIResponse{Code: ERROR, Message: "No acknowledge comment given"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "No acknowledge comment given"})
 		return
 	}
 	userId := getUserId(r)
@@ -3577,34 +3731,35 @@ func (this *HttpAPI) AcknowledgeClusterRecoveries(w http.ResponseWriter, r *http
 	if orcraft.IsRaftEnabled() {
 		ack := logic.NewRecoveryAcknowledgement(userId, comment)
 		ack.ClusterName = clusterName
-		_, err = orcraft.PublishCommand("ack-recovery", ack)
+		_, err = orcraft.PublishTenantCommand(tenant.ID, "ack-recovery", ack)
 	} else {
-		_, err = logic.AcknowledgeClusterRecoveries(clusterName, userId, comment)
+		_, err = tenant.AcknowledgeClusterRecoveries(clusterName, userId, comment)
 	}
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: "Acknowledged cluster recoveries", Details: clusterName})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Acknowledged cluster recoveries", Details: clusterName})
 }
 
 // ClusterInfo provides details of a given cluster
 func (this *HttpAPI) AcknowledgeInstanceRecoveries(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
 
-	instanceKey, err := this.getInstanceKey(chi.URLParam(r, "host"), chi.URLParam(r, "port"))
+	instanceKey, err := this.getInstanceKey(tenant, chi.URLParam(r, "host"), chi.URLParam(r, "port"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
 
 	comment := strings.TrimSpace(r.URL.Query().Get("comment"))
 	if comment == "" {
-		Respond(w, &APIResponse{Code: ERROR, Message: "No acknowledge comment given"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "No acknowledge comment given"})
 		return
 	}
 	userId := getUserId(r)
@@ -3614,22 +3769,23 @@ func (this *HttpAPI) AcknowledgeInstanceRecoveries(w http.ResponseWriter, r *htt
 	if orcraft.IsRaftEnabled() {
 		ack := logic.NewRecoveryAcknowledgement(userId, comment)
 		ack.Key = instanceKey
-		_, err = orcraft.PublishCommand("ack-recovery", ack)
+		_, err = orcraft.PublishTenantCommand(tenant.ID, "ack-recovery", ack)
 	} else {
-		_, err = logic.AcknowledgeInstanceRecoveries(&instanceKey, userId, comment)
+		_, err = tenant.AcknowledgeInstanceRecoveries(&instanceKey, userId, comment)
 	}
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: "Acknowledged instance recoveries", Details: instanceKey})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Acknowledged instance recoveries", Details: instanceKey})
 }
 
 // ClusterInfo provides details of a given cluster
 func (this *HttpAPI) AcknowledgeRecovery(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
 	var err error
@@ -3642,7 +3798,7 @@ func (this *HttpAPI) AcknowledgeRecovery(w http.ResponseWriter, r *http.Request)
 		idParam = chi.URLParam(r, "recoveryId")
 		recoveryId, err = strconv.ParseInt(idParam, 10, 0)
 		if err != nil {
-			Respond(w, &APIResponse{Code: ERROR, Message: err.Error()})
+			respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 			return
 		}
 	} else {
@@ -3650,7 +3806,7 @@ func (this *HttpAPI) AcknowledgeRecovery(w http.ResponseWriter, r *http.Request)
 	}
 	comment := strings.TrimSpace(r.URL.Query().Get("comment"))
 	if comment == "" {
-		Respond(w, &APIResponse{Code: ERROR, Message: "No acknowledge comment given"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "No acknowledge comment given"})
 		return
 	}
 	userId := getUserId(r)
@@ -3661,33 +3817,34 @@ func (this *HttpAPI) AcknowledgeRecovery(w http.ResponseWriter, r *http.Request)
 		ack := logic.NewRecoveryAcknowledgement(userId, comment)
 		ack.Id = recoveryId
 		ack.UID = recoveryUid
-		_, err = orcraft.PublishCommand("ack-recovery", ack)
+		_, err = orcraft.PublishTenantCommand(tenant.ID, "ack-recovery", ack)
 	} else {
 		if recoveryUid != "" {
-			_, err = logic.AcknowledgeRecoveryByUID(recoveryUid, userId, comment)
+			_, err = tenant.AcknowledgeRecoveryByUID(recoveryUid, userId, comment)
 		} else {
-			_, err = logic.AcknowledgeRecovery(recoveryId, userId, comment)
+			_, err = tenant.AcknowledgeRecovery(recoveryId, userId, comment)
 		}
 	}
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: "Acknowledged recovery", Details: idParam})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Acknowledged recovery", Details: idParam})
 }
 
 // ClusterInfo provides details of a given cluster
 func (this *HttpAPI) AcknowledgeAllRecoveries(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
 
 	comment := strings.TrimSpace(r.URL.Query().Get("comment"))
 	if comment == "" {
-		Respond(w, &APIResponse{Code: ERROR, Message: "No acknowledge comment given"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "No acknowledge comment given"})
 		return
 	}
 	userId := getUserId(r)
@@ -3698,86 +3855,90 @@ func (this *HttpAPI) AcknowledgeAllRecoveries(w http.ResponseWriter, r *http.Req
 	if orcraft.IsRaftEnabled() {
 		ack := logic.NewRecoveryAcknowledgement(userId, comment)
 		ack.AllRecoveries = true
-		_, err = orcraft.PublishCommand("ack-recovery", ack)
+		_, err = orcraft.PublishTenantCommand(tenant.ID, "ack-recovery", ack)
 	} else {
-		_, err = logic.AcknowledgeAllRecoveries(userId, comment)
+		_, err = tenant.AcknowledgeAllRecoveries(userId, comment)
 	}
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: "Acknowledged all recoveries", Details: comment})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Acknowledged all recoveries", Details: comment})
 }
 
 // BlockedRecoveries reads list of currently blocked recoveries, optionally filtered by cluster name
 func (this *HttpAPI) BlockedRecoveries(w http.ResponseWriter, r *http.Request) {
-	blockedRecoveries, err := logic.ReadBlockedRecoveries(chi.URLParam(r, "clusterName"))
+	tenant := tenantOf(r)
+	blockedRecoveries, err := tenant.ReadBlockedRecoveries(chi.URLParam(r, "clusterName"))
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	renderJSON(w, http.StatusOK, blockedRecoveries)
+	renderTenantJSON(w, r, http.StatusOK, blockedRecoveries)
 }
 
 // DisableGlobalRecoveries globally disables recoveries
 func (this *HttpAPI) DisableGlobalRecoveries(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
 
 	var err error
 	if orcraft.IsRaftEnabled() {
-		_, err = orcraft.PublishCommand("disable-global-recoveries", 0)
+		_, err = orcraft.PublishTenantCommand(tenant.ID, "disable-global-recoveries", 0)
 	} else {
-		err = logic.DisableRecovery()
+		err = tenant.DisableRecovery()
 	}
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: "Globally disabled recoveries", Details: "disabled"})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Globally disabled recoveries", Details: "disabled"})
 }
 
 // EnableGlobalRecoveries globally enables recoveries
 func (this *HttpAPI) EnableGlobalRecoveries(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantOf(r)
 	if !isAuthorizedForAction(r) {
-		Respond(w, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
 	}
 
 	var err error
 	if orcraft.IsRaftEnabled() {
-		_, err = orcraft.PublishCommand("enable-global-recoveries", 0)
+		_, err = orcraft.PublishTenantCommand(tenant.ID, "enable-global-recoveries", 0)
 	} else {
-		err = logic.EnableRecovery()
+		err = tenant.EnableRecovery()
 	}
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	Respond(w, &APIResponse{Code: OK, Message: "Globally enabled recoveries", Details: "enabled"})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: "Globally enabled recoveries", Details: "enabled"})
 }
 
 // CheckGlobalRecoveries checks whether
 func (this *HttpAPI) CheckGlobalRecoveries(w http.ResponseWriter, r *http.Request) {
-	isDisabled, err := logic.IsRecoveryDisabled()
+	tenant := tenantOf(r)
+	isDisabled, err := tenant.IsRecoveryDisabled()
 
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 	details := "enabled"
 	if isDisabled {
 		details = "disabled"
 	}
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Global recoveries %+v", details), Details: details})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Global recoveries %+v", details), Details: details})
 }
 
 func (this *HttpAPI) getSynonymPath(path string) (synonymPath string) {
@@ -3788,66 +3949,103 @@ func (this *HttpAPI) getSynonymPath(path string) (synonymPath string) {
 	return synonymPath
 }
 
-func (this *HttpAPI) registerSingleAPIRequest(router chi.Router, path string, handler http.HandlerFunc, allowProxy bool) {
-	registeredPaths = append(registeredPaths, path)
-	fullPath := fmt.Sprintf("%s/api/%s", this.URLPrefix, path)
+// tenantMiddleware resolves the tenant of the requests of the tenant-scoped routes.
+func (this *HttpAPI) tenantMiddleware() func(http.Handler) http.Handler {
+	return tenantMiddleware(func() *logic.TenantManager { return managerOf(this.Manager) }, styleV1)
+}
 
+// registerRoute registers one GET route: behind the tenant middleware if it is
+// tenant-scoped, then behind the Raft reverse proxy if allowProxy and Raft is enabled.
+func (this *HttpAPI) registerRoute(router chi.Router, fullPath string, handler http.HandlerFunc, allowProxy bool, tenantScoped bool) {
+	var middlewares []func(http.Handler) http.Handler
+	if tenantScoped {
+		middlewares = append(middlewares, this.tenantMiddleware())
+	}
 	if allowProxy && config.Config.RaftEnabled {
-		router.With(raftReverseProxyMiddleware).Get(fullPath, handler)
-	} else {
+		middlewares = append(middlewares, raftReverseProxyMiddleware)
+	}
+	if len(middlewares) == 0 {
 		router.Get(fullPath, handler)
+		return
+	}
+	router.With(middlewares...).Get(fullPath, handler)
+}
+
+// registerSingleAPIRequest registers path under /api. A tenant-scoped path is
+// registered twice: in its legacy form, /api/<path>, whose tenant is the implicit
+// tenant unless the request names one (header or query), and in its canonical
+// form, /api/tenants/{tenantId}/<path>. A global path has the legacy form only.
+func (this *HttpAPI) registerSingleAPIRequest(router chi.Router, path string, handler http.HandlerFunc, allowProxy bool, tenantScoped bool) {
+	registeredPaths = append(registeredPaths, path)
+	this.registerRoute(router, fmt.Sprintf("%s/api/%s", this.URLPrefix, path), handler, allowProxy, tenantScoped)
+	if tenantScoped {
+		this.registerRoute(router, fmt.Sprintf("%s/api/tenants/{%s}/%s", this.URLPrefix, tenantPathParam, path), handler, allowProxy, true)
 	}
 }
 
 // ProxySQLServers returns all servers from ProxySQL's runtime_mysql_servers table.
 func (this *HttpAPI) ProxySQLServers(w http.ResponseWriter, r *http.Request) {
-	hook := proxysql.GetHook()
+	hook := tenantOf(r).ProxySQL
 	if hook == nil || !hook.IsConfigured() {
-		Respond(w, &APIResponse{Code: ERROR, Message: "ProxySQL is not configured"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "ProxySQL is not configured"})
 		return
 	}
 	servers, err := hook.GetClient().GetServers()
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Failed to query ProxySQL servers: %v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Failed to query ProxySQL servers: %v", err)})
 		return
 	}
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Found %d servers", len(servers)), Details: servers})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Found %d servers", len(servers)), Details: servers})
 }
 
 // ProxySQLServersByHostgroup returns servers for a specific hostgroup from ProxySQL.
 func (this *HttpAPI) ProxySQLServersByHostgroup(w http.ResponseWriter, r *http.Request) {
-	hook := proxysql.GetHook()
+	hook := tenantOf(r).ProxySQL
 	if hook == nil || !hook.IsConfigured() {
-		Respond(w, &APIResponse{Code: ERROR, Message: "ProxySQL is not configured"})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: "ProxySQL is not configured"})
 		return
 	}
 	hostgroupID, err := strconv.Atoi(chi.URLParam(r, "hostgroup"))
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Invalid hostgroup ID: %v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Invalid hostgroup ID: %v", err)})
 		return
 	}
 	servers, err := hook.GetClient().GetServersByHostgroup(hostgroupID)
 	if err != nil {
-		Respond(w, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Failed to query ProxySQL servers: %v", err)})
+		respondTenant(w, r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Failed to query ProxySQL servers: %v", err)})
 		return
 	}
-	Respond(w, &APIResponse{Code: OK, Message: fmt.Sprintf("Found %d servers in hostgroup %d", len(servers), hostgroupID), Details: servers})
+	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("Found %d servers in hostgroup %d", len(servers), hostgroupID), Details: servers})
 }
 
-func (this *HttpAPI) registerAPIRequestInternal(router chi.Router, path string, handler http.HandlerFunc, allowProxy bool) {
-	this.registerSingleAPIRequest(router, path, handler, allowProxy)
+func (this *HttpAPI) registerAPIRequestInternal(router chi.Router, path string, handler http.HandlerFunc, allowProxy bool, tenantScoped bool) {
+	this.registerSingleAPIRequest(router, path, handler, allowProxy, tenantScoped)
 
 	if synonym := this.getSynonymPath(path); synonym != "" {
-		this.registerSingleAPIRequest(router, synonym, handler, allowProxy)
+		this.registerSingleAPIRequest(router, synonym, handler, allowProxy, tenantScoped)
 	}
 }
 
+// registerAPIRequest registers a tenant-scoped route, delegated to the Raft leader.
 func (this *HttpAPI) registerAPIRequest(router chi.Router, path string, handler http.HandlerFunc) {
-	this.registerAPIRequestInternal(router, path, handler, true)
+	this.registerAPIRequestInternal(router, path, handler, true, true)
 }
 
+// registerAPIRequestNoProxy registers a tenant-scoped route that is served locally.
 func (this *HttpAPI) registerAPIRequestNoProxy(router chi.Router, path string, handler http.HandlerFunc) {
-	this.registerAPIRequestInternal(router, path, handler, false)
+	this.registerAPIRequestInternal(router, path, handler, false, true)
+}
+
+// registerGlobalAPIRequest registers a route that belongs to the process, not to
+// a tenant (Raft, election, agents...), delegated to the Raft leader. It has no
+// tenant form and does not resolve a tenant.
+func (this *HttpAPI) registerGlobalAPIRequest(router chi.Router, path string, handler http.HandlerFunc) {
+	this.registerAPIRequestInternal(router, path, handler, true, false)
+}
+
+// registerGlobalAPIRequestNoProxy is registerGlobalAPIRequest for routes served locally.
+func (this *HttpAPI) registerGlobalAPIRequestNoProxy(router chi.Router, path string, handler http.HandlerFunc) {
+	this.registerAPIRequestInternal(router, path, handler, false, false)
 }
 
 // RegisterRequests makes for the de-facto list of known API calls
@@ -4058,31 +4256,34 @@ func (this *HttpAPI) RegisterRequests(router chi.Router) {
 	this.registerAPIRequest(router, "audit/instance/{host}/{port}/{page}", this.Audit)
 	this.registerAPIRequest(router, "resolve/{host}/{port}", this.Resolve)
 
+	// Tenants of the process (global, node-local)
+	this.registerGlobalAPIRequestNoProxy(router, "tenants", this.ListTenants)
+
 	// Meta, no proxy
-	this.registerAPIRequestNoProxy(router, "headers", this.Headers)
-	this.registerAPIRequestNoProxy(router, "health", this.Health)
-	this.registerAPIRequestNoProxy(router, "lb-check", this.LBCheck)
-	this.registerAPIRequestNoProxy(router, "_ping", this.LBCheck)
-	this.registerAPIRequestNoProxy(router, "leader-check", this.LeaderCheck)
-	this.registerAPIRequestNoProxy(router, "leader-check/{errorStatusCode}", this.LeaderCheck)
-	this.registerAPIRequestNoProxy(router, "grab-election", this.GrabElection)
-	this.registerAPIRequest(router, "raft-add-peer/{addr}", this.RaftAddPeer)       // delegated to the raft leader
-	this.registerAPIRequest(router, "raft-remove-peer/{addr}", this.RaftRemovePeer) // delegated to the raft leader
-	this.registerAPIRequestNoProxy(router, "raft-yield/{node}", this.RaftYield)
-	this.registerAPIRequestNoProxy(router, "raft-yield-hint/{hint}", this.RaftYieldHint)
-	this.registerAPIRequestNoProxy(router, "raft-peers", this.RaftPeers)
-	this.registerAPIRequestNoProxy(router, "raft-state", this.RaftState)
-	this.registerAPIRequestNoProxy(router, "raft-leader", this.RaftLeader)
-	this.registerAPIRequestNoProxy(router, "raft-health", this.RaftHealth)
-	this.registerAPIRequestNoProxy(router, "raft-status", this.RaftStatus)
-	this.registerAPIRequestNoProxy(router, "raft-snapshot", this.RaftSnapshot)
-	this.registerAPIRequestNoProxy(router, "raft-follower-health-report/{authenticationToken}/{raftBind}/{raftAdvertise}", this.RaftFollowerHealthReport)
-	this.registerAPIRequestNoProxy(router, "reload-configuration", this.ReloadConfiguration)
+	this.registerGlobalAPIRequestNoProxy(router, "headers", this.Headers)
+	this.registerGlobalAPIRequestNoProxy(router, "health", this.Health)
+	this.registerGlobalAPIRequestNoProxy(router, "lb-check", this.LBCheck)
+	this.registerGlobalAPIRequestNoProxy(router, "_ping", this.LBCheck)
+	this.registerGlobalAPIRequestNoProxy(router, "leader-check", this.LeaderCheck)
+	this.registerGlobalAPIRequestNoProxy(router, "leader-check/{errorStatusCode}", this.LeaderCheck)
+	this.registerGlobalAPIRequestNoProxy(router, "grab-election", this.GrabElection)
+	this.registerGlobalAPIRequest(router, "raft-add-peer/{addr}", this.RaftAddPeer)       // delegated to the raft leader
+	this.registerGlobalAPIRequest(router, "raft-remove-peer/{addr}", this.RaftRemovePeer) // delegated to the raft leader
+	this.registerGlobalAPIRequestNoProxy(router, "raft-yield/{node}", this.RaftYield)
+	this.registerGlobalAPIRequestNoProxy(router, "raft-yield-hint/{hint}", this.RaftYieldHint)
+	this.registerGlobalAPIRequestNoProxy(router, "raft-peers", this.RaftPeers)
+	this.registerGlobalAPIRequestNoProxy(router, "raft-state", this.RaftState)
+	this.registerGlobalAPIRequestNoProxy(router, "raft-leader", this.RaftLeader)
+	this.registerGlobalAPIRequestNoProxy(router, "raft-health", this.RaftHealth)
+	this.registerGlobalAPIRequestNoProxy(router, "raft-status", this.RaftStatus)
+	this.registerGlobalAPIRequestNoProxy(router, "raft-snapshot", this.RaftSnapshot)
+	this.registerGlobalAPIRequestNoProxy(router, "raft-follower-health-report/{authenticationToken}/{raftBind}/{raftAdvertise}", this.RaftFollowerHealthReport)
+	this.registerGlobalAPIRequestNoProxy(router, "reload-configuration", this.ReloadConfiguration)
 	this.registerAPIRequestNoProxy(router, "hostname-resolve-cache", this.HostnameResolveCache)
 	this.registerAPIRequestNoProxy(router, "reset-hostname-resolve-cache", this.ResetHostnameResolveCache)
 	// Meta
-	this.registerAPIRequest(router, "routed-leader-check", this.LeaderCheck)
-	this.registerAPIRequest(router, "reelect", this.Reelect)
+	this.registerGlobalAPIRequest(router, "routed-leader-check", this.LeaderCheck)
+	this.registerGlobalAPIRequest(router, "reelect", this.Reelect)
 	this.registerAPIRequest(router, "reload-cluster-alias", this.ReloadClusterAlias)
 	this.registerAPIRequest(router, "deregister-hostname-unresolve/{host}/{port}", this.DeregisterHostnameUnresolve)
 	this.registerAPIRequest(router, "register-hostname-unresolve/{host}/{port}/{virtualname}", this.RegisterHostnameUnresolve)
@@ -4103,23 +4304,24 @@ func (this *HttpAPI) RegisterRequests(router chi.Router) {
 	this.registerAPIRequest(router, "write-buffer-metrics-raw/{seconds}", this.WriteBufferMetricsRaw)
 	this.registerAPIRequest(router, "write-buffer-metrics-aggregated/{seconds}", this.WriteBufferMetricsAggregated)
 
-	// Agents
-	this.registerAPIRequest(router, "agents", this.Agents)
-	this.registerAPIRequest(router, "agent/{host}", this.Agent)
-	this.registerAPIRequest(router, "agent-umount/{host}", this.AgentUnmount)
-	this.registerAPIRequest(router, "agent-mount/{host}", this.AgentMountLV)
-	this.registerAPIRequest(router, "agent-create-snapshot/{host}", this.AgentCreateSnapshot)
-	this.registerAPIRequest(router, "agent-removelv/{host}", this.AgentRemoveLV)
-	this.registerAPIRequest(router, "agent-mysql-stop/{host}", this.AgentMySQLStop)
-	this.registerAPIRequest(router, "agent-mysql-start/{host}", this.AgentMySQLStart)
-	this.registerAPIRequest(router, "agent-seed/{targetHost}/{sourceHost}", this.AgentSeed)
-	this.registerAPIRequest(router, "agent-active-seeds/{host}", this.AgentActiveSeeds)
-	this.registerAPIRequest(router, "agent-recent-seeds/{host}", this.AgentRecentSeeds)
-	this.registerAPIRequest(router, "agent-seed-details/{seedId}", this.AgentSeedDetails)
-	this.registerAPIRequest(router, "agent-seed-states/{seedId}", this.AgentSeedStates)
-	this.registerAPIRequest(router, "agent-abort-seed/{seedId}", this.AbortSeed)
-	this.registerAPIRequest(router, "agent-custom-command/{host}/{command}", this.AgentCustomCommand)
-	this.registerAPIRequest(router, "seeds", this.Seeds)
+	// Agents and seeds: out of the multi-tenant scope of v1. They are global routes that
+	// keep using the process-wide (default) backend through the agent package.
+	this.registerGlobalAPIRequest(router, "agents", this.Agents)
+	this.registerGlobalAPIRequest(router, "agent/{host}", this.Agent)
+	this.registerGlobalAPIRequest(router, "agent-umount/{host}", this.AgentUnmount)
+	this.registerGlobalAPIRequest(router, "agent-mount/{host}", this.AgentMountLV)
+	this.registerGlobalAPIRequest(router, "agent-create-snapshot/{host}", this.AgentCreateSnapshot)
+	this.registerGlobalAPIRequest(router, "agent-removelv/{host}", this.AgentRemoveLV)
+	this.registerGlobalAPIRequest(router, "agent-mysql-stop/{host}", this.AgentMySQLStop)
+	this.registerGlobalAPIRequest(router, "agent-mysql-start/{host}", this.AgentMySQLStart)
+	this.registerGlobalAPIRequest(router, "agent-seed/{targetHost}/{sourceHost}", this.AgentSeed)
+	this.registerGlobalAPIRequest(router, "agent-active-seeds/{host}", this.AgentActiveSeeds)
+	this.registerGlobalAPIRequest(router, "agent-recent-seeds/{host}", this.AgentRecentSeeds)
+	this.registerGlobalAPIRequest(router, "agent-seed-details/{seedId}", this.AgentSeedDetails)
+	this.registerGlobalAPIRequest(router, "agent-seed-states/{seedId}", this.AgentSeedStates)
+	this.registerGlobalAPIRequest(router, "agent-abort-seed/{seedId}", this.AbortSeed)
+	this.registerGlobalAPIRequest(router, "agent-custom-command/{host}/{command}", this.AgentCustomCommand)
+	this.registerGlobalAPIRequest(router, "seeds", this.Seeds)
 
 	// ProxySQL topology
 	this.registerAPIRequest(router, "proxysql/servers", this.ProxySQLServers)
@@ -4127,7 +4329,7 @@ func (this *HttpAPI) RegisterRequests(router chi.Router) {
 
 	// Configurable status check endpoint
 	if config.Config.StatusEndpoint == config.DefaultStatusAPIEndpoint {
-		this.registerAPIRequestNoProxy(router, "status", this.StatusCheck)
+		this.registerGlobalAPIRequestNoProxy(router, "status", this.StatusCheck)
 	} else {
 		router.Get(config.Config.StatusEndpoint, this.StatusCheck)
 	}

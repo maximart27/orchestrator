@@ -107,7 +107,7 @@ func V2Clusters(w http.ResponseWriter, r *http.Request) {
 // V2ClusterInfo returns detailed information about a specific cluster.
 func V2ClusterInfo(w http.ResponseWriter, r *http.Request) {
 	clusterName := chi.URLParam(r, "name")
-	clusterName, err := figureClusterName(clusterName)
+	clusterName, err := figureClusterName(tenantOf(r), clusterName)
 	if err != nil {
 		respondNotFound(w, fmt.Sprintf("Cluster not found: %v", err))
 		return
@@ -123,7 +123,7 @@ func V2ClusterInfo(w http.ResponseWriter, r *http.Request) {
 // V2ClusterInstances returns all instances belonging to a given cluster.
 func V2ClusterInstances(w http.ResponseWriter, r *http.Request) {
 	clusterName := chi.URLParam(r, "name")
-	clusterName, err := figureClusterName(clusterName)
+	clusterName, err := figureClusterName(tenantOf(r), clusterName)
 	if err != nil {
 		respondNotFound(w, fmt.Sprintf("Cluster not found: %v", err))
 		return
@@ -166,7 +166,7 @@ func V2Instance(w http.ResponseWriter, r *http.Request) {
 // V2Topology returns the ASCII topology representation for a given cluster.
 func V2Topology(w http.ResponseWriter, r *http.Request) {
 	clusterName := chi.URLParam(r, "name")
-	clusterName, err := figureClusterName(clusterName)
+	clusterName, err := figureClusterName(tenantOf(r), clusterName)
 	if err != nil {
 		respondNotFound(w, fmt.Sprintf("Cluster not found: %v", err))
 		return
