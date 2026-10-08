@@ -17,19 +17,37 @@
 package inst
 
 import (
+	"errors"
+
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
-	"github.com/proxysql/orchestrator/go/db"
+	"github.com/proxysql/orchestrator/go/config"
 )
 
 // MySQLProvider implements DatabaseProvider for MySQL and MySQL-compatible
 // databases (MariaDB, Percona Server, etc.). It delegates to the existing
 // orchestrator DAO functions.
-type MySQLProvider struct{}
+type MySQLProvider struct {
+	cfg   *config.Configuration
+	store *Store
+}
 
-// NewMySQLProvider creates a new MySQL database provider.
-func NewMySQLProvider() *MySQLProvider {
-	return &MySQLProvider{}
+// NewMySQLProvider creates a MySQL database provider for the tenant configuration
+// cfg (without one, the pre-multi-tenant signature, the legacy global
+// configuration). A Store binds itself to the providers it creates (see
+// NewStore); an unbound provider can only answer ProviderName.
+func NewMySQLProvider(cfg ...*config.Configuration) *MySQLProvider {
+	if len(cfg) == 0 || cfg[0] == nil {
+		return &MySQLProvider{cfg: legacyConfig()}
+	}
+	return &MySQLProvider{cfg: cfg[0]}
+}
+
+func (p *MySQLProvider) boundStore() (*Store, error) {
+	if p.store == nil {
+		return nil, errors.New("MySQLProvider is not bound to a Store")
+	}
+	return p.store, nil
 }
 
 // ProviderName returns "mysql".
@@ -40,7 +58,11 @@ func (p *MySQLProvider) ProviderName() string {
 // GetReplicationStatus retrieves the replication state for a MySQL instance
 // by reading the topology and mapping it to a database-agnostic ReplicationStatus.
 func (p *MySQLProvider) GetReplicationStatus(key InstanceKey) (*ReplicationStatus, error) {
-	instance, err := ReadTopologyInstance(&key)
+	store, err := p.boundStore()
+	if err != nil {
+		return nil, log.Errore(err)
+	}
+	instance, err := store.ReadTopologyInstance(&key)
 	if err != nil {
 		return nil, log.Errore(err)
 	}
@@ -67,7 +89,11 @@ func (p *MySQLProvider) GetReplicationStatus(key InstanceKey) (*ReplicationStatu
 // IsReplicaRunning checks whether replication is actively running on the
 // given MySQL instance.
 func (p *MySQLProvider) IsReplicaRunning(key InstanceKey) (bool, error) {
-	instance, err := ReadTopologyInstance(&key)
+	store, err := p.boundStore()
+	if err != nil {
+		return false, log.Errore(err)
+	}
+	instance, err := store.ReadTopologyInstance(&key)
 	if err != nil {
 		return false, log.Errore(err)
 	}
@@ -77,13 +103,21 @@ func (p *MySQLProvider) IsReplicaRunning(key InstanceKey) (bool, error) {
 // SetReadOnly sets or clears the global read_only variable on a MySQL instance.
 // This delegates to the existing SetReadOnly function.
 func (p *MySQLProvider) SetReadOnly(key InstanceKey, readOnly bool) error {
-	_, err := SetReadOnly(&key, readOnly)
+	store, err := p.boundStore()
+	if err != nil {
+		return err
+	}
+	_, err = store.SetReadOnly(&key, readOnly)
 	return err
 }
 
 // IsReadOnly checks whether a MySQL instance has global read_only enabled.
 func (p *MySQLProvider) IsReadOnly(key InstanceKey) (bool, error) {
-	sqlDB, err := db.OpenTopology(key.Hostname, key.Port)
+	store, err := p.boundStore()
+	if err != nil {
+		return false, log.Errore(err)
+	}
+	sqlDB, err := store.backend.OpenTopology(key.Hostname, key.Port)
 	if err != nil {
 		return false, log.Errore(err)
 	}
@@ -101,14 +135,22 @@ func (p *MySQLProvider) IsReadOnly(key InstanceKey) (bool, error) {
 // StartReplication starts the replication threads on the given MySQL instance.
 // This delegates to the existing StartReplication function.
 func (p *MySQLProvider) StartReplication(key InstanceKey) error {
-	_, err := StartReplication(&key)
+	store, err := p.boundStore()
+	if err != nil {
+		return err
+	}
+	_, err = store.StartReplication(&key)
 	return err
 }
 
 // StopReplication stops the replication threads on the given MySQL instance.
 // This delegates to the existing StopReplication function.
 func (p *MySQLProvider) StopReplication(key InstanceKey) error {
-	_, err := StopReplication(&key)
+	store, err := p.boundStore()
+	if err != nil {
+		return err
+	}
+	_, err = store.StopReplication(&key)
 	return err
 }
 

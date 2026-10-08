@@ -21,14 +21,12 @@ import (
 
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
-	"github.com/proxysql/orchestrator/go/config"
-	"github.com/proxysql/orchestrator/go/db"
 )
 
 // writePoolInstances will write (and override) a single cluster name mapping
-func writePoolInstances(pool string, instanceKeys [](*InstanceKey)) error {
+func (s *Store) writePoolInstances(pool string, instanceKeys [](*InstanceKey)) error {
 	writeFunc := func() error {
-		dbh, err := db.OpenOrchestrator()
+		dbh, err := s.backend.Open()
 		if err != nil {
 			return log.Errore(err)
 		}
@@ -50,11 +48,11 @@ func writePoolInstances(pool string, instanceKeys [](*InstanceKey)) error {
 
 		return nil
 	}
-	return ExecDBWriteFunc(writeFunc)
+	return s.ExecDBWriteFunc(writeFunc)
 }
 
 // ReadClusterPoolInstances reads cluster-pool-instance associationsfor given cluster and pool
-func ReadClusterPoolInstances(clusterName string, pool string) (result [](*ClusterPoolInstance), err error) {
+func (s *Store) ReadClusterPoolInstances(clusterName string, pool string) (result [](*ClusterPoolInstance), err error) {
 	args := sqlutils.Args()
 	whereClause := ``
 	if clusterName != "" {
@@ -76,7 +74,7 @@ func ReadClusterPoolInstances(clusterName string, pool string) (result [](*Clust
 			left join cluster_alias using (cluster_name)
 		%s
 		`, whereClause)
-	err = db.QueryOrchestrator(query, args, func(m sqlutils.RowMap) error {
+	err = s.backend.Query(query, args, func(m sqlutils.RowMap) error {
 		clusterPoolInstance := ClusterPoolInstance{
 			ClusterName:  m.GetString("cluster_name"),
 			ClusterAlias: m.GetString("alias"),
@@ -96,16 +94,16 @@ func ReadClusterPoolInstances(clusterName string, pool string) (result [](*Clust
 }
 
 // ReadAllClusterPoolInstances returns all clusters-pools-insatnces associations
-func ReadAllClusterPoolInstances() ([](*ClusterPoolInstance), error) {
-	return ReadClusterPoolInstances("", "")
+func (s *Store) ReadAllClusterPoolInstances() ([](*ClusterPoolInstance), error) {
+	return s.ReadClusterPoolInstances("", "")
 }
 
 // ReadClusterPoolInstancesMap returns association of pools-to-instances for a given cluster
 // and potentially for a given pool.
-func ReadClusterPoolInstancesMap(clusterName string, pool string) (*PoolInstancesMap, error) {
+func (s *Store) ReadClusterPoolInstancesMap(clusterName string, pool string) (*PoolInstancesMap, error) {
 	var poolInstancesMap = make(PoolInstancesMap)
 
-	clusterPoolInstances, err := ReadClusterPoolInstances(clusterName, pool)
+	clusterPoolInstances, err := s.ReadClusterPoolInstances(clusterName, pool)
 	if err != nil {
 		return nil, nil
 	}
@@ -119,7 +117,7 @@ func ReadClusterPoolInstancesMap(clusterName string, pool string) (*PoolInstance
 	return &poolInstancesMap, nil
 }
 
-func ReadAllPoolInstancesSubmissions() ([]PoolInstancesSubmission, error) {
+func (s *Store) ReadAllPoolInstancesSubmissions() ([]PoolInstancesSubmission, error) {
 	result := []PoolInstancesSubmission{}
 	query := `
 		select
@@ -131,7 +129,7 @@ func ReadAllPoolInstancesSubmissions() ([]PoolInstancesSubmission, error) {
 		group by
 			pool
 	`
-	err := db.QueryOrchestrator(query, sqlutils.Args(), func(m sqlutils.RowMap) error {
+	err := s.backend.Query(query, sqlutils.Args(), func(m sqlutils.RowMap) error {
 		submission := PoolInstancesSubmission{}
 		submission.Pool = m.GetString("pool")
 		submission.CreatedAt = m.GetTime("registered_at")
@@ -145,14 +143,14 @@ func ReadAllPoolInstancesSubmissions() ([]PoolInstancesSubmission, error) {
 }
 
 // ExpirePoolInstances cleans up the database_instance_pool table from expired items
-func ExpirePoolInstances() error {
-	_, err := db.ExecOrchestrator(`
+func (s *Store) ExpirePoolInstances() error {
+	_, err := s.backend.Exec(`
 			delete
 				from database_instance_pool
 			where
 				registered_at < now() - interval ? minute
 			`,
-		config.Config.InstancePoolExpiryMinutes,
+		s.cfg.InstancePoolExpiryMinutes,
 	)
 	return log.Errore(err)
 }

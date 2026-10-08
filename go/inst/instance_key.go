@@ -18,7 +18,6 @@ package inst
 
 import (
 	"fmt"
-	"github.com/proxysql/orchestrator/go/config"
 	"regexp"
 	"strconv"
 	"strings"
@@ -40,27 +39,27 @@ var (
 
 const detachHint = "//"
 
-func newInstanceKey(hostname string, port int, resolve bool) (instanceKey *InstanceKey, err error) {
+func (s *Store) newInstanceKey(hostname string, port int, resolve bool) (instanceKey *InstanceKey, err error) {
 	if hostname == "" {
 		return instanceKey, fmt.Errorf("NewResolveInstanceKey: Empty hostname")
 	}
 
 	instanceKey = &InstanceKey{Hostname: hostname, Port: port}
 	if resolve {
-		instanceKey, err = instanceKey.ResolveHostname()
+		instanceKey, err = s.InstanceKeyResolveHostname(instanceKey)
 	}
 	return instanceKey, err
 }
 
 // newInstanceKeyStrings
-func newInstanceKeyStrings(hostname string, port string, resolve bool) (*InstanceKey, error) {
+func (s *Store) newInstanceKeyStrings(hostname string, port string, resolve bool) (*InstanceKey, error) {
 	if portInt, err := strconv.Atoi(port); err != nil {
 		return nil, fmt.Errorf("Invalid port: %s", port)
 	} else {
-		return newInstanceKey(hostname, portInt, resolve)
+		return s.newInstanceKey(hostname, portInt, resolve)
 	}
 }
-func parseRawInstanceKey(hostPort string, resolve bool) (instanceKey *InstanceKey, err error) {
+func (s *Store) parseRawInstanceKey(hostPort string, resolve bool) (instanceKey *InstanceKey, err error) {
 	hostname := ""
 	port := ""
 	if submatch := ipv4HostPortRegexp.FindStringSubmatch(hostPort); len(submatch) > 0 {
@@ -77,39 +76,39 @@ func parseRawInstanceKey(hostPort string, resolve bool) (instanceKey *InstanceKe
 		return nil, fmt.Errorf("Cannot parse address: %s", hostPort)
 	}
 	if port == "" {
-		port = fmt.Sprintf("%d", config.Config.DefaultInstancePort)
+		port = fmt.Sprintf("%d", s.cfg.DefaultInstancePort)
 	}
-	return newInstanceKeyStrings(hostname, port, resolve)
+	return s.newInstanceKeyStrings(hostname, port, resolve)
 }
 
-func NewResolveInstanceKey(hostname string, port int) (instanceKey *InstanceKey, err error) {
-	return newInstanceKey(hostname, port, true)
-}
-
-// NewResolveInstanceKeyStrings creates and resolves a new instance key based on string params
-func NewResolveInstanceKeyStrings(hostname string, port string) (*InstanceKey, error) {
-	return newInstanceKeyStrings(hostname, port, true)
-}
-
-func ParseResolveInstanceKey(hostPort string) (instanceKey *InstanceKey, err error) {
-	return parseRawInstanceKey(hostPort, true)
-}
-
-func ParseRawInstanceKey(hostPort string) (instanceKey *InstanceKey, err error) {
-	return parseRawInstanceKey(hostPort, false)
+func (s *Store) NewResolveInstanceKey(hostname string, port int) (instanceKey *InstanceKey, err error) {
+	return s.newInstanceKey(hostname, port, true)
 }
 
 // NewResolveInstanceKeyStrings creates and resolves a new instance key based on string params
-func NewRawInstanceKeyStrings(hostname string, port string) (*InstanceKey, error) {
-	return newInstanceKeyStrings(hostname, port, false)
+func (s *Store) NewResolveInstanceKeyStrings(hostname string, port string) (*InstanceKey, error) {
+	return s.newInstanceKeyStrings(hostname, port, true)
 }
 
-func (this *InstanceKey) ResolveHostname() (*InstanceKey, error) {
+func (s *Store) ParseResolveInstanceKey(hostPort string) (instanceKey *InstanceKey, err error) {
+	return s.parseRawInstanceKey(hostPort, true)
+}
+
+func (s *Store) ParseRawInstanceKey(hostPort string) (instanceKey *InstanceKey, err error) {
+	return s.parseRawInstanceKey(hostPort, false)
+}
+
+// NewResolveInstanceKeyStrings creates and resolves a new instance key based on string params
+func (s *Store) NewRawInstanceKeyStrings(hostname string, port string) (*InstanceKey, error) {
+	return s.newInstanceKeyStrings(hostname, port, false)
+}
+
+func (s *Store) InstanceKeyResolveHostname(this *InstanceKey) (*InstanceKey, error) {
 	if !this.IsValid() {
 		return this, nil
 	}
 
-	hostname, err := ResolveHostname(this.Hostname)
+	hostname, err := s.ResolveHostname(this.Hostname)
 	if err == nil {
 		this.Hostname = hostname
 	}

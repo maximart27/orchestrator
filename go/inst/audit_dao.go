@@ -25,18 +25,10 @@ import (
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
 	"github.com/proxysql/orchestrator/go/config"
-	"github.com/proxysql/orchestrator/go/db"
-	"github.com/rcrowley/go-metrics"
 )
 
 // syslogWriter is optional, and defaults to nil (disabled)
 var syslogWriter *syslog.Writer
-
-var auditOperationCounter = metrics.NewCounter()
-
-func init() {
-	_ = metrics.Register("audit.write", auditOperationCounter)
-}
 
 // EnableSyslogWriter enables, if possible, writes to syslog. These will execute _in addition_ to normal logging
 func EnableAuditSyslog() (err error) {
@@ -48,21 +40,21 @@ func EnableAuditSyslog() (err error) {
 }
 
 // AuditOperation creates and writes a new audit entry by given params
-func AuditOperation(auditType string, instanceKey *InstanceKey, message string) error {
+func (s *Store) AuditOperation(auditType string, instanceKey *InstanceKey, message string) error {
 	if instanceKey == nil {
 		instanceKey = &InstanceKey{}
 	}
 	clusterName := ""
 	if instanceKey.Hostname != "" {
-		clusterName, _ = GetClusterName(instanceKey)
+		clusterName, _ = s.GetClusterName(instanceKey)
 	}
 
 	auditWrittenToFile := false
-	if config.Config.AuditLogFile != "" {
+	if s.cfg.AuditLogFile != "" {
 		auditWrittenToFile = true
 		go func() {
 			_ = func() error {
-				f, err := os.OpenFile(config.Config.AuditLogFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0640)
+				f, err := os.OpenFile(s.cfg.AuditLogFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0640)
 				if err != nil {
 					return log.Errore(err)
 				}
@@ -76,8 +68,8 @@ func AuditOperation(auditType string, instanceKey *InstanceKey, message string) 
 			}()
 		}()
 	}
-	if config.Config.AuditToBackendDB {
-		_, err := db.ExecOrchestrator(`
+	if s.cfg.AuditToBackendDB {
+		_, err := s.backend.Exec(`
 			insert
 				into audit (
 					audit_timestamp, audit_type, hostname, port, cluster_name, message
@@ -105,13 +97,13 @@ func AuditOperation(auditType string, instanceKey *InstanceKey, message string) 
 	if !auditWrittenToFile {
 		log.Infof("%s", logMessage)
 	}
-	auditOperationCounter.Inc(1)
+	s.auditOperationCounter.Inc(1)
 
 	return nil
 }
 
 // ReadRecentAudit returns a list of audit entries order chronologically descending, using page number.
-func ReadRecentAudit(instanceKey *InstanceKey, page int) ([]Audit, error) {
+func (s *Store) ReadRecentAudit(instanceKey *InstanceKey, page int) ([]Audit, error) {
 	res := []Audit{}
 	args := sqlutils.Args()
 	whereCondition := ``
@@ -136,7 +128,7 @@ func ReadRecentAudit(instanceKey *InstanceKey, page int) ([]Audit, error) {
 		offset ?
 		`, whereCondition)
 	args = append(args, config.AuditPageSize, page*config.AuditPageSize)
-	err := db.QueryOrchestrator(query, args, func(m sqlutils.RowMap) error {
+	err := s.backend.Query(query, args, func(m sqlutils.RowMap) error {
 		audit := Audit{}
 		audit.AuditId = m.GetInt64("audit_id")
 		audit.AuditTimestamp = m.GetString("audit_timestamp")
@@ -157,6 +149,6 @@ func ReadRecentAudit(instanceKey *InstanceKey, page int) ([]Audit, error) {
 }
 
 // ExpireAudit removes old rows from the audit table
-func ExpireAudit() error {
-	return ExpireTableData("audit", "audit_timestamp")
+func (s *Store) ExpireAudit() error {
+	return s.ExpireTableData("audit", "audit_timestamp")
 }

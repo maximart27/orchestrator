@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/proxysql/orchestrator/go/collection"
-	"github.com/proxysql/orchestrator/go/config"
 
 	"github.com/montanaflynn/stats"
 )
@@ -66,7 +65,7 @@ type AggregatedWriteBufferMetric struct {
 
 // AggregatedSince returns the aggregated query metrics for the period
 // given from the values provided.
-func AggregatedSince(c *collection.Collection, t time.Time) AggregatedWriteBufferMetric {
+func (st *Store) AggregatedSince(c *collection.Collection, t time.Time) AggregatedWriteBufferMetric {
 
 	// Initialise timing metrics
 	var instancesCounter []float64
@@ -76,8 +75,8 @@ func AggregatedSince(c *collection.Collection, t time.Time) AggregatedWriteBuffe
 	// Retrieve values since the time specified
 	values, err := c.Since(t)
 	a := AggregatedWriteBufferMetric{
-		InstanceWriteBufferSize:           config.Config.InstanceWriteBufferSize,
-		InstanceFlushIntervalMilliseconds: config.Config.InstanceFlushIntervalMilliseconds,
+		InstanceWriteBufferSize:           st.cfg.InstanceWriteBufferSize,
+		InstanceFlushIntervalMilliseconds: st.cfg.InstanceFlushIntervalMilliseconds,
 	}
 	if err != nil {
 		return a // empty data

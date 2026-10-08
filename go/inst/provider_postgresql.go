@@ -28,11 +28,19 @@ import (
 
 // PostgreSQLProvider implements DatabaseProvider for PostgreSQL streaming
 // replication topologies.
-type PostgreSQLProvider struct{}
+type PostgreSQLProvider struct {
+	cfg *config.Configuration
+}
 
-// NewPostgreSQLProvider creates a new PostgreSQL database provider.
-func NewPostgreSQLProvider() *PostgreSQLProvider {
-	return &PostgreSQLProvider{}
+// NewPostgreSQLProvider creates a PostgreSQL database provider that connects to
+// the topology with the credentials of cfg, the configuration of ONE tenant.
+// Called without a configuration (the pre-multi-tenant signature) it uses the
+// legacy global one.
+func NewPostgreSQLProvider(cfg ...*config.Configuration) *PostgreSQLProvider {
+	if len(cfg) == 0 || cfg[0] == nil {
+		return &PostgreSQLProvider{cfg: legacyConfig()}
+	}
+	return &PostgreSQLProvider{cfg: cfg[0]}
 }
 
 // ProviderName returns "postgresql".
@@ -40,17 +48,36 @@ func (p *PostgreSQLProvider) ProviderName() string {
 	return "postgresql"
 }
 
-// openPostgreSQLTopology opens a connection to a PostgreSQL instance using
-// credentials from the orchestrator configuration.
-func openPostgreSQLTopology(key InstanceKey) (*sql.DB, error) {
+// postgreSQLTopologyURL builds the connection URL of a PostgreSQL topology
+// instance from the tenant configuration cfg.
+func postgreSQLTopologyURL(cfg *config.Configuration, key InstanceKey) string {
 	u := &url.URL{
 		Scheme:   "postgres",
-		User:     url.UserPassword(config.Config.PostgreSQLTopologyUser, config.Config.PostgreSQLTopologyPassword),
+		User:     url.UserPassword(cfg.PostgreSQLTopologyUser, cfg.PostgreSQLTopologyPassword),
 		Host:     fmt.Sprintf("%s:%d", key.Hostname, key.Port),
 		Path:     "postgres",
-		RawQuery: fmt.Sprintf("sslmode=%s&connect_timeout=5", config.Config.PostgreSQLSSLMode),
+		RawQuery: fmt.Sprintf("sslmode=%s&connect_timeout=5", cfg.PostgreSQLSSLMode),
 	}
-	db, err := sql.Open("postgres", u.String())
+	return u.String()
+}
+
+// postgreSQLPrimaryConnInfo builds the primary_conninfo a standby uses to
+// replicate from primaryKey, with the credentials of the tenant configuration cfg.
+func postgreSQLPrimaryConnInfo(cfg *config.Configuration, primaryKey *InstanceKey) string {
+	return fmt.Sprintf(
+		"host=%s port=%d user=%s password=%s sslmode=%s application_name=orchestrator",
+		primaryKey.Hostname,
+		primaryKey.Port,
+		cfg.PostgreSQLTopologyUser,
+		cfg.PostgreSQLTopologyPassword,
+		cfg.PostgreSQLSSLMode,
+	)
+}
+
+// connectPostgreSQLTopology opens a connection to a PostgreSQL instance using
+// the credentials of the tenant configuration cfg.
+func connectPostgreSQLTopology(cfg *config.Configuration, key InstanceKey) (*sql.DB, error) {
+	db, err := sql.Open("postgres", postgreSQLTopologyURL(cfg, key))
 	if err != nil {
 		return nil, err
 	}
@@ -59,11 +86,21 @@ func openPostgreSQLTopology(key InstanceKey) (*sql.DB, error) {
 	return db, nil
 }
 
+// openPostgreSQLTopology opens a connection to a PostgreSQL instance of this
+// tenant's topology.
+func (s *Store) openPostgreSQLTopology(key InstanceKey) (*sql.DB, error) {
+	return connectPostgreSQLTopology(s.cfg, key)
+}
+
+func (p *PostgreSQLProvider) open(key InstanceKey) (*sql.DB, error) {
+	return connectPostgreSQLTopology(p.cfg, key)
+}
+
 // GetReplicationStatus retrieves the replication state for a PostgreSQL instance.
 // On a standby it queries pg_stat_wal_receiver; on a primary it queries
 // pg_current_wal_lsn().
 func (p *PostgreSQLProvider) GetReplicationStatus(key InstanceKey) (*ReplicationStatus, error) {
-	db, err := openPostgreSQLTopology(key)
+	db, err := p.open(key)
 	if err != nil {
 		return nil, log.Errore(err)
 	}
@@ -149,7 +186,7 @@ func (p *PostgreSQLProvider) getPrimaryReplicationStatus(db *sql.DB) (*Replicati
 // IsReplicaRunning checks whether the WAL receiver is active on a PostgreSQL
 // standby instance.
 func (p *PostgreSQLProvider) IsReplicaRunning(key InstanceKey) (bool, error) {
-	db, err := openPostgreSQLTopology(key)
+	db, err := p.open(key)
 	if err != nil {
 		return false, log.Errore(err)
 	}
@@ -169,7 +206,7 @@ func (p *PostgreSQLProvider) IsReplicaRunning(key InstanceKey) (bool, error) {
 // SetReadOnly sets or clears the default_transaction_read_only parameter on
 // a PostgreSQL instance and reloads the configuration.
 func (p *PostgreSQLProvider) SetReadOnly(key InstanceKey, readOnly bool) error {
-	db, err := openPostgreSQLTopology(key)
+	db, err := p.open(key)
 	if err != nil {
 		return log.Errore(err)
 	}
@@ -191,7 +228,7 @@ func (p *PostgreSQLProvider) SetReadOnly(key InstanceKey, readOnly bool) error {
 // IsReadOnly checks whether default_transaction_read_only is enabled on a
 // PostgreSQL instance.
 func (p *PostgreSQLProvider) IsReadOnly(key InstanceKey) (bool, error) {
-	db, err := openPostgreSQLTopology(key)
+	db, err := p.open(key)
 	if err != nil {
 		return false, log.Errore(err)
 	}
@@ -210,7 +247,7 @@ func (p *PostgreSQLProvider) IsReadOnly(key InstanceKey) (bool, error) {
 func (p *PostgreSQLProvider) StartReplication(key InstanceKey) error {
 	log.Infof("PostgreSQL streaming replication on %s:%d starts automatically; resuming WAL replay if paused", key.Hostname, key.Port)
 
-	db, err := openPostgreSQLTopology(key)
+	db, err := p.open(key)
 	if err != nil {
 		return log.Errore(err)
 	}
@@ -235,7 +272,7 @@ func (p *PostgreSQLProvider) StartReplication(key InstanceKey) error {
 // closest equivalent to stopping replication in MySQL. Note that the WAL
 // receiver (IO thread equivalent) remains connected; only replay is paused.
 func (p *PostgreSQLProvider) StopReplication(key InstanceKey) error {
-	db, err := openPostgreSQLTopology(key)
+	db, err := p.open(key)
 	if err != nil {
 		return log.Errore(err)
 	}

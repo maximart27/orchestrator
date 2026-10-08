@@ -22,7 +22,6 @@ import (
 	"strings"
 
 	"github.com/proxysql/golib/log"
-	"github.com/proxysql/orchestrator/go/config"
 )
 
 // Event entries may contains table IDs (can be different for same tables on different servers)
@@ -147,7 +146,7 @@ func (this *BinlogEventCursor) nextEvent(numEmptyEventsEvents int) (*BinlogEvent
 
 // NextRealEvent returns the next event from binlog that is not meta/control event (these are start-of-binary-log,
 // rotate-binary-log etc.)
-func (this *BinlogEventCursor) nextRealEvent(recursionLevel int) (*BinlogEvent, error) {
+func (s *Store) binlogEventCursorNextRealEvent(this *BinlogEventCursor, recursionLevel int) (*BinlogEvent, error) {
 	if recursionLevel > maxEmptyEventsEvents {
 		log.Debugf("End of real events")
 		return nil, nil
@@ -163,12 +162,12 @@ func (this *BinlogEventCursor) nextRealEvent(recursionLevel int) (*BinlogEvent, 
 	if _, found := skippedEventTypes[event.EventType]; found {
 		// Recursion will not be deep here. A few entries (end-of-binlog followed by start-of-bin-log) are possible,
 		// but we really don't expect a huge sequence of those.
-		return this.nextRealEvent(recursionLevel + 1)
+		return s.binlogEventCursorNextRealEvent(this, recursionLevel+1)
 	}
-	for _, skipSubstring := range config.Config.SkipBinlogEventsContaining {
+	for _, skipSubstring := range s.cfg.SkipBinlogEventsContaining {
 		if strings.Contains(event.Info, skipSubstring) {
 			// Recursion might go deeper here.
-			return this.nextRealEvent(recursionLevel + 1)
+			return s.binlogEventCursorNextRealEvent(this, recursionLevel+1)
 		}
 	}
 	event.NormalizeInfo()

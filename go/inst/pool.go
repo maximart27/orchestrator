@@ -20,8 +20,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/proxysql/orchestrator/go/config"
-
 	"github.com/proxysql/golib/log"
 )
 
@@ -52,8 +50,8 @@ type ClusterPoolInstance struct {
 	Port         int
 }
 
-func ApplyPoolInstances(submission *PoolInstancesSubmission) error {
-	if submission.CreatedAt.Add(time.Duration(config.Config.InstancePoolExpiryMinutes) * time.Minute).Before(time.Now()) {
+func (s *Store) ApplyPoolInstances(submission *PoolInstancesSubmission) error {
+	if submission.CreatedAt.Add(time.Duration(s.cfg.InstancePoolExpiryMinutes) * time.Minute).Before(time.Now()) {
 		// already expired; no need to persist
 		return nil
 	}
@@ -62,9 +60,9 @@ func ApplyPoolInstances(submission *PoolInstancesSubmission) error {
 		instancesStrings := strings.Split(submission.DelimitedInstances, ",")
 		for _, instanceString := range instancesStrings {
 			instanceString = strings.TrimSpace(instanceString)
-			instanceKey, err := ParseResolveInstanceKey(instanceString)
-			if config.Config.SupportFuzzyPoolHostnames {
-				instanceKey = ReadFuzzyInstanceKeyIfPossible(instanceKey)
+			instanceKey, err := s.ParseResolveInstanceKey(instanceString)
+			if s.cfg.SupportFuzzyPoolHostnames {
+				instanceKey = s.ReadFuzzyInstanceKeyIfPossible(instanceKey)
 			}
 			if err != nil {
 				return log.Errore(err)
@@ -74,6 +72,6 @@ func ApplyPoolInstances(submission *PoolInstancesSubmission) error {
 		}
 	}
 	log.Debugf("submitting %d instances in %+v pool", len(instanceKeys), submission.Pool)
-	writePoolInstances(submission.Pool, instanceKeys)
+	s.writePoolInstances(submission.Pool, instanceKeys)
 	return nil
 }

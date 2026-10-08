@@ -19,10 +19,8 @@ package inst
 import (
 	"fmt"
 	"regexp"
-	"time"
 
 	"github.com/proxysql/orchestrator/go/config"
-	"github.com/proxysql/orchestrator/go/db"
 	"github.com/proxysql/orchestrator/go/process"
 
 	"github.com/proxysql/orchestrator/go/util"
@@ -30,31 +28,12 @@ import (
 	"github.com/patrickmn/go-cache"
 	"github.com/proxysql/golib/log"
 	"github.com/proxysql/golib/sqlutils"
-	"github.com/rcrowley/go-metrics"
 )
-
-var analysisChangeWriteAttemptCounter = metrics.NewCounter()
-var analysisChangeWriteCounter = metrics.NewCounter()
-
-var recentInstantAnalysis *cache.Cache
-
-func init() {
-	_ = metrics.Register("analysis.change.write.attempt", analysisChangeWriteAttemptCounter)
-	_ = metrics.Register("analysis.change.write", analysisChangeWriteCounter)
-
-	go initializeAnalysisDaoPostConfiguration()
-}
-
-func initializeAnalysisDaoPostConfiguration() {
-	config.WaitForConfigurationToBeLoaded()
-
-	recentInstantAnalysis = cache.New(time.Duration(config.RecoveryPollSeconds*2)*time.Second, time.Second)
-}
 
 // hasPostgreSQLInstances checks whether the orchestrator backend has any
 // instances with provider_type='postgresql'. This is used to decide whether
 // PostgreSQL analysis should be run alongside MySQL analysis.
-func hasPostgreSQLInstances(clusterName string) bool {
+func (s *Store) hasPostgreSQLInstances(clusterName string) bool {
 	query := `SELECT 1 FROM database_instance WHERE provider_type = 'postgresql'`
 	args := sqlutils.Args()
 	if clusterName != "" {
@@ -63,7 +42,7 @@ func hasPostgreSQLInstances(clusterName string) bool {
 	}
 	query += ` LIMIT 1`
 	found := false
-	_ = db.QueryOrchestrator(query, args, func(m sqlutils.RowMap) error {
+	_ = s.backend.Query(query, args, func(m sqlutils.RowMap) error {
 		found = true
 		return nil
 	})
@@ -72,7 +51,7 @@ func hasPostgreSQLInstances(clusterName string) bool {
 
 // hasMySQLInstances checks whether the orchestrator backend has any
 // instances with provider_type='mysql' (or empty, for backward compat).
-func hasMySQLInstances(clusterName string) bool {
+func (s *Store) hasMySQLInstances(clusterName string) bool {
 	query := `SELECT 1 FROM database_instance WHERE provider_type IN ('mysql', '')`
 	args := sqlutils.Args()
 	if clusterName != "" {
@@ -81,19 +60,29 @@ func hasMySQLInstances(clusterName string) bool {
 	}
 	query += ` LIMIT 1`
 	found := false
-	_ = db.QueryOrchestrator(query, args, func(m sqlutils.RowMap) error {
+	_ = s.backend.Query(query, args, func(m sqlutils.RowMap) error {
 		found = true
 		return nil
 	})
 	return found
 }
 
+// analyzesPostgreSQLOnly tells whether the replication analysis of this store is
+// PostgreSQL-only.
+func (s *Store) analyzesPostgreSQLOnly(clusterName string) bool {
+	if !s.legacyMixedProviders {
+		return s.providerType == config.ProviderPostgreSQL
+	}
+	return s.cfg.ProviderType == "postgresql" && !s.hasMySQLInstances(clusterName)
+}
+
 // GetReplicationAnalysis will check for replication problems (dead master; unreachable master; etc)
-func GetReplicationAnalysis(clusterName string, hints *ReplicationAnalysisHints) ([]ReplicationAnalysis, error) {
-	// When the global config is set to "postgresql" and there are no MySQL instances,
-	// use the pure PG path (backward compatibility).
-	if config.Config.ProviderType == "postgresql" && !hasMySQLInstances(clusterName) {
-		return GetPostgreSQLReplicationAnalysis(clusterName, hints)
+func (s *Store) GetReplicationAnalysis(clusterName string, hints *ReplicationAnalysisHints) ([]ReplicationAnalysis, error) {
+	// A PostgreSQL tenant uses the pure PG path. The legacy default store does so
+	// when ProviderType is "postgresql" and there are no MySQL instances
+	// (backward compatibility).
+	if s.analyzesPostgreSQLOnly(clusterName) {
+		return s.GetPostgreSQLReplicationAnalysis(clusterName, hints)
 	}
 
 	// In multi-cluster mode, run both MySQL and PG analysis and merge results.
@@ -101,10 +90,10 @@ func GetReplicationAnalysis(clusterName string, hints *ReplicationAnalysisHints)
 
 	result := []ReplicationAnalysis{}
 
-	args := sqlutils.Args(config.Config.ReasonableLockedSemiSyncMasterSeconds, ValidSecondsFromSeenToLastAttemptedCheck(), config.Config.ReasonableReplicationLagSeconds, clusterName)
+	args := sqlutils.Args(s.cfg.ReasonableLockedSemiSyncMasterSeconds, s.ValidSecondsFromSeenToLastAttemptedCheck(), s.cfg.ReasonableReplicationLagSeconds, clusterName)
 	analysisQueryReductionClause := ``
 
-	if config.Config.ReduceReplicationAnalysisCount {
+	if s.cfg.ReduceReplicationAnalysisCount {
 		analysisQueryReductionClause = `
 			HAVING
 				(
@@ -171,7 +160,7 @@ func GetReplicationAnalysis(clusterName string, hints *ReplicationAnalysisHints)
 					> 0
 				)
 			`
-		args = append(args, ValidSecondsFromSeenToLastAttemptedCheck())
+		args = append(args, s.ValidSecondsFromSeenToLastAttemptedCheck())
 	}
 	// "OR count_replicas > 0" above is a recent addition, which, granted, makes some previous conditions redundant.
 	// It gives more output, and more "NoProblem" messages that I am now interested in for purpose of auditing in database_instance_analysis_changelog
@@ -475,7 +464,7 @@ func GetReplicationAnalysis(clusterName string, hints *ReplicationAnalysisHints)
 	`,
 		analysisQueryReductionClause)
 
-	err := db.QueryOrchestrator(query, args, func(m sqlutils.RowMap) error {
+	err := s.backend.Query(query, args, func(m sqlutils.RowMap) error {
 		a := ReplicationAnalysis{
 			Analysis:               NoProblem,
 			ProcessingNodeHostname: process.ThisHostname,
@@ -515,10 +504,10 @@ func GetReplicationAnalysis(clusterName string, hints *ReplicationAnalysisHints)
 		a.DowntimeEndTimestamp = m.GetString("downtime_end_timestamp")
 		a.DowntimeRemainingSeconds = m.GetInt("downtime_remaining_seconds")
 		a.IsBinlogServer = m.GetBool("is_binlog_server")
-		a.ClusterDetails.ReadRecoveryInfo()
+		s.ClusterInfoReadRecoveryInfo(&a.ClusterDetails)
 
 		a.Replicas = *NewInstanceKeyMap()
-		_ = a.Replicas.ReadCommaDelimitedList(m.GetString("slave_hosts"))
+		_ = s.InstanceKeyMapReadCommaDelimitedList(&a.Replicas, m.GetString("slave_hosts"))
 
 		countValidOracleGTIDReplicas := m.GetUint("count_valid_oracle_gtid_replicas")
 		a.OracleGTIDImmediateTopology = countValidOracleGTIDReplicas == a.CountValidReplicas && a.CountValidReplicas > 0
@@ -603,11 +592,11 @@ func GetReplicationAnalysis(clusterName string, hints *ReplicationAnalysisHints)
 					a.Description = "Semi sync master seems to be locked, more samplings needed to validate"
 				}
 				//
-			} else if config.Config.EnforceExactSemiSyncReplicas && a.IsMaster && a.SemiSyncMasterEnabled && a.SemiSyncMasterStatus && a.SemiSyncMasterWaitForReplicaCount > 0 && a.SemiSyncMasterClients > a.SemiSyncMasterWaitForReplicaCount {
+			} else if s.cfg.EnforceExactSemiSyncReplicas && a.IsMaster && a.SemiSyncMasterEnabled && a.SemiSyncMasterStatus && a.SemiSyncMasterWaitForReplicaCount > 0 && a.SemiSyncMasterClients > a.SemiSyncMasterWaitForReplicaCount {
 				a.Analysis = MasterWithTooManySemiSyncReplicas
 				a.Description = "Semi sync master has more semi sync replicas than configured"
 				//
-			} else if a.IsMaster && a.LastCheckValid && a.IsReadOnly && a.CountValidReplicatingReplicas > 0 && config.Config.RecoverNonWriteableMaster {
+			} else if a.IsMaster && a.LastCheckValid && a.IsReadOnly && a.CountValidReplicatingReplicas > 0 && s.cfg.RecoverNonWriteableMaster {
 				a.Analysis = NoWriteableMasterStructureWarning
 				a.Description = "Master with replicas is read_only"
 				//
@@ -710,7 +699,7 @@ func GetReplicationAnalysis(clusterName string, hints *ReplicationAnalysisHints)
 			if a.Analysis == NoProblem && len(a.StructureAnalysis) == 0 && !hints.IncludeNoProblem {
 				return
 			}
-			for _, filter := range config.Config.RecoveryIgnoreHostnameFilters {
+			for _, filter := range s.cfg.RecoveryIgnoreHostnameFilters {
 				if matched, _ := regexp.MatchString(filter, a.AnalyzedInstanceKey.Hostname); matched {
 					return
 				}
@@ -785,7 +774,7 @@ func GetReplicationAnalysis(clusterName string, hints *ReplicationAnalysisHints)
 
 		if a.CountReplicas > 0 && hints.AuditAnalysis {
 			// Interesting enough for analysis
-			go func() { _ = auditInstanceAnalysisInChangelog(&a.AnalyzedInstanceKey, a.Analysis) }()
+			go func() { _ = s.auditInstanceAnalysisInChangelog(&a.AnalyzedInstanceKey, a.Analysis) }()
 		}
 		return nil
 	})
@@ -795,9 +784,10 @@ func GetReplicationAnalysis(clusterName string, hints *ReplicationAnalysisHints)
 	}
 	// TODO: result, err = getConcensusReplicationAnalysis(result)
 
-	// In multi-cluster mode, also run PostgreSQL analysis and merge results
-	if hasPostgreSQLInstances(clusterName) {
-		pgResult, pgErr := GetPostgreSQLReplicationAnalysis(clusterName, hints)
+	// Only the legacy default store can hold instances of both engines: also run
+	// PostgreSQL analysis and merge results
+	if s.legacyMixedProviders && s.hasPostgreSQLInstances(clusterName) {
+		pgResult, pgErr := s.GetPostgreSQLReplicationAnalysis(clusterName, hints)
 		if pgErr != nil {
 			_ = log.Errore(pgErr)
 		} else {
@@ -811,23 +801,23 @@ func GetReplicationAnalysis(clusterName string, hints *ReplicationAnalysisHints)
 // auditInstanceAnalysisInChangelog will write down an instance's analysis in the database_instance_analysis_changelog table.
 // To not repeat recurring analysis code, the database_instance_last_analysis table is used, so that only changes to
 // analysis codes are written.
-func auditInstanceAnalysisInChangelog(instanceKey *InstanceKey, analysisCode AnalysisCode) error {
-	if lastWrittenAnalysis, found := recentInstantAnalysis.Get(instanceKey.DisplayString()); found {
+func (s *Store) auditInstanceAnalysisInChangelog(instanceKey *InstanceKey, analysisCode AnalysisCode) error {
+	if lastWrittenAnalysis, found := s.recentInstantAnalysis.Get(instanceKey.DisplayString()); found {
 		if lastWrittenAnalysis == analysisCode {
 			// Surely nothing new.
 			// And let's expand the timeout
-			recentInstantAnalysis.Set(instanceKey.DisplayString(), analysisCode, cache.DefaultExpiration)
+			s.recentInstantAnalysis.Set(instanceKey.DisplayString(), analysisCode, cache.DefaultExpiration)
 			return nil
 		}
 	}
 	// Passed the cache; but does database agree that there's a change? Here's a persistent cache; this comes here
 	// to verify no two orchestrator services are doing this without coordinating (namely, one dies, the other taking its place
 	// and has no familiarity of the former's cache)
-	analysisChangeWriteAttemptCounter.Inc(1)
+	s.analysisChangeWriteAttemptCounter.Inc(1)
 
 	lastAnalysisChanged := false
 	{
-		sqlResult, err := db.ExecOrchestrator(`
+		sqlResult, err := s.backend.Exec(`
 			update database_instance_last_analysis set
 				analysis = ?,
 				analysis_timestamp = now()
@@ -848,7 +838,7 @@ func auditInstanceAnalysisInChangelog(instanceKey *InstanceKey, analysisCode Ana
 		lastAnalysisChanged = (rows > 0)
 	}
 	if !lastAnalysisChanged {
-		_, err := db.ExecOrchestrator(`
+		_, err := s.backend.Exec(`
 			insert ignore into database_instance_last_analysis (
 					hostname, port, analysis_timestamp, analysis
 				) values (
@@ -861,12 +851,12 @@ func auditInstanceAnalysisInChangelog(instanceKey *InstanceKey, analysisCode Ana
 			return log.Errore(err)
 		}
 	}
-	recentInstantAnalysis.Set(instanceKey.DisplayString(), analysisCode, cache.DefaultExpiration)
+	s.recentInstantAnalysis.Set(instanceKey.DisplayString(), analysisCode, cache.DefaultExpiration)
 	if !lastAnalysisChanged {
 		return nil
 	}
 
-	_, err := db.ExecOrchestrator(`
+	_, err := s.backend.Exec(`
 			insert into database_instance_analysis_changelog (
 					hostname, port, analysis_timestamp, analysis
 				) values (
@@ -876,26 +866,26 @@ func auditInstanceAnalysisInChangelog(instanceKey *InstanceKey, analysisCode Ana
 		instanceKey.Hostname, instanceKey.Port, string(analysisCode),
 	)
 	if err == nil {
-		analysisChangeWriteCounter.Inc(1)
+		s.analysisChangeWriteCounter.Inc(1)
 	}
 	return log.Errore(err)
 }
 
 // ExpireInstanceAnalysisChangelog removes old-enough analysis entries from the changelog
-func ExpireInstanceAnalysisChangelog() error {
-	_, err := db.ExecOrchestrator(`
+func (s *Store) ExpireInstanceAnalysisChangelog() error {
+	_, err := s.backend.Exec(`
 			delete
 				from database_instance_analysis_changelog
 			where
 				analysis_timestamp < now() - interval ? hour
 			`,
-		config.Config.UnseenInstanceForgetHours,
+		s.cfg.UnseenInstanceForgetHours,
 	)
 	return log.Errore(err)
 }
 
 // ReadReplicationAnalysisChangelog
-func ReadReplicationAnalysisChangelog() (res [](*ReplicationAnalysisChangelog), err error) {
+func (s *Store) ReadReplicationAnalysisChangelog() (res [](*ReplicationAnalysisChangelog), err error) {
 	query := `
 		select
       hostname,
@@ -908,7 +898,7 @@ func ReadReplicationAnalysisChangelog() (res [](*ReplicationAnalysisChangelog), 
 			hostname, port, changelog_id
 		`
 	analysisChangelog := &ReplicationAnalysisChangelog{}
-	err = db.QueryOrchestratorRowsMap(query, func(m sqlutils.RowMap) error {
+	err = s.backend.QueryRowsMap(query, func(m sqlutils.RowMap) error {
 		key := InstanceKey{Hostname: m.GetString("hostname"), Port: m.GetInt("port")}
 
 		if !analysisChangelog.AnalyzedInstanceKey.Equals(&key) {
@@ -929,7 +919,7 @@ func ReadReplicationAnalysisChangelog() (res [](*ReplicationAnalysisChangelog), 
 
 // ReadPeerAnalysisMap reads raft-peer failure analysis, and returns a PeerAnalysisMap,
 // indicating how many peers see which analysis
-func ReadPeerAnalysisMap() (peerAnalysisMap PeerAnalysisMap, err error) {
+func (s *Store) ReadPeerAnalysisMap() (peerAnalysisMap PeerAnalysisMap, err error) {
 	peerAnalysisMap = make(PeerAnalysisMap)
 	query := `
 		select
@@ -941,7 +931,7 @@ func ReadPeerAnalysisMap() (peerAnalysisMap PeerAnalysisMap, err error) {
 		order by
 			peer, hostname, port
 		`
-	err = db.QueryOrchestratorRowsMap(query, func(m sqlutils.RowMap) error {
+	err = s.backend.QueryRowsMap(query, func(m sqlutils.RowMap) error {
 		instanceKey := InstanceKey{Hostname: m.GetString("hostname"), Port: m.GetInt("port")}
 		analysis := m.GetString("analysis")
 		instanceAnalysis := NewInstanceAnalysis(&instanceKey, AnalysisCode(analysis))

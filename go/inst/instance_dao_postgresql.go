@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"github.com/proxysql/golib/log"
-	"github.com/proxysql/orchestrator/go/config"
 )
 
 // connInfoHostPortRegexp extracts host and port from primary_conninfo
@@ -34,12 +33,12 @@ var connInfoHostPortRegexp = regexp.MustCompile(`host=(\S+).*port=(\d+)`)
 // ReadPostgreSQLTopologyInstance connects to a PostgreSQL instance, discovers
 // its role (primary or standby), and populates an Instance struct that maps
 // PostgreSQL concepts to orchestrator's MySQL-oriented data model.
-func ReadPostgreSQLTopologyInstance(instanceKey *InstanceKey) (*Instance, error) {
+func (s *Store) ReadPostgreSQLTopologyInstance(instanceKey *InstanceKey) (*Instance, error) {
 	if instanceKey == nil {
 		return nil, fmt.Errorf("ReadPostgreSQLTopologyInstance: nil instanceKey")
 	}
 
-	db, err := openPostgreSQLTopology(*instanceKey)
+	db, err := s.openPostgreSQLTopology(*instanceKey)
 	if err != nil {
 		return nil, log.Errore(err)
 	}
@@ -80,7 +79,7 @@ func ReadPostgreSQLTopologyInstance(instanceKey *InstanceKey) (*Instance, error)
 		}
 	} else {
 		// This is a primary (master)
-		if err := readPostgreSQLPrimaryInfo(db, instance); err != nil {
+		if err := s.readPostgreSQLPrimaryInfo(db, instance); err != nil {
 			return nil, err
 		}
 	}
@@ -105,7 +104,7 @@ func ReadPostgreSQLTopologyInstance(instanceKey *InstanceKey) (*Instance, error)
 	instance.LastSeenTimestamp = time.Now().Format("2006-01-02 15:04:05")
 
 	// Write instance to backend DB
-	_ = WriteInstance(instance, true, nil)
+	_ = s.WriteInstance(instance, true, nil)
 
 	return instance, nil
 }
@@ -233,7 +232,7 @@ func readPostgreSQLStandbyInfo(db *sql.DB, instance *Instance) error {
 }
 
 // readPostgreSQLPrimaryInfo populates Instance fields for a PostgreSQL primary.
-func readPostgreSQLPrimaryInfo(db *sql.DB, instance *Instance) error {
+func (s *Store) readPostgreSQLPrimaryInfo(db *sql.DB, instance *Instance) error {
 	// Get current WAL LSN
 	var currentLSN string
 	if err := db.QueryRow("SELECT pg_current_wal_lsn()::text").Scan(&currentLSN); err != nil {
@@ -279,7 +278,7 @@ func readPostgreSQLPrimaryInfo(db *sql.DB, instance *Instance) error {
 			hostname = clientAddr.String
 		}
 		if hostname != "" {
-			port := config.Config.DefaultInstancePort
+			port := s.cfg.DefaultInstancePort
 			// client_port in pg_stat_replication is the ephemeral port, not the PG listen port.
 			// We use DefaultInstancePort instead.
 			replicaKey := InstanceKey{Hostname: hostname, Port: port}

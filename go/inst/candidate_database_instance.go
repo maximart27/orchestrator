@@ -18,8 +18,6 @@ package inst
 
 import (
 	"fmt"
-
-	"github.com/proxysql/orchestrator/go/db"
 )
 
 // CandidateDatabaseInstance contains information about explicit promotion rules for an instance
@@ -39,8 +37,8 @@ func NewCandidateDatabaseInstance(instanceKey *InstanceKey, promotionRule Candid
 	}
 }
 
-func (cdi *CandidateDatabaseInstance) WithCurrentTime() *CandidateDatabaseInstance {
-	cdi.LastSuggestedString, _ = db.ReadTimeNow()
+func (s *Store) CandidateDatabaseInstanceWithCurrentTime(cdi *CandidateDatabaseInstance) *CandidateDatabaseInstance {
+	cdi.LastSuggestedString, _ = s.backend.ReadTimeNow()
 	return cdi
 }
 

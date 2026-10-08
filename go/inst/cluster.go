@@ -21,28 +21,27 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/proxysql/orchestrator/go/config"
 	"github.com/proxysql/orchestrator/go/kv"
 )
 
-func GetClusterMasterKVKey(clusterAlias string) string {
-	return fmt.Sprintf("%s%s", config.Config.KVClusterMasterPrefix, clusterAlias)
+func (s *Store) GetClusterMasterKVKey(clusterAlias string) string {
+	return fmt.Sprintf("%s%s", s.cfg.KVClusterMasterPrefix, clusterAlias)
 }
 
-func getClusterMasterKVPair(clusterAlias string, masterKey *InstanceKey) *kv.KVPair {
+func (s *Store) getClusterMasterKVPair(clusterAlias string, masterKey *InstanceKey) *kv.KVPair {
 	if clusterAlias == "" {
 		return nil
 	}
 	if masterKey == nil {
 		return nil
 	}
-	return kv.NewKVPair(GetClusterMasterKVKey(clusterAlias), masterKey.StringCode())
+	return kv.NewKVPair(s.GetClusterMasterKVKey(clusterAlias), masterKey.StringCode())
 }
 
 // GetClusterMasterKVPairs returns all KV pairs associated with a master. This includes the
 // full identity of the master as well as a breakdown by hostname, port, ipv4, ipv6
-func GetClusterMasterKVPairs(clusterAlias string, masterKey *InstanceKey) (kvPairs [](*kv.KVPair)) {
-	masterKVPair := getClusterMasterKVPair(clusterAlias, masterKey)
+func (s *Store) GetClusterMasterKVPairs(clusterAlias string, masterKey *InstanceKey) (kvPairs [](*kv.KVPair)) {
+	masterKVPair := s.getClusterMasterKVPair(clusterAlias, masterKey)
 	if masterKVPair == nil {
 		return kvPairs
 	}
@@ -55,7 +54,7 @@ func GetClusterMasterKVPairs(clusterAlias string, masterKey *InstanceKey) (kvPai
 
 	addPair("hostname", masterKey.Hostname)
 	addPair("port", fmt.Sprintf("%d", masterKey.Port))
-	if ipv4, ipv6, err := readHostnameIPs(masterKey.Hostname); err == nil {
+	if ipv4, ipv6, err := s.readHostnameIPs(masterKey.Hostname); err == nil {
 		addPair("ipv4", ipv4)
 		addPair("ipv6", ipv6)
 	}
@@ -64,8 +63,8 @@ func GetClusterMasterKVPairs(clusterAlias string, masterKey *InstanceKey) (kvPai
 
 // mappedClusterNameToAlias attempts to match a cluster with an alias based on
 // configured ClusterNameToAlias map
-func mappedClusterNameToAlias(clusterName string) string {
-	for pattern, alias := range config.Config.ClusterNameToAlias {
+func (s *Store) mappedClusterNameToAlias(clusterName string) string {
+	for pattern, alias := range s.cfg.ClusterNameToAlias {
 		if pattern == "" {
 			// sanity
 			continue
@@ -89,9 +88,9 @@ type ClusterInfo struct {
 }
 
 // ReadRecoveryInfo
-func (this *ClusterInfo) ReadRecoveryInfo() {
-	this.HasAutomatedMasterRecovery = this.filtersMatchCluster(config.Config.RecoverMasterClusterFilters)
-	this.HasAutomatedIntermediateMasterRecovery = this.filtersMatchCluster(config.Config.RecoverIntermediateMasterClusterFilters)
+func (s *Store) ClusterInfoReadRecoveryInfo(this *ClusterInfo) {
+	this.HasAutomatedMasterRecovery = this.filtersMatchCluster(s.cfg.RecoverMasterClusterFilters)
+	this.HasAutomatedIntermediateMasterRecovery = this.filtersMatchCluster(s.cfg.RecoverIntermediateMasterClusterFilters)
 }
 
 // filtersMatchCluster will see whether the given filters match the given cluster details
@@ -125,12 +124,12 @@ func (this *ClusterInfo) filtersMatchCluster(filters []string) bool {
 }
 
 // ApplyClusterAlias updates the given clusterInfo's ClusterAlias property
-func (this *ClusterInfo) ApplyClusterAlias() {
+func (s *Store) ClusterInfoApplyClusterAlias(this *ClusterInfo) {
 	if this.ClusterAlias != "" && this.ClusterAlias != this.ClusterName {
 		// Already has an alias; abort
 		return
 	}
-	if alias := mappedClusterNameToAlias(this.ClusterName); alias != "" {
+	if alias := s.mappedClusterNameToAlias(this.ClusterName); alias != "" {
 		this.ClusterAlias = alias
 	}
 }

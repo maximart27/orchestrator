@@ -102,13 +102,13 @@ type InstanceTag struct {
 	T   Tag
 }
 
-func GetInstanceKeysByTags(tagsString string) (tagged *InstanceKeyMap, err error) {
+func (s *Store) GetInstanceKeysByTags(tagsString string) (tagged *InstanceKeyMap, err error) {
 	tags, err := ParseIntersectTags(tagsString)
 	if err != nil {
 		return tagged, err
 	}
 	for i, tag := range tags {
-		taggedByTag, err := GetInstanceKeysByTag(tag)
+		taggedByTag, err := s.GetInstanceKeysByTag(tag)
 		if err != nil {
 			return tagged, err
 		}

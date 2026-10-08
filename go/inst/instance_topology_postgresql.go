@@ -22,18 +22,17 @@ import (
 	"time"
 
 	"github.com/proxysql/golib/log"
-	"github.com/proxysql/orchestrator/go/config"
 )
 
 // PostgreSQLPromoteStandby promotes a PostgreSQL standby to primary by calling
 // pg_promote(). It waits for the instance to exit recovery mode and returns
 // the promoted instance.
-func PostgreSQLPromoteStandby(instanceKey *InstanceKey) (*Instance, error) {
+func (s *Store) PostgreSQLPromoteStandby(instanceKey *InstanceKey) (*Instance, error) {
 	if instanceKey == nil {
 		return nil, fmt.Errorf("PostgreSQLPromoteStandby: nil instanceKey")
 	}
 
-	db, err := openPostgreSQLTopology(*instanceKey)
+	db, err := s.openPostgreSQLTopology(*instanceKey)
 	if err != nil {
 		return nil, log.Errore(err)
 	}
@@ -66,7 +65,7 @@ func PostgreSQLPromoteStandby(instanceKey *InstanceKey) (*Instance, error) {
 		} else if !inRecovery {
 			log.Infof("PostgreSQLPromoteStandby: %+v has exited recovery mode (promoted to primary)", *instanceKey)
 			// Re-read the instance to get updated state
-			return ReadPostgreSQLTopologyInstance(instanceKey)
+			return s.ReadPostgreSQLTopologyInstance(instanceKey)
 		}
 		time.Sleep(pollInterval)
 	}
@@ -77,12 +76,12 @@ func PostgreSQLPromoteStandby(instanceKey *InstanceKey) (*Instance, error) {
 // PostgreSQLReconfigureStandby reconfigures a PostgreSQL standby to replicate
 // from a new primary by updating primary_conninfo via ALTER SYSTEM and
 // reloading the configuration.
-func PostgreSQLReconfigureStandby(standbyKey *InstanceKey, newPrimaryKey *InstanceKey) error {
+func (s *Store) PostgreSQLReconfigureStandby(standbyKey *InstanceKey, newPrimaryKey *InstanceKey) error {
 	if standbyKey == nil || newPrimaryKey == nil {
 		return fmt.Errorf("PostgreSQLReconfigureStandby: nil key provided")
 	}
 
-	db, err := openPostgreSQLTopology(*standbyKey)
+	db, err := s.openPostgreSQLTopology(*standbyKey)
 	if err != nil {
 		return log.Errore(err)
 	}
@@ -98,14 +97,7 @@ func PostgreSQLReconfigureStandby(standbyKey *InstanceKey, newPrimaryKey *Instan
 	}
 
 	// Build new primary_conninfo
-	newConnInfo := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s sslmode=%s application_name=orchestrator",
-		newPrimaryKey.Hostname,
-		newPrimaryKey.Port,
-		config.Config.PostgreSQLTopologyUser,
-		config.Config.PostgreSQLTopologyPassword,
-		config.Config.PostgreSQLSSLMode,
-	)
+	newConnInfo := postgreSQLPrimaryConnInfo(s.cfg, newPrimaryKey)
 
 	log.Infof("PostgreSQLReconfigureStandby: reconfiguring %+v to replicate from %+v", *standbyKey, *newPrimaryKey)
 
@@ -187,12 +179,12 @@ func PostgreSQLGetBestStandbyForPromotion(replicas [](*Instance), candidateKey *
 // by updating default_transaction_read_only via ALTER SYSTEM and reloading.
 // When setting read-only, it also terminates existing non-replication connections
 // to prevent stray writes during graceful switchover.
-func PostgreSQLSetReadOnly(instanceKey *InstanceKey, readOnly bool) (*Instance, error) {
+func (s *Store) PostgreSQLSetReadOnly(instanceKey *InstanceKey, readOnly bool) (*Instance, error) {
 	if instanceKey == nil {
 		return nil, fmt.Errorf("PostgreSQLSetReadOnly: nil instanceKey")
 	}
 
-	db, err := openPostgreSQLTopology(*instanceKey)
+	db, err := s.openPostgreSQLTopology(*instanceKey)
 	if err != nil {
 		return nil, log.Errore(err)
 	}
@@ -232,17 +224,17 @@ func PostgreSQLSetReadOnly(instanceKey *InstanceKey, readOnly bool) (*Instance, 
 		}
 	}
 
-	return ReadPostgreSQLTopologyInstance(instanceKey)
+	return s.ReadPostgreSQLTopologyInstance(instanceKey)
 }
 
 // PostgreSQLGetCurrentWALLSN returns the current WAL write position (LSN)
 // of a PostgreSQL primary instance.
-func PostgreSQLGetCurrentWALLSN(instanceKey *InstanceKey) (string, error) {
+func (s *Store) PostgreSQLGetCurrentWALLSN(instanceKey *InstanceKey) (string, error) {
 	if instanceKey == nil {
 		return "", fmt.Errorf("PostgreSQLGetCurrentWALLSN: nil instanceKey")
 	}
 
-	db, err := openPostgreSQLTopology(*instanceKey)
+	db, err := s.openPostgreSQLTopology(*instanceKey)
 	if err != nil {
 		return "", log.Errore(err)
 	}
@@ -259,7 +251,7 @@ func PostgreSQLGetCurrentWALLSN(instanceKey *InstanceKey) (string, error) {
 
 // PostgreSQLWaitForStandbyLSN polls a PostgreSQL standby until its replay LSN
 // reaches or exceeds the target LSN, or the timeout expires.
-func PostgreSQLWaitForStandbyLSN(standbyKey *InstanceKey, targetLSN string, timeout time.Duration) error {
+func (s *Store) PostgreSQLWaitForStandbyLSN(standbyKey *InstanceKey, targetLSN string, timeout time.Duration) error {
 	if standbyKey == nil {
 		return fmt.Errorf("PostgreSQLWaitForStandbyLSN: nil standbyKey")
 	}
@@ -267,7 +259,7 @@ func PostgreSQLWaitForStandbyLSN(standbyKey *InstanceKey, targetLSN string, time
 		return fmt.Errorf("PostgreSQLWaitForStandbyLSN: empty targetLSN")
 	}
 
-	db, err := openPostgreSQLTopology(*standbyKey)
+	db, err := s.openPostgreSQLTopology(*standbyKey)
 	if err != nil {
 		return log.Errore(err)
 	}
@@ -299,25 +291,18 @@ func PostgreSQLWaitForStandbyLSN(standbyKey *InstanceKey, targetLSN string, time
 // replicate from a new primary by updating primary_conninfo via ALTER SYSTEM.
 // The actual restart and standby.signal creation is the operator's
 // responsibility, typically via PostGracefulTakeoverProcesses hooks.
-func PostgreSQLRepositionAsStandby(instanceKey *InstanceKey, newPrimaryKey *InstanceKey) error {
+func (s *Store) PostgreSQLRepositionAsStandby(instanceKey *InstanceKey, newPrimaryKey *InstanceKey) error {
 	if instanceKey == nil || newPrimaryKey == nil {
 		return fmt.Errorf("PostgreSQLRepositionAsStandby: nil key provided")
 	}
 
-	db, err := openPostgreSQLTopology(*instanceKey)
+	db, err := s.openPostgreSQLTopology(*instanceKey)
 	if err != nil {
 		return log.Errore(err)
 	}
 	defer func() { _ = db.Close() }()
 
-	newConnInfo := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s sslmode=%s application_name=orchestrator",
-		newPrimaryKey.Hostname,
-		newPrimaryKey.Port,
-		config.Config.PostgreSQLTopologyUser,
-		config.Config.PostgreSQLTopologyPassword,
-		config.Config.PostgreSQLSSLMode,
-	)
+	newConnInfo := postgreSQLPrimaryConnInfo(s.cfg, newPrimaryKey)
 
 	log.Infof("PostgreSQLRepositionAsStandby: configuring %+v to replicate from %+v", *instanceKey, *newPrimaryKey)
 
