@@ -23,7 +23,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/proxysql/golib/log"
@@ -38,9 +37,6 @@ var (
 	ErrNoMatch = errors.New("no match")
 )
 
-var mysqlURI string
-var dbMutex sync.Mutex
-
 type DummySqlResult struct {
 }
 
@@ -53,11 +49,6 @@ func (this DummySqlResult) RowsAffected() (int64, error) {
 }
 
 func getMySQLURI() string {
-	dbMutex.Lock()
-	defer dbMutex.Unlock()
-	if mysqlURI != "" {
-		return mysqlURI
-	}
 	mysqlURI := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?timeout=%ds&readTimeout=%ds&rejectReadOnly=%t&interpolateParams=true",
 		config.Config.MySQLOrchestratorUser,
 		config.Config.MySQLOrchestratorPassword,
@@ -99,7 +90,7 @@ func openTopology(host string, port int, readTimeout int) (db *sql.DB, err error
 	)
 
 	if config.Config.MySQLTopologyMaxAllowedPacket >= 0 {
-		mysqlURI = fmt.Sprintf("%s&maxAllowedPacket=%d", mysqlURI, config.Config.MySQLTopologyMaxAllowedPacket)
+		mysql_uri = fmt.Sprintf("%s&maxAllowedPacket=%d", mysql_uri, config.Config.MySQLTopologyMaxAllowedPacket)
 	}
 	if config.Config.MySQLTopologyUseMutualTLS ||
 		(config.Config.MySQLTopologyUseMixedTLS && requiresTLS(host, port, mysql_uri)) {
@@ -180,11 +171,13 @@ func OpenOrchestrator() (db *sql.DB, err error) {
 	var fromCache bool
 	if IsSQLite() {
 		db, fromCache, err = sqlutils.GetSQLiteDB(config.Config.SQLite3DataFile, nil)
-		if err == nil && !fromCache {
-			log.Debugf("Connected to orchestrator backend: sqlite on %v", config.Config.SQLite3DataFile)
+		if err == nil {
+			if !fromCache {
+				log.Debugf("Connected to orchestrator backend: sqlite on %v", config.Config.SQLite3DataFile)
+			}
+			db.SetMaxOpenConns(1)
+			db.SetMaxIdleConns(1)
 		}
-		db.SetMaxOpenConns(1)
-		db.SetMaxIdleConns(1)
 	} else {
 		if db, fromCache, err := openOrchestratorMySQLGeneric(); err != nil {
 			return db, log.Errore(err)

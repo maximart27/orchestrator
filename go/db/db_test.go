@@ -1,7 +1,10 @@
 package db
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/proxysql/orchestrator/go/config"
 )
 
 // TestMatchDSN tests that the dsns we match don't expose the password
@@ -28,5 +31,24 @@ func TestMatchDSN(t *testing.T) {
 			t.Errorf("Failed to match %q: expected(%q,%v), got(%q,%v)",
 				tests[i].dsn, tests[i].output, tests[i].err, match, err)
 		}
+	}
+}
+
+// TestTopologyMaxAllowedPacketDoesNotLeakIntoBackendURI guards against
+// openTopology writing the topology maxAllowedPacket into the backend DSN.
+func TestTopologyMaxAllowedPacketDoesNotLeakIntoBackendURI(t *testing.T) {
+	prev := config.Config.MySQLTopologyMaxAllowedPacket
+	defer func() { config.Config.MySQLTopologyMaxAllowedPacket = prev }()
+	config.Config.MySQLTopologyMaxAllowedPacket = 4242
+
+	if _, err := OpenTopology("127.0.0.1", 3306); err != nil {
+		t.Fatalf("OpenTopology: %v", err)
+	}
+	uri := getMySQLURI()
+	if strings.Contains(uri, "maxAllowedPacket=4242") {
+		t.Errorf("backend DSN picked up the topology maxAllowedPacket: %q", uri)
+	}
+	if !strings.Contains(uri, "@tcp(") {
+		t.Errorf("backend DSN looks corrupted: %q", uri)
 	}
 }

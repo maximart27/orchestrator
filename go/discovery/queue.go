@@ -46,6 +46,7 @@ type Queue struct {
 
 	name         string
 	done         chan struct{}
+	stopOnce     sync.Once
 	queue        chan inst.InstanceKey
 	queuedKeys   map[inst.InstanceKey]time.Time
 	consumedKeys map[inst.InstanceKey]time.Time
@@ -89,6 +90,7 @@ func CreateOrReturnQueue(name string) *Queue {
 
 	q := &Queue{
 		name:         name,
+		done:         make(chan struct{}),
 		queuedKeys:   make(map[inst.InstanceKey]time.Time),
 		consumedKeys: make(map[inst.InstanceKey]time.Time),
 		queue:        make(chan inst.InstanceKey, config.Config.DiscoveryQueueCapacity),
@@ -117,7 +119,7 @@ func (q *Queue) startMonitoring() {
 
 // Stop monitoring the queue
 func (q *Queue) stopMonitoring() {
-	q.done <- struct{}{}
+	q.stopOnce.Do(func() { close(q.done) })
 }
 
 // do a check of the entries in the queue, both those active and queued
