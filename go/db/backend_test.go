@@ -350,3 +350,55 @@ func TestDefaultBackendIsSingleton(t *testing.T) {
 		t.Errorf("unexpected default id %q", got[0].ID())
 	}
 }
+
+func TestDisabledDefaultBackendFailsWithoutTouchingAnything(t *testing.T) {
+	// the base configuration points at a MySQL backend that does not exist: if the
+	// disabled backend ever tried to use it, this would hang, create a schema or
+	// exit the process
+	prev := *config.Config
+	config.Config.BackendDB = "mysql"
+	config.Config.MySQLOrchestratorHost = "203.0.113.1"
+	defer func() { *config.Config = prev }()
+
+	DisableDefaultBackend()
+	defer EnableDefaultBackend()
+
+	b := DefaultBackend()
+	if _, err := b.Exec("select 1"); !errors.Is(err, ErrDefaultBackendDisabled) {
+		t.Errorf("Exec: expected ErrDefaultBackendDisabled, got %v", err)
+	}
+	if _, err := b.Open(); !errors.Is(err, ErrDefaultBackendDisabled) {
+		t.Errorf("Open: %v", err)
+	}
+	if err := b.EnsureSchema(); !errors.Is(err, ErrDefaultBackendDisabled) {
+		t.Errorf("EnsureSchema: %v", err)
+	}
+	if _, err := b.ReadTimeNow(); !errors.Is(err, ErrDefaultBackendDisabled) {
+		t.Errorf("ReadTimeNow: %v", err)
+	}
+	if _, err := b.OpenTopology("127.0.0.1", 3306); !errors.Is(err, ErrDefaultBackendDisabled) {
+		t.Errorf("OpenTopology: %v", err)
+	}
+	if _, err := b.OpenDiscovery("127.0.0.1", 3306); !errors.Is(err, ErrDefaultBackendDisabled) {
+		t.Errorf("OpenDiscovery: %v", err)
+	}
+	// the package-level legacy shims land on it too
+	if _, err := ExecOrchestrator("select 1"); !errors.Is(err, ErrDefaultBackendDisabled) {
+		t.Errorf("ExecOrchestrator: %v", err)
+	}
+	if _, err := OpenTopology("127.0.0.1", 3306); !errors.Is(err, ErrDefaultBackendDisabled) {
+		t.Errorf("package OpenTopology: %v", err)
+	}
+	if err := b.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+}
+
+func TestDisableDefaultBackendIsReversible(t *testing.T) {
+	DisableDefaultBackend()
+	disabled := DefaultBackend()
+	EnableDefaultBackend()
+	if enabled := DefaultBackend(); enabled == disabled || enabled.disabled {
+		t.Errorf("EnableDefaultBackend must bring the legacy backend back")
+	}
+}

@@ -27,8 +27,42 @@ import (
 
 	"github.com/proxysql/orchestrator/go/config"
 	"github.com/proxysql/orchestrator/go/db"
+	"github.com/proxysql/orchestrator/go/inst"
 	"github.com/proxysql/orchestrator/go/process"
 )
+
+// The legacy defaults -- db.DefaultBackend() and inst.DefaultStore(), driven by
+// the global config.Config -- belong to the legacy single-tenant setup. A manager
+// built from a tenants file never uses them (even its tenant "default" has its
+// own backend and Store), so while one is alive they are disabled: a call that
+// was not migrated to its tenant fails with an error instead of creating a
+// schema on, or exiting the process because of, the base backend. The disabling
+// is reference counted, since several managers can coexist in a process (tests,
+// CLI helpers).
+var legacyDefaults struct {
+	mu   sync.Mutex
+	held int
+}
+
+func disableLegacyDefaults() {
+	legacyDefaults.mu.Lock()
+	defer legacyDefaults.mu.Unlock()
+	if legacyDefaults.held == 0 {
+		db.DisableDefaultBackend()
+		inst.DisableDefaultStore()
+	}
+	legacyDefaults.held++
+}
+
+func enableLegacyDefaults() {
+	legacyDefaults.mu.Lock()
+	defer legacyDefaults.mu.Unlock()
+	legacyDefaults.held--
+	if legacyDefaults.held == 0 {
+		db.EnableDefaultBackend()
+		inst.EnableDefaultStore()
+	}
+}
 
 // controlBackendID names the dedicated control backend of a multi-tenant node
 // that has no "default" tenant. It starts with an underscore, which no tenant
@@ -91,6 +125,8 @@ type TenantManager struct {
 	leader           Leadership
 	processBootstrap bool
 	legacy           bool
+	// defaultsDisabled is true while this manager holds the legacy defaults disabled.
+	defaultsDisabled bool
 
 	mu      sync.Mutex
 	started bool
@@ -150,6 +186,10 @@ func NewTenantManagerFor(base *config.Configuration, tenantConfigs []*config.Ten
 			m.release()
 		}
 	}()
+	if !m.legacy {
+		disableLegacyDefaults()
+		m.defaultsDisabled = true
+	}
 
 	for _, tc := range tenantConfigs {
 		if _, dup := m.byID[tc.ID]; dup {
@@ -312,5 +352,9 @@ func (m *TenantManager) release() {
 			_ = log.Errorf("closing the control backend: %v", err)
 		}
 		m.ownedControlBackend = nil
+	}
+	if m.defaultsDisabled {
+		enableLegacyDefaults()
+		m.defaultsDisabled = false
 	}
 }
