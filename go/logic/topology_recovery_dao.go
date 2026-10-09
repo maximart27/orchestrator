@@ -149,8 +149,18 @@ func (t *Tenant) acknowledgeInstanceFailureDetection(instanceKey *inst.InstanceK
 }
 
 // recoveryInsertStatement is the statement that inserts a topology_recovery row, and its arguments.
+//
+// The row records the node that processes the recovery: the one that originated it, which travels in the
+// replicated entry. This node's identity is only the fallback, for the entries of a log written before
+// the leader stamped them. Stamping the node that applies the row instead would make every replicated
+// recovery look as if it belonged to a live node (the applying one), so that the recovery a leader
+// left behind when it died would never be recognised as crashed (AcknowledgeCrashedRecoveries).
 func recoveryInsertStatement(topologyRecovery *TopologyRecovery) (string, []interface{}) {
 	analysisEntry := topologyRecovery.AnalysisEntry
+	processingNodeHostname, processingNodeToken := topologyRecovery.ProcessingNodeHostname, topologyRecovery.ProcessingNodeToken
+	if processingNodeHostname == "" || processingNodeToken == "" {
+		processingNodeHostname, processingNodeToken = process.ThisHostname, util.ProcessToken.Hash
+	}
 	return `
 			insert ignore
 				into topology_recovery (
@@ -190,7 +200,7 @@ func recoveryInsertStatement(topologyRecovery *TopologyRecovery) (string, []inte
 			sqlutils.NilIfZero(topologyRecovery.Id),
 			topologyRecovery.UID,
 			analysisEntry.AnalyzedInstanceKey.Hostname, analysisEntry.AnalyzedInstanceKey.Port,
-			process.ThisHostname, util.ProcessToken.Hash,
+			processingNodeHostname, processingNodeToken,
 			string(analysisEntry.Analysis),
 			analysisEntry.ClusterDetails.ClusterName,
 			analysisEntry.ClusterDetails.ClusterAlias,
@@ -203,6 +213,8 @@ func recoveryInsertStatement(topologyRecovery *TopologyRecovery) (string, []inte
 // table (hostname, port, in_active_period, end_active_period_unixtime) is what makes a second active
 // recovery of the same instance impossible: it returns nil, nil when the instance already has one.
 func (t *Tenant) registerTopologyRecovery(topologyRecovery *TopologyRecovery) (*TopologyRecovery, error) {
+	// this node originates the recovery: the entry that is replicated carries who it is
+	topologyRecovery.ProcessingNodeHostname, topologyRecovery.ProcessingNodeToken = process.ThisHostname, util.ProcessToken.Hash
 	query, args := recoveryInsertStatement(topologyRecovery)
 	sqlResult, err := t.Backend.Exec(query, args...)
 	if err != nil {
@@ -677,7 +689,17 @@ func (t *Tenant) AcknowledgeInstanceCompletedRecoveries(instanceKey *inst.Instan
 }
 
 // AcknowledgeCrashedRecoveries marks recoveries whose processing nodes has crashed as acknowledged.
+//
+// node_health only knows the nodes this node heard from (each node has its own, and itself), and a
+// replicated recovery carries the node that originated it: a recovery of any other node than the one
+// that acknowledges is orphaned. Only the leader may acknowledge them: it is the one that needs the
+// instance released, and an acknowledgement is local, so a follower doing it would make its rows differ
+// from the leader's for the recoveries that are alive. Without Raft the leader is the elected node,
+// which is who runs the recovery loop anyway.
 func (t *Tenant) AcknowledgeCrashedRecoveries() (countAcknowledgedEntries int64, err error) {
+	if !t.isLeader() {
+		return 0, nil
+	}
 	whereClause := `
 			in_active_period = 1
 			and end_recovery is null
