@@ -51,6 +51,13 @@ node_up "$OLD"
 wait_until "$T_NODE_READY" "$OLD HTTP" node_http_ready "$OLD" || fail "$OLD did not come back"
 cluster_stable "${NODES[@]}" && pass "killed node rejoined: $(states_line "${NODES[@]}")" || fail "cluster not stable after restarting $OLD"
 wait_until 60 "a converged on ${NODES[*]}" converged "$TENANT_A" "${NODES[@]}" && pass "tenant a converged on all 3 nodes" || fail "tenant a diverges" "$(for n in "${NODES[@]}"; do echo "$n=$(tenant_fp $n $TENANT_A) rows: $(rows $n)"; echo "   $n active-period columns (id,start_active_period,in_active_period,end_active_period_unixtime): $(sql $n "$(tdb $TENANT_A)" "select recovery_id,start_active_period,in_active_period,end_active_period_unixtime from topology_recovery order by recovery_id" | tr '\n' ';')"; echo "   $n raft applies of write-recovery: $(node_logs $n | grep 'op=write-recovery$' | sed 's/ DEBUG.*applying command/ cmd/' | cut -c1-60 | tr '\n' ';')"; done)"
+# the audit rows of topology_recovery are the same on every node with the time stamps the leader decided (the
+# restarted node applies, late and with its own clock, what it missed). end_active_period_unixtime is left out on
+# purpose: the expiry of an active period (ClearActiveRecoveries) is local to each node, by its own clock.
+strict_rows() { sql "$1" "$(tdb "$TENANT_A")" "select recovery_id,uid,start_active_period,ifnull(end_recovery,'-'),in_active_period,acknowledged,ifnull(acknowledged_at,'-'),ifnull(acknowledged_by,'-'),ifnull(acknowledge_comment,'-'),processing_node_hostname from topology_recovery order by recovery_id" | md5sum | cut -c1-12; }
+strict_ref="$(strict_rows "${NODES[0]}")"; strict_diff=""
+for n in "${NODES[@]}"; do [ "$(strict_rows "$n")" = "$strict_ref" ] || strict_diff="$strict_diff $n"; done
+if [ -z "$strict_diff" ]; then pass "recovery rows (start, end, acknowledgement, with their time stamps) identical on all 3 nodes"; else fail "recovery rows differ with time stamps on:$strict_diff" "$(for n in "${NODES[@]}"; do echo "$n: $(sql "$n" "$(tdb "$TENANT_A")" "select recovery_id,start_active_period,ifnull(end_recovery,'-'),acknowledged,ifnull(acknowledged_at,'-') from topology_recovery order by recovery_id" | tr '\n' ';')"; done)"; fi
 sleep 10
 assert_eq "restarting the killed leader did not re-run any hook" "$posts" "$(hooks_total "$TENANT_A")"
 assert_clean_logs "end" "${NODES[@]}"

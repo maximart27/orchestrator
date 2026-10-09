@@ -150,6 +150,22 @@ Raft-only tables no longer hold (`f91f9b50`).
    unhealthy time from the wake-up (`go/logic/node_health_watch.go`). A control backend that really fails still yields after 5 s and
    is fatal after 30 s.
 
+10. **Tenant `a` diverged after `kill -9` of the leader mid-failover** (scenario 4, last run of the suite). The new leader
+   closed the orphan recovery of the dead one with `AcknowledgeCrashedRecoveries`, which wrote **locally** (`acknowledged=1`,
+   `end_recovery` set) while the followers kept it open and unacknowledged; and the node that came back applied what it had
+   missed stamping `start_active_period`, `end_active_period_unixtime`, `end_recovery` and `acknowledged_at` with its own
+   clock. No failover was blocked (`in_active_period=0` everywhere), but the audit rows differed. *Pre-existing.*
+   **Status: fixed** (`mt/fx-ack`): with Raft the leader publishes one `ack-recovery` per crashed recovery (owner, comment,
+   its instant and an optional `EndRecovery` flag in the payload), and the leader stamps the instants of a recovery's start
+   and end and of a failure detection's start in the entries it publishes, so every node (a late one, a restarted one, one
+   restored from a snapshot) writes the same values. Every column of `topology_recovery` converges except
+   `end_active_period_unixtime` of a row whose active period simply expired (`ClearActiveRecoveries`, local by design); the
+   scenario asserts a hash of the other columns.
+11. **A snapshot turned every NULL into an empty string** (found while testing 10). `sqlutils.CellData.UnmarshalJSON` read a
+   JSON `null` as a valid empty string, so a restored node held `end_recovery`/`acknowledged_at` = `''` (read back as
+   `0001-01-01`): the orphan recovery of a restored node was not `end_recovery is null`, hence invisible to
+   `AcknowledgeCrashedRecoveries`. **Status: fixed** (`go/golib/sqlutils`, vendored copy included).
+
 What held: no panic, nil dereference or stray `unknown tenant` in any run of any scenario; one Leader at every sample of
 the soak; commands of tenant A never landed in B or C (partitions, snapshot install, tenant mismatch); partitioned or
 frozen leaders never ran a recovery or hook after a new term had started (3a, 1, 3c); every accepted command survived a
