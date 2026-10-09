@@ -182,8 +182,9 @@ func logErrorEntry(logLevel LogLevel, err error) error {
 		// No error
 		return nil
 	}
-	entryString := fmt.Sprintf("%+v", err)
-	logEntry(logLevel, entryString)
+	// the text of an error is data, not a format: a '%' in it (the host of a MySQL account, a LIKE pattern in a
+	// query) must come out as it is
+	logFormattedEntry(logLevel, "%s", fmt.Sprintf("%+v", err))
 	if printStackTrace {
 		debug.PrintStack()
 	}
