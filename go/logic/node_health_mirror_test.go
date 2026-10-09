@@ -94,8 +94,12 @@ func TestExpireMaintenanceWaitsForTheNodeHealthMirror(t *testing.T) {
 }
 
 func TestAcknowledgeCrashedRecoveriesWaitsForTheNodeHealthMirror(t *testing.T) {
-	m, _ := newTestManager(t, []string{"a"}, nil)
+	m, leader := newTestManager(t, []string{"a"}, nil)
+	leader.leader.Store(true)
 	a := mustTenant(t, m, "a")
+	// the identity of the node is resolved lazily (the first heartbeat): without this the test only
+	// passes when another test has already sent one
+	process.ThisNodeHealth.Update()
 	const active = `select count(*) as c from topology_recovery where in_active_period = 1`
 	if _, err := a.Backend.Exec(`insert into topology_recovery
 		(hostname, port, in_active_period, processing_node_hostname, processcing_node_token)

@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/proxysql/orchestrator/go/inst"
 
@@ -157,7 +158,80 @@ func (t *Tenant) readTableData(tableName string, data *sqlutils.NamedResultData)
 		return log.Errore(err)
 	}
 	*data, err = sqlutils.ScanTable(orcdb, tableName)
-	return log.Errore(err)
+	if err != nil {
+		return log.Errore(err)
+	}
+	if t.Backend.IsSQLite() {
+		// The SQLite driver hands DATETIME/TIMESTAMP columns over as time.Time, which a snapshot
+		// would carry as RFC3339 text: write them the way SQLite stores them.
+		timeColumns, err := backendTimeColumns(orcdb, true, tableName)
+		if err != nil {
+			return log.Errore(err)
+		}
+		normalizeTimestamps(data, timeColumns)
+	}
+	return nil
+}
+
+// backendTimeColumns lists the DATETIME/TIMESTAMP columns of a table of a tenant's backend.
+func backendTimeColumns(orcdb *sql.DB, sqlite bool, tableName string) (map[string]bool, error) {
+	columns := make(map[string]bool)
+	var rows *sql.Rows
+	var err error
+	if sqlite {
+		rows, err = orcdb.Query(fmt.Sprintf("pragma table_info(%s)", tableName))
+	} else {
+		rows, err = orcdb.Query(`select column_name, data_type from information_schema.columns
+			where table_schema = database() and table_name = ?`, tableName)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	isTime := func(declaredType string) bool {
+		switch strings.ToLower(declaredType) {
+		case "timestamp", "datetime":
+			return true
+		}
+		return false
+	}
+	for rows.Next() {
+		var name, declaredType string
+		if sqlite {
+			var cid, notNull, pk int
+			var dflt sql.NullString
+			if err := rows.Scan(&cid, &name, &declaredType, &notNull, &dflt, &pk); err != nil {
+				return nil, err
+			}
+		} else if err := rows.Scan(&name, &declaredType); err != nil {
+			return nil, err
+		}
+		if isTime(declaredType) {
+			columns[strings.ToLower(name)] = true
+		}
+	}
+	return columns, rows.Err()
+}
+
+// normalizeTimestamps rewrites the RFC3339 timestamps of the given columns (which is how the SQLite
+// driver renders a time column, and so how a snapshot carries it) to the text the backends store and
+// compare: "2006-01-02 15:04:05[.ffffff]", in UTC (what SQLite's datetime('now') writes and what its
+// driver reads a stored time as). Left as RFC3339, a value would sort after every stored one ('T' >
+// ' ') and the SQL comparisons against NOW() would never be true. Other values are left alone.
+func normalizeTimestamps(data *sqlutils.NamedResultData, timeColumns map[string]bool) {
+	for i, column := range data.Columns {
+		if !timeColumns[strings.ToLower(column)] {
+			continue
+		}
+		for _, row := range data.Data {
+			if i >= len(row) || !row[i].Valid {
+				continue
+			}
+			if parsed, err := time.Parse(time.RFC3339Nano, row[i].String); err == nil {
+				row[i].String = parsed.UTC().Format(sqlutils.DateTimeFormat)
+			}
+		}
+	}
 }
 
 // writeTables writes the tables of a snapshot into the tenant's backend in ONE
@@ -168,6 +242,14 @@ func (t *Tenant) writeTables(tables []snapshotTable) error {
 		orcdb, err := t.Backend.Open()
 		if err != nil {
 			return err
+		}
+		for _, table := range tables {
+			// a snapshot written by a node of this code or of an older one may carry RFC3339 timestamps
+			timeColumns, err := backendTimeColumns(orcdb, t.Backend.IsSQLite(), table.name)
+			if err != nil {
+				return fmt.Errorf("table %s: %w", table.name, err)
+			}
+			normalizeTimestamps(table.data, timeColumns)
 		}
 		tx, err := orcdb.Begin()
 		if err != nil {
