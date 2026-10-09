@@ -501,7 +501,10 @@ func (c *chaosCluster) WaitConverged(timeout time.Duration) {
 			var st []string
 			for i := range c.nodes {
 				if r := c.raftOf(i); r != nil {
-					st = append(st, fmt.Sprintf("node%d applied=%d last=%d state=%s", i, r.AppliedIndex(), r.LastIndex(), r.State()))
+					stats := r.Stats()
+					st = append(st, fmt.Sprintf("node%d applied=%d last=%d state=%s [term=%s commit=%s last_log_term=%s last_snapshot=%s@%s leader=%s]",
+						i, r.AppliedIndex(), r.LastIndex(), r.State(), stats["term"], stats["commit_index"], stats["last_log_term"],
+						stats["last_snapshot_index"], stats["last_snapshot_term"], r.Leader()))
 				}
 			}
 			if os.Getenv("RAFT_LOGS") != "" {

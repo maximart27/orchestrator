@@ -63,6 +63,8 @@ func (applier *CommandApplier) ApplyCommand(op string, value []byte) interface{}
 		return applier.leaderURI(value)
 	case orcraft.RequestHealthReportCommand:
 		return applier.healthReport(value)
+	case orcraft.TenantSetCommand:
+		return applier.tenants().applyTenantSet(value)
 	}
 	return applier.ApplyTenantCommand(orcraft.LegacyTenantID, op, value)
 }

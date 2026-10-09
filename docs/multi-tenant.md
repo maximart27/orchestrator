@@ -38,6 +38,15 @@ configuration. Everything on this page applies only when `TenantsConfigFile` is 
    tenant). The tenants file is node-local, so keeping the files equivalent is up to the deployment
    (Ansible, config management...). Tenant IDs, providers and each tenant's configuration should be identical;
    the backend (`Backend` section) is the part that may legitimately differ per node.
+   **Detection:** the Raft leader announces the tenants it runs (global op `tenant-set`: sorted tenant IDs plus a
+   digest of ID and provider, never credentials) when it is elected and every 5 minutes. Each node compares it
+   with its own tenants; on a difference it logs an `ERROR` naming the tenants missing here / only here / with a
+   different provider, and sets the gauge `orchestrator_tenant_set_mismatch` (Prometheus) /
+   `raft.tenant_set_mismatch` (go-metrics) to 1. The node-local setting `RaftTenantSetMismatchPolicy` decides what
+   else happens: `"warn"` (default) nothing; `"yield"` a node that is the leader and runs different tenants than
+   the previous leader announced gives the leadership up (a follower only warns). Adding the missing tenant later
+   does **not** recover the commands that were dropped meanwhile. Nodes of an older version answer
+   `Unknown command op` to the announcement and keep working; they cannot report the mismatch.
 3. **Upgrade every node before activating a second tenant (mixed-version risk).** A node of a version without
    multi-tenancy ignores the `Tenant` field of a Raft command and would apply it to its single backend. Roll the
    new version out to *all* nodes first, with no tenants file or only the `default` tenant, and only then add the

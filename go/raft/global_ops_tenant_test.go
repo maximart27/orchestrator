@@ -20,7 +20,7 @@ func TestGlobalOpsWithTenantAreRejectedDeterministically(t *testing.T) {
 	base := len(fakes[0].globalOps())
 	globalOps := []string{
 		orcraft.HeartbeatCommand, orcraft.AsyncSnapshotCommand, orcraft.RegisterNodeCommand, orcraft.LeaderURICommand,
-		orcraft.RequestHealthReportCommand, orcraft.YieldCommand, orcraft.YieldHintCommand,
+		orcraft.RequestHealthReportCommand, orcraft.TenantSetCommand, orcraft.YieldCommand, orcraft.YieldHintCommand,
 	}
 	for _, op := range globalOps {
 		// the publishing path refuses it

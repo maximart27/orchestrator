@@ -320,43 +320,29 @@ func (f *FileSnapshotStore) Open(id string) (*raft.SnapshotMeta, io.ReadCloser, 
 	return &meta.SnapshotMeta, buffered, nil
 }
 
-// ReapSnapshots reaps any snapshots beyond the retain count.
-func (f *FileSnapshotStore) ReapSnapshots(currentSnapshotMeta *fileSnapshotMeta) error {
-
-	reapSnapshot := func(snapshot *fileSnapshotMeta) error {
-		path := filepath.Join(f.path, snapshot.ID)
-		log.Infof("snapshot: reaping snapshot %v", path)
-		if err := os.RemoveAll(path); err != nil {
-			_ = log.Errorf("snapshot: Failed to reap snapshot %v: %v", path, err)
-			return err
-		}
-		return nil
-	}
+// ReapSnapshots reaps any snapshots beyond the retain count, oldest (term, index) first.
+//
+// It must never delete a snapshot that is newer than the one that has just been
+// closed: the local snapshot (runSnapshots goroutine) and the InstallSnapshot of the
+// leader run concurrently, so an older snapshot can legitimately close after a newer
+// one, when Raft has already truncated its log up to the newer one. Deleting it would
+// leave a snapshot older than the first log entry and the next NewRaft would panic
+// ("log not found"). This is exactly hashicorp/raft's FileSnapshotStore policy; since
+// getSnapshots sorts newest first and retain >= 1, the newest snapshot always survives.
+func (f *FileSnapshotStore) ReapSnapshots() error {
 	snapshots, err := f.getSnapshots()
 	if err != nil {
 		_ = log.Errorf("snapshot: Failed to get snapshots: %v", err)
 		return err
 	}
 
-	deprecatedSnapshotsReaped := false
-	for _, snapshot := range snapshots {
-		if snapshot.Term > currentSnapshotMeta.Term ||
-			snapshot.Term == currentSnapshotMeta.Term && snapshot.Index > currentSnapshotMeta.Index {
-			_ = reapSnapshot(snapshot)
-			deprecatedSnapshotsReaped = true
-		}
-	}
-
-	if deprecatedSnapshotsReaped {
-		// re-read list, since we've removed files
-		snapshots, err = f.getSnapshots()
-		if err != nil {
-			_ = log.Errorf("snapshot: Failed to get snapshots: %v", err)
+	for i := f.retain; i < len(snapshots); i++ {
+		path := filepath.Join(f.path, snapshots[i].ID)
+		log.Infof("snapshot: reaping snapshot %v", path)
+		if err := os.RemoveAll(path); err != nil {
+			_ = log.Errorf("snapshot: Failed to reap snapshot %v: %v", path, err)
 			return err
 		}
-	}
-	for i := f.retain; i < len(snapshots); i++ {
-		_ = reapSnapshot(snapshots[i])
 	}
 	return nil
 }
@@ -401,7 +387,7 @@ func (s *FileSnapshotSink) Close() error {
 	}
 
 	// Reap any old snapshots
-	if err := s.store.ReapSnapshots(&s.meta); err != nil {
+	if err := s.store.ReapSnapshots(); err != nil {
 		return err
 	}
 

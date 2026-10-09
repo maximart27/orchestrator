@@ -76,6 +76,7 @@ var fieldScope = map[string]Scope{
 	"RaftDataDir":                                ScopeNodeLocal,
 	"DefaultRaftPort":                            ScopeGlobal,
 	"RaftNodes":                                  ScopeGlobal,
+	"RaftTenantSetMismatchPolicy":                ScopeNodeLocal,
 	"ExpectFailureAnalysisConcensus":             ScopeGlobal,
 	"MySQLOrchestratorHost":                      ScopeBackendNodeLocal,
 	"MySQLOrchestratorMaxPoolConnections":        ScopeBackendNodeLocal,

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/proxysql/golib/log"
 
@@ -128,6 +129,12 @@ type TenantManager struct {
 	legacy           bool
 	// defaultsDisabled is true while this manager holds the legacy defaults disabled.
 	defaultsDisabled bool
+
+	// tenantSetState is the memory of the tenant-set comparison (see tenant_set.go);
+	// thisNode and now are seams for tests (nil: the real ones).
+	tenantSetState tenantSetState
+	thisNode       func() string
+	now            func() time.Time
 
 	mu      sync.Mutex
 	started bool
