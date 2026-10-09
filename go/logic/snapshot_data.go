@@ -306,12 +306,26 @@ func gzipped(b ...[]byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// isLegacySingleTenant tells whether the manager holds exactly the legacy tenant: a single-tenant
+// deployment with no tenants file, where every node of the Raft group may still be running a version
+// without multi-tenancy.
+func (m *TenantManager) isLegacySingleTenant() bool {
+	return len(m.tenants) == 1 && m.tenants[0].ID == orcraft.LegacyTenantID
+}
+
 // GetData reads the state of every tenant and encodes it (gzip of a SnapshotData in JSON).
 //
 // The FSM is stopped while this runs (the snapshot is the state at a point of the log), so it is
 // concurrent per tenant: the tenants are read and marshalled each in its own goroutine and the
 // pieces are compressed concurrently too, as the members of a multi-member gzip stream, which is
 // still one gzip stream that every reader of a snapshot (decodeSnapshot, older nodes) decodes.
+//
+// A legacy single-tenant deployment is written in format version 1 (no FormatVersion, the tables
+// of the tenant at the top level, exactly what a version without multi-tenancy writes and reads):
+// a node of an older version that restores it -- InstallSnapshot from this leader, or its own
+// snapshot after a downgrade -- would otherwise find no table in a version 2 snapshot and, for
+// one, re-enable recoveries that the cluster has disabled. Version 2 is written as soon as
+// there is any other tenant, which an older node cannot serve anyway.
 func (s *SnapshotDataCreatorApplier) GetData() (data []byte, err error) {
 	manager := s.tenants()
 	leaderURI, err := json.Marshal(orcraft.LeaderURI.Get())
@@ -330,6 +344,10 @@ func (s *SnapshotDataCreatorApplier) GetData() (data []byte, err error) {
 			errs[i] = err
 			return
 		}
+		if manager.isLegacySingleTenant() {
+			marshalled[i] = body
+			return
+		}
 		id, err := json.Marshal(t.ID)
 		if err != nil {
 			errs[i] = err
@@ -343,18 +361,24 @@ func (s *SnapshotDataCreatorApplier) GetData() (data []byte, err error) {
 		}
 	}
 
-	// {"FormatVersion":2,"LeaderURI":...,"Tenants":{<id>:<state>,<id>:<state>}}
-	pieces := [][]byte{[]byte(fmt.Sprintf(`{"FormatVersion":%d,"LeaderURI":%s,"Tenants":{`, SnapshotFormatVersion, leaderURI))}
-	for _, piece := range marshalled {
-		if piece == nil {
-			continue
+	var pieces [][]byte
+	if manager.isLegacySingleTenant() && marshalled[0] != nil {
+		// {"LeaderURI":...,<the fields of the tenant>}: the body is an object whose first byte is its '{'
+		pieces = [][]byte{[]byte(fmt.Sprintf(`{"LeaderURI":%s,`, leaderURI)), marshalled[0][1:]}
+	} else {
+		// {"FormatVersion":2,"LeaderURI":...,"Tenants":{<id>:<state>,<id>:<state>}}
+		pieces = [][]byte{[]byte(fmt.Sprintf(`{"FormatVersion":%d,"LeaderURI":%s,"Tenants":{`, SnapshotFormatVersion, leaderURI))}
+		for _, piece := range marshalled {
+			if piece == nil {
+				continue
+			}
+			if len(pieces) > 1 {
+				piece = append([]byte{','}, piece...)
+			}
+			pieces = append(pieces, piece)
 		}
-		if len(pieces) > 1 {
-			piece = append([]byte{','}, piece...)
-		}
-		pieces = append(pieces, piece)
+		pieces = append(pieces, []byte(`}}`))
 	}
-	pieces = append(pieces, []byte(`}}`))
 
 	members := make([][]byte, len(pieces))
 	memberErrs := make([]error, len(pieces))
