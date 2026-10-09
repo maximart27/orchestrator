@@ -539,3 +539,28 @@ func TestDocExampleIsValid(t *testing.T) {
 		t.Errorf("doc example has %d tenants, want 3", len(tenants))
 	}
 }
+
+// With a MySQL backend on the node, a tenant must not live in the control database of the node (nor share a
+// database with another tenant): the schema, node_health and recoveries of both would be mixed.
+func TestMySQLTenantBackendMustNotBeTheControlBackend(t *testing.T) {
+	base := newConfiguration()
+	base.BackendDB = "mysql"
+	base.MySQLOrchestratorHost = "DB"
+	base.MySQLOrchestratorPort = 3306
+	base.MySQLOrchestratorDatabase = "orc_control"
+	own := func(id, database string) string {
+		return `{"ID":"` + id + `","Provider":"mysql","Backend":{"MySQLOrchestratorDatabase":"` + database + `"}}`
+	}
+	_, err := ParseTenantConfigs(base, []byte(`{"Tenants":[`+own("a", "orc_a")+`,`+own("b", "orc_control")+`]}`))
+	if err == nil || !strings.Contains(err.Error(), `"b"`) || !strings.Contains(err.Error(), "control") {
+		t.Errorf("tenant b in the control database: expected an error naming it, got %v", err)
+	}
+	// inheriting everything from the node = the control database
+	_, err = ParseTenantConfigs(base, []byte(`{"Tenants":[{"ID":"a","Provider":"mysql"}]}`))
+	if err == nil || !strings.Contains(err.Error(), "control") {
+		t.Errorf("tenant inheriting the control database: expected an error, got %v", err)
+	}
+	if _, err = ParseTenantConfigs(base, []byte(`{"Tenants":[`+own("a", "orc_a")+`,`+own("b", "orc_b")+`]}`)); err != nil {
+		t.Errorf("one database per tenant plus the control one is the supported layout: %v", err)
+	}
+}

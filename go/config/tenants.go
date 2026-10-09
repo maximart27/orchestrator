@@ -313,6 +313,9 @@ func validateTenantSet(base *Configuration, tenants []*TenantConfig) error {
 		sqliteFiles[canonicalPath(filepath.Join(base.RaftDataDir, "raft_store.db"))] = raftStoreOwner
 	}
 	mysqlBackends := map[string]string{}
+	if base.IsMySQL() && base.MySQLOrchestratorHost != "" {
+		mysqlBackends[mysqlBackendKey(base)] = controlBackendOwner
+	}
 	for _, t := range tenants {
 		cfg := t.Cfg
 		switch {
@@ -331,9 +334,13 @@ func validateTenantSet(base *Configuration, tenants []*TenantConfig) error {
 				sqliteFiles[key] = t.ID
 			}
 		case cfg.IsMySQL() && cfg.MySQLOrchestratorHost != "":
-			key := fmt.Sprintf("%s:%d/%s", strings.ToLower(cfg.MySQLOrchestratorHost), cfg.MySQLOrchestratorPort, cfg.MySQLOrchestratorDatabase)
+			key := mysqlBackendKey(cfg)
 			if other, found := mysqlBackends[key]; found {
-				errs = append(errs, fmt.Errorf("tenants %q and %q share the same MySQL backend %s", other, t.ID, key))
+				if other == controlBackendOwner {
+					errs = append(errs, fmt.Errorf("tenant %q uses the MySQL backend %s of the node's own (control) backend: give the tenant its own Backend.MySQLOrchestratorDatabase", t.ID, key))
+				} else {
+					errs = append(errs, fmt.Errorf("tenants %q and %q share the same MySQL backend %s", other, t.ID, key))
+				}
 			} else {
 				mysqlBackends[key] = t.ID
 			}
@@ -351,6 +358,11 @@ func validateTenantSet(base *Configuration, tenants []*TenantConfig) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// mysqlBackendKey identifies a MySQL backend: the server and the database on it.
+func mysqlBackendKey(cfg *Configuration) string {
+	return fmt.Sprintf("%s:%d/%s", strings.ToLower(cfg.MySQLOrchestratorHost), cfg.MySQLOrchestratorPort, cfg.MySQLOrchestratorDatabase)
 }
 
 func proxySQLEndpoint(cfg *Configuration) string {
