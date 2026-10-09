@@ -21,7 +21,7 @@ Prefix **`orcmtc`** (containers, volumes and networks `orcmtc-*`), subnets `172.
 `172.31.89.0/24` (Raft). `lib.sh` selects with the anchored regular expression `^orcmtc-`, which cannot match
 `orcmt-*` (the other suites) and vice versa; `lib-chaos.sh` refuses `ORCMT_PREFIX=orcmt`. Logs of **every** container
 are saved to `$ORCMT_WORK/logs/<scenario>/` (default `/tmp/orcmtc-work`) before anything is removed. `ORCMT_KEEP=1`
-leaves the containers for debugging (then `./run-chaos.sh cleanup`). Memory is bounded (`MEM_*` of `lib.sh`).
+leaves the containers for debugging (then `./run-chaos.sh cleanup`). Memory is bounded (`MEM_*` of `lib.sh`). Checked: with a dummy `orcmt-guard` container, network and volume present, `run-chaos.sh cleanup` removed only `orcmtc-*`.
 
 ## Network model (why a second network)
 
@@ -51,9 +51,10 @@ which recovery, and was it the Leader".
 | 7 | `chaos-07-tenant-backend-failure.sh` | the SQLite of tenant `mariadb-b` fills its volume (6 MB tmpfs) on the leader | the leader yields in ~5 s (`yielding leadership: backend of tenant mariadb-b ...`), another node recovers **all** tenants, the broken process survives and heals; then what happened to the commands it could not apply |
 | 8 | `chaos-08-tenant-mismatch.sh` | a node whose `tenants.json` lacks `mariadb-b` | `tenant unknown here` per command, the node lives and keeps applying the other tenants, nothing lands in another tenant; adding the tenant back does not recover the lost commands; wiping and re-joining does |
 | 9 | `chaos-09-soak.sh` (`CHAOS_SOAK=1`) | seeded random faults (kill/pause/partition/isolation/restart + master crashes) for `CHAOS_SOAK_SECONDS` (600) | at most one Leader; no panic/fatal/`unknown tenant`; no hook by a non-leader; failovers complete; final convergence |
+| 10 | `chaos-10-restored-recovery-stuck.sh` | recovery registered, snapshot on every node, both followers restart (restore it), then the master fails again under a restored leader | after the block period no recovery row may stay `in_active_period=1`; the restored leader must fail over again (regression found by the soak, finding 1) |
 
 ```sh
-tests/multitenant/run-chaos.sh                 # scenarios 1-8 (~25 min)
+tests/multitenant/run-chaos.sh                 # scenarios 1-8 and 10 (~25 min)
 tests/multitenant/run-chaos.sh 2 5             # selected ones
 CHAOS_LONG=1 tests/multitenant/run-chaos.sh 3  # + the 60 s freeze
 CHAOS_SOAK=1 CHAOS_SOAK_SECONDS=600 CHAOS_SEED=42 tests/multitenant/run-chaos.sh 9
@@ -80,10 +81,10 @@ leader's `raft_log` first index moved past 1 before it wipes a node.
 | 6 | PASS (24; 2/2) | ~3-4 min | snapshot really installed (`installing snapshot on` in the leader log) |
 | 7 | yield/takeover PASS; lost commands **FAIL** (3/3); rebuild PASS | ~2.5 min | finding 6 |
 | 8 | PASS (20; 2/2) | ~1-2 min | |
-| 9 | soak (seed 2026) found findings 1 and 2 | 10 min + | |
+| 9 | soak: seed 2026 (10 min, 10 cycles) FAIL: a failover stuck for 150 s (finding 1; an operator `ack-recovery` unblocked it) and `topology_recovery` rows that differ between nodes at the end (finding 2) while **all tags/downtimes were identical**; seed 3 (100 s) FAIL: a recovery hook ran with `state=Candidate` (finding 3, caught in the wild) | 10-12 min | reproducible by seed (the action sequence is deterministic) |
 | 10 | **FAIL** (3/3), deterministic | ~4 min | finding 1 |
 
-`run-chaos.sh` (1-8 and 10) takes about 22-25 minutes.
+`run-chaos.sh` (1-8 and 10) takes about 22-25 minutes; scenarios 4, 5b, 3b, 7 and 10 end in FAIL by design of the findings (they assert the correct behaviour).
 
 ## Findings
 

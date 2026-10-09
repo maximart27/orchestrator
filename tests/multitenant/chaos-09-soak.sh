@@ -117,8 +117,11 @@ log "SOAK done after $cycle cycles; final healing and convergence"
 traffic_stop; traffic_stats >&2
 supervise
 cluster_stable "${NODES[@]}" && pass "final: single Leader $LEADER ($(states_line "${NODES[@]}"))" || violation "no stable cluster at the end"
+data_fp() { { sql "$1" "$(tdb "$2")" "select hostname,port,tag_name,tag_value from database_instance_tags order by 1,2,3"; sql "$1" "$(tdb "$2")" "select hostname,port,owner,reason from database_instance_downtime where reason <> 'lost-in-recovery' order by 1,2"; } | md5sum | cut -c1-12; }
+data_same() { local t="$1" n first="" fp; for n in "${NODES[@]}"; do fp="$(data_fp "$n" "$t")"; [ -z "$first" ] && first="$fp"; [ "$fp" = "$first" ] || return 1; done; }
 for t in "${TENANTS[@]}"; do
-  wait_until 60 "$t converged" converged "$t" "${NODES[@]}" && pass "final: $t identical on the three nodes" || violation "tenant $t diverges at the end: $(diverge_report "$t" "${NODES[@]}")"
+  wait_until 60 "$t data (tags/downtime) identical" data_same "$t" && pass "final: $t tags/downtime identical on the three nodes (every accepted command replicated)" || violation "tenant $t: tags/downtime diverge at the end: $(diverge_report "$t" "${NODES[@]}")"
+  converged "$t" "${NODES[@]}" && pass "final: $t recovery history identical too" || violation "[finding 2 of README-chaos.md: replicated recovery rows dropped/stuck] tenant $t: topology_recovery differs between nodes: $(diverge_report "$t" "${NODES[@]}")"
 done
 check_logs; check_hooks
 log "hook runs per tenant (cluster-wide): $(for t in "${TENANTS[@]}"; do echo -n "$t=$(hooks_total $t) "; done)"
