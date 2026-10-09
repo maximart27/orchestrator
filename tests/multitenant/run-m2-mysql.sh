@@ -243,7 +243,8 @@ tfp() { # NODE TENANT -> md5 of the tables that must be identical on every node 
 }
 same_fp() { local t="$1" first="" n fp; shift; for n in "$@"; do fp="$(tfp "$n" "$t")"; [ -z "$first" ] && first="$fp"; [ "$fp" = "$first" ] || return 1; done; }
 tspec() { local t spec=""; for t in "${TENANTS[@]}"; do spec="$spec${spec:+,}$t=$(tenant_master "$t"):$(tenant_port "$t")"; done; echo "$spec"; }
-publish() { # PREFIX MAX LOGFILE : tag commands against the two live nodes
+publish() { # PREFIX MAX LOGFILE : tag commands against the two live nodes (the log is recreated)
+  rm -f "$3"
   python3 "$ORCMT_DIR/chaos-traffic.py" run --nodes "$(ip_of $L2),$(ip_of $F2)" --tenants "$(tspec)" --prefix "$1" --log "$3" --workers 6 --pace 0 --max "$2" >/dev/null 2>&1
 }
 log "publishing 150 tag commands + downtimes through Raft"
@@ -269,7 +270,7 @@ assert_eq "restart: no restore errors in the log of $F2" 0 "$(node_logs $F2 | gr
 if [ "$M2_NEWNODE_OPS" -gt 0 ]; then
   echo "== 6f. a brand new node ($L1: empty Raft dir and EMPTY databases) gets the snapshot installed by the leader =="
   log "publishing $M2_NEWNODE_OPS commands so that the Raft log is compacted (TrailingLogs=10240)"
-  T1=$SECONDS; publish ne "$M2_NEWNODE_OPS" "$ORCMT_WORK/ne.jsonl"; log "published in $((SECONDS-T1))s: $(python3 "$ORCMT_DIR/chaos-traffic.py" stats --log "$ORCMT_WORK/ne.jsonl")"
+  rm -f "$ORCMT_WORK/ne.jsonl"; T1=$SECONDS; publish ne "$M2_NEWNODE_OPS" "$ORCMT_WORK/ne.jsonl"; log "published in $((SECONDS-T1))s: $(python3 "$ORCMT_DIR/chaos-traffic.py" stats --log "$ORCMT_WORK/ne.jsonl")"
   api "$L2" /api/raft-snapshot >/dev/null; api "$F2" /api/raft-snapshot >/dev/null
   rdb() { docker exec "$(cname $L2)" python3 -c "$_SQ_PY" /data/raft/raft_store.db "$1" 2>/dev/null; }
   first_ok() { [ "$(rdb 'select min(log_index) from raft_log')" -gt 1 ] 2>/dev/null; }
