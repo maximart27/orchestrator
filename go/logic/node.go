@@ -273,13 +273,7 @@ func (m *TenantManager) onHealthTick() {
 			atomic.StoreInt64(&isElectedNode, 0)
 		}
 		// The health of the node is the one of its control backend (and Raft).
-		if process.SinceLastGoodHealthCheck() > yieldAfterUnhealthyDuration {
-			_ = log.Errorf("Health test is failing for over %+v seconds. raft yielding", yieldAfterUnhealthyDuration.Seconds())
-			_ = orcraft.Yield()
-		}
-		if process.SinceLastGoodHealthCheck() > fatalAfterUnhealthyDuration {
-			_ = orcraft.FatalRaftError(fmt.Errorf("node is unable to register health, please check database connectivity and/or time synchronization"))
-		}
+		m.checkControlHealth()
 		m.yieldForUnhealthyTenants()
 	}
 	if !orcraft.IsRaftEnabled() {
@@ -306,6 +300,27 @@ func (m *TenantManager) onHealthTick() {
 	if !wasAlreadyElected {
 		// Just turned to be leader!
 		go func() { _, _ = m.control.RegisterNode(process.ThisNodeHealth) }()
+	}
+}
+
+// raftYield and raftFatal are orcraft.Yield and orcraft.FatalRaftError, seams for tests.
+var (
+	raftYield = orcraft.Yield
+	raftFatal = orcraft.FatalRaftError
+)
+
+// checkControlHealth yields the Raft leadership when the control backend has failed to register
+// the node health for yieldAfterUnhealthyDuration, and gives up when it has for
+// fatalAfterUnhealthyDuration. A pause of the whole process is not such a failure (see
+// controlHealthWatch).
+func (m *TenantManager) checkControlHealth() {
+	unhealthy := m.healthWatch.unhealthyFor()
+	if unhealthy > yieldAfterUnhealthyDuration {
+		_ = log.Errorf("Health test is failing for over %+v seconds. raft yielding", yieldAfterUnhealthyDuration.Seconds())
+		_ = raftYield()
+	}
+	if unhealthy > fatalAfterUnhealthyDuration {
+		_ = raftFatal(fmt.Errorf("node is unable to register health, please check database connectivity and/or time synchronization"))
 	}
 }
 

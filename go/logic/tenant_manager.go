@@ -136,6 +136,9 @@ type TenantManager struct {
 	thisNode       func() string
 	now            func() time.Time
 
+	// healthWatch measures for how long the control backend has been unhealthy.
+	healthWatch controlHealthWatch
+
 	mu      sync.Mutex
 	started bool
 	stopped bool
