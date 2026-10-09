@@ -50,6 +50,12 @@ func (this *CellData) MarshalJSON() ([]byte, error) {
 
 // UnmarshalJSON reds this object from JSON
 func (this *CellData) UnmarshalJSON(b []byte) error {
+	if string(b) == "null" {
+		// MarshalJSON writes a NULL cell as null: it must come back as NULL, not as an empty string
+		(*this).String = ""
+		(*this).Valid = false
+		return nil
+	}
 	var s string
 	if err := json.Unmarshal(b, &s); err != nil {
 		return err
