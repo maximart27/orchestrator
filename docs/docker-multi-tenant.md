@@ -241,7 +241,7 @@ How it is wired:
   when loading.
 * `config/mysql-backend/initdb/01-orchestrator-backend.sh` runs once, when the MariaDB data directory is created: it
   creates the backend account from the **same** credentials file orchestrator reads (one secret, one place) with
-  `GRANT ALL ON `orc\_%`.*`; orchestrator creates the databases itself. Changing the secret afterwards needs an
+  ``GRANT ALL ON `orc\_%`.*``; orchestrator creates the databases itself. Changing the secret afterwards needs an
   `ALTER USER` by hand, the script does not run again.
 * The server does not start orchestrator until it is `healthy` (`depends_on: condition: service_healthy`, with the image's
   `healthcheck.sh --connect --innodb_initialized`).
