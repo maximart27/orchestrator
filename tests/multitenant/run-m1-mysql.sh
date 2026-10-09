@@ -177,6 +177,7 @@ if [ "$M1_FAILOVER" = 1 ]; then
   [ -z "$errs" ] && pass "no MySQL errors after the recoveries" || fail "MySQL errors after the recoveries" "$errs"
 fi
 
+[ "$(docker inspect -f '{{.State.Running}} {{.State.OOMKilled}} {{.RestartCount}}' "$(cname bk)" 2>/dev/null)" = "true false 0" ] && pass "the backend server never stopped (not OOM-killed)" || fail "the backend server stopped" "$(docker inspect -f '{{.State.Status}} OOM={{.State.OOMKilled}} exit={{.State.ExitCode}}' "$(cname bk)" 2>&1)"
 echo "== 7. fail-fast: unusable backend settings stop the process with a message that names the tenant =="
 docker rm -f -v "$NC" >/dev/null 2>&1
 ff() { # NAME EXPECT_REGEX python-mutation-of-tenants.json

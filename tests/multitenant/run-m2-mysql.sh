@@ -291,6 +291,7 @@ if [ "$M2_NEWNODE_OPS" -gt 0 ]; then
   ALIVE=("$L2" "$F2" "$L1")
 fi
 
+[ "$(docker inspect -f '{{.State.Running}} {{.State.OOMKilled}} {{.RestartCount}}' "$(cname bk)" 2>/dev/null)" = "true false 0" ] && pass "the backend server never stopped (not OOM-killed)" || fail "the backend server stopped" "$(docker inspect -f '{{.State.Status}} OOM={{.State.OOMKilled}} exit={{.State.ExitCode}}' "$(cname bk)" 2>&1)"
 echo "== 7. process health =="
 # MySQL errors that mean the SQL does not fit the dialect/schema (syntax, unknown column/table/function, NOT NULL, data
 # truncation). Transient ones (1062 duplicate on the alias unique key while a cluster is renamed, 1213 deadlock) are
