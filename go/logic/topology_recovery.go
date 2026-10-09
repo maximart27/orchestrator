@@ -174,6 +174,42 @@ func (this InstancesByCountReplicas) Less(i, j int) bool {
 	return len(this[i].Replicas) < len(this[j].Replicas)
 }
 
+// errLeadershipLost is what a recovery in flight answers when, with Raft, this node stopped being the
+// leader while it was running: another node owns the recoveries of every tenant now.
+var errLeadershipLost = errors.New("this node is no longer the Raft leader")
+
+// recoveryRaftEnabled tells whether the recoveries run under Raft, which is when they can lose the
+// leadership. A seam for the tests.
+var recoveryRaftEnabled = orcraft.IsRaftEnabled
+
+// ensureStillLeader is asked before every step of a recovery that has an effect outside orchestrator
+// that cannot be taken back (a hook, the promotion, reconfiguring replicas, key-value stores, ProxySQL).
+// The leadership is checked once when a recovery starts, and a recovery can take long: a leader that
+// was frozen (or partitioned) in the middle of one wakes up as a follower, and carrying on would
+// act on a topology that the new leader is already repairing (its Raft writes fail with "not leader").
+// It returns errLeadershipLost (wrapped, naming the step) so the recovery stops there; the recovery of
+// a leader that stays the leader is unaffected, as is everything without Raft.
+func (t *Tenant) ensureStillLeader(topologyRecovery *TopologyRecovery, step string) error {
+	if !recoveryRaftEnabled() || t.isLeader() {
+		return nil
+	}
+	err := fmt.Errorf("%w: aborting before %s", errLeadershipLost, step)
+	_ = log.Warningf("tenant %s: recovery %s: %v; the new leader takes over", t.ID, recoveryUID(topologyRecovery), err)
+	if topologyRecovery != nil {
+		_ = topologyRecovery.AddError(err)
+		// best effort: the node no longer is the leader, so Raft will probably refuse the entry
+		_ = t.AuditTopologyRecovery(topologyRecovery, err.Error())
+	}
+	return err
+}
+
+func recoveryUID(topologyRecovery *TopologyRecovery) string {
+	if topologyRecovery == nil {
+		return "-"
+	}
+	return topologyRecovery.UID
+}
+
 func (t *Tenant) getCountPendingRecoveries() int64 {
 	return atomic.LoadInt64(&t.countPendingRecoveries)
 }
@@ -341,6 +377,9 @@ func (t *Tenant) executeProcesses(processes []string, description string, topolo
 
 	t.AuditTopologyRecovery(topologyRecovery, fmt.Sprintf("Running %d %s hooks", len(processes), description))
 	for i, command := range processes {
+		if err := t.ensureStillLeader(topologyRecovery, fmt.Sprintf("%s hook %d of %d", description, i+1, len(processes))); err != nil {
+			return err
+		}
 		command, async := t.prepareCommand(command, topologyRecovery)
 		env := t.applyEnvironmentVariables(topologyRecovery)
 
@@ -406,6 +445,9 @@ func (t *Tenant) runPostSuccessFailoverProcesses(processes []string, description
 	err := t.executeProcesses(processes, description, topologyRecovery, failOnError)
 	if err == nil {
 		return nil
+	}
+	if errors.Is(err, errLeadershipLost) {
+		return err
 	}
 	if !failOnError {
 		_ = t.AuditTopologyRecovery(topologyRecovery, fmt.Sprintf("%s completed with errors (ignored for recovery success): %+v", description, err))
@@ -542,6 +584,9 @@ func (t *Tenant) recoverDeadMaster(topologyRecovery *TopologyRecovery, candidate
 			return false, nil, lostReplicas, topologyRecovery.AddError(err)
 		}
 	}
+	if err := t.ensureStillLeader(topologyRecovery, "ProxySQL pre-failover"); err != nil {
+		return false, nil, lostReplicas, err
+	}
 	if err := t.ProxySQL.PreFailover(failedInstanceKey.Hostname, failedInstanceKey.Port); err != nil {
 		_ = log.Errorf("ProxySQL pre-failover failed (non-blocking): %v", err)
 		t.AuditTopologyRecovery(topologyRecovery, fmt.Sprintf("ProxySQL pre-failover failed: %v", err))
@@ -570,6 +615,9 @@ func (t *Tenant) recoverDeadMaster(topologyRecovery *TopologyRecovery, candidate
 			}
 		}
 		return false
+	}
+	if err := t.ensureStillLeader(topologyRecovery, "promoting a replica"); err != nil {
+		return false, nil, lostReplicas, err
 	}
 	switch topologyRecovery.RecoveryType {
 	case MasterRecoveryGTID:
@@ -651,6 +699,9 @@ func (t *Tenant) recoverDeadMaster(topologyRecovery *TopologyRecovery, candidate
 	t.AuditTopologyRecovery(topologyRecovery, fmt.Sprintf("RecoverDeadMaster: %d postponed functions", topologyRecovery.Len()))
 
 	if promotedReplica != nil && !postponedAll {
+		if err := t.ensureStillLeader(topologyRecovery, "replacing the promoted replica with the candidate"); err != nil {
+			return true, promotedReplica, lostReplicas, err
+		}
 		promotedReplica, err = t.replacePromotedReplicaWithCandidate(topologyRecovery, &analysisEntry.AnalyzedInstanceKey, promotedReplica, candidateInstanceKey)
 		_ = topologyRecovery.AddError(err)
 	}
@@ -910,8 +961,8 @@ func (t *Tenant) checkAndRecoverDeadMaster(analysisEntry inst.ReplicationAnalysi
 		t.AuditTopologyRecovery(topologyRecovery, err.Error())
 	}
 	topologyRecovery.LostReplicas.AddInstances(lostReplicas)
-	if !recoveryAttempted {
-		return false, topologyRecovery, err
+	if !recoveryAttempted || errors.Is(err, errLeadershipLost) {
+		return recoveryAttempted, topologyRecovery, err
 	}
 
 	overrideMasterPromotion := func() (*inst.Instance, error) {
@@ -948,6 +999,9 @@ func (t *Tenant) checkAndRecoverDeadMaster(analysisEntry inst.ReplicationAnalysi
 		t.AuditTopologyRecovery(topologyRecovery, err.Error())
 	}
 	// And this is the end; whether successful or not, we're done.
+	if err := t.ensureStillLeader(topologyRecovery, "resolving the recovery"); err != nil {
+		return true, topologyRecovery, err
+	}
 	t.resolveRecovery(topologyRecovery, promotedReplica)
 	// Now, see whether we are successful or not. From this point there's no going back.
 	if promotedReplica != nil {
@@ -957,6 +1011,9 @@ func (t *Tenant) checkAndRecoverDeadMaster(analysisEntry inst.ReplicationAnalysi
 		t.AuditTopologyRecovery(topologyRecovery, fmt.Sprintf("- RecoverDeadMaster: promoted server coordinates: %+v", promotedReplica.SelfBinlogCoordinates))
 
 		if t.Cfg.ApplyMySQLPromotionAfterMasterFailover || analysisEntry.CommandHint == inst.GracefulMasterTakeoverCommandHint {
+			if err := t.ensureStillLeader(topologyRecovery, "applying the MySQL promotion"); err != nil {
+				return true, topologyRecovery, err
+			}
 			// on GracefulMasterTakeoverCommandHint it makes utter sense to RESET SLAVE ALL and read_only=0, and there is no sense in not doing so.
 			t.AuditTopologyRecovery(topologyRecovery, "- RecoverDeadMaster: will apply MySQL changes to promoted master")
 			{
@@ -981,6 +1038,9 @@ func (t *Tenant) checkAndRecoverDeadMaster(analysisEntry inst.ReplicationAnalysi
 			}()
 		}
 
+		if err := t.ensureStillLeader(topologyRecovery, "writing the key-value stores"); err != nil {
+			return true, topologyRecovery, err
+		}
 		kvPairs := t.Store.GetClusterMasterKVPairs(analysisEntry.ClusterDetails.ClusterAlias, &promotedReplica.Key)
 		t.AuditTopologyRecovery(topologyRecovery, fmt.Sprintf("Writing KV %+v", kvPairs))
 		if orcraft.IsRaftEnabled() {
@@ -999,6 +1059,9 @@ func (t *Tenant) checkAndRecoverDeadMaster(analysisEntry inst.ReplicationAnalysi
 			t.AuditTopologyRecovery(topologyRecovery, fmt.Sprintf("Distributing KV %+v", kvPairs))
 			err := t.KV.DistributePairs(kvPairs)
 			log.Errore(err)
+		}
+		if err := t.ensureStillLeader(topologyRecovery, "ProxySQL post-failover"); err != nil {
+			return true, topologyRecovery, err
 		}
 		if err := t.ProxySQL.PostFailover(
 			promotedReplica.Key.Hostname, promotedReplica.Key.Port,
@@ -1193,6 +1256,9 @@ func (t *Tenant) RecoverDeadIntermediateMaster(topologyRecovery *TopologyRecover
 		}
 	}
 
+	if err := t.ensureStillLeader(topologyRecovery, "relocating the replicas of the intermediate master"); err != nil {
+		return nil, err
+	}
 	intermediateMasterInstance, _, err := t.Store.ReadInstance(failedInstanceKey)
 	if err != nil {
 		return nil, topologyRecovery.AddError(err)
@@ -1378,6 +1444,9 @@ func (t *Tenant) RecoverDeadCoMaster(topologyRecovery *TopologyRecovery, skipPro
 
 	t.AuditTopologyRecovery(topologyRecovery, fmt.Sprintf("RecoverDeadCoMaster: coMasterRecoveryType=%+v", coMasterRecoveryType))
 
+	if err := t.ensureStillLeader(topologyRecovery, "promoting a replica of the co-master"); err != nil {
+		return nil, lostReplicas, err
+	}
 	var cannotReplicateReplicas [](*inst.Instance)
 	switch coMasterRecoveryType {
 	case MasterRecoveryGTID:
