@@ -1,0 +1,73 @@
+# systemd unit for orchestrator running in multi-tenant mode (one process, several tenants, one Raft group).
+# Guide: docs/install-multi-tenant.md (user and permissions, directive-by-directive notes, troubleshooting).
+#
+# Install. The .deb/.rpm packages ship etc/systemd/orchestrator.service (runs as root, no tenants), not this unit:
+# it has its own name so a package upgrade never overwrites it. Disable the packaged one first if it is installed.
+#   systemctl disable --now orchestrator
+#   install -m 0644 etc/systemd/orchestrator-multitenant.service /etc/systemd/system/orchestrator-multitenant.service
+#   systemctl daemon-reload && systemctl enable --now orchestrator-multitenant
+#
+# Layout assumed (adjust the paths below if yours differ):
+#   /usr/local/orchestrator/orchestrator        binary (also the working directory: "resources/" is read relative to it)
+#   /etc/orchestrator/orchestrator.conf.json    node configuration (TenantsConfigFile points to tenants.json)
+#   /var/lib/orchestrator/                      control SQLite, one SQLite per tenant and the Raft data (RaftDataDir)
+
+[Unit]
+Description=orchestrator (multi-tenant): MySQL/MariaDB/PostgreSQL replication management and failover
+Documentation=https://github.com/proxysql/orchestrator/blob/master/docs/install-multi-tenant.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orchestrator
+Group=orchestrator
+WorkingDirectory=/usr/local/orchestrator
+
+# Flags for the orchestrator binary (they must precede "http"). The optional file overrides this default.
+# Keep credentials OUT of the environment: every hook inherits it (see docs/multi-tenant.md, "Security between tenants").
+Environment=ORC_ARGS=--verbose
+EnvironmentFile=-/etc/orchestrator/orchestrator-multitenant.env
+ExecStart=/usr/local/orchestrator/orchestrator --config /etc/orchestrator/orchestrator.conf.json $ORC_ARGS http
+# SIGHUP reloads the GLOBAL configuration only; to change a tenant or the tenants file, restart the node.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Orderly shutdown: on SIGTERM orchestrator stops the tenants, waiting up to 30 s, then exits.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=5
+# One socket per discovered instance of every tenant, plus the HTTP clients and Raft peers.
+LimitNOFILE=65536
+
+# Created by systemd (mode 0700, owned by the service user): control SQLite, tenant SQLite files and Raft data.
+StateDirectory=orchestrator
+StateDirectoryMode=0700
+UMask=0077
+
+# Sandbox: read-only system, writes only where orchestrator keeps its state.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/orchestrator
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target
