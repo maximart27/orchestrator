@@ -65,9 +65,10 @@ EXPOSE 3000 10008
 STOPSIGNAL SIGTERM
 
 # /health/live only says the HTTP server answers. For a readiness gate use /health/ready or /api/health.
+# Every probe is logged by the HTTP access log, hence the 30 s interval.
 # If you enable HTTP authentication or TLS (UseSSL) point this at the right URL with ORC_HEALTH_URL.
 ENV ORC_HEALTH_URL=http://127.0.0.1:3000/health/live
-HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \
   CMD curl -fsS "$ORC_HEALTH_URL" >/dev/null || exit 1
 
 ENTRYPOINT ["/usr/local/orchestrator/orchestrator"]

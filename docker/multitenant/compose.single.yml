@@ -12,6 +12,7 @@ name: orchestrator-mt-single
 
 services:
   orchestrator:
+    hostname: orchestrator
     image: ${ORCHESTRATOR_IMAGE:-orchestrator-mt:local}
     build:
       context: ../..
