@@ -1,0 +1,14 @@
+{
+  "Debug": false,
+  "ListenAddress": ":3000",
+  "HTTPAdvertise": "http://172.28.61.11:3000",
+  "BackendDB": "sqlite",
+  "SQLite3DataFile": "/var/lib/orchestrator/control.db",
+  "RaftEnabled": true,
+  "RaftDataDir": "/var/lib/orchestrator/raft",
+  "RaftBind": "172.28.61.11",
+  "RaftAdvertise": "172.28.61.11",
+  "DefaultRaftPort": 10008,
+  "RaftNodes": ["172.28.61.11", "172.28.61.12", "172.28.61.13"],
+  "TenantsConfigFile": "/etc/orchestrator/tenants.json"
+}

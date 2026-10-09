@@ -1,0 +1,58 @@
+{
+  "Tenants": [
+    {
+      "ID": "mariadb-a",
+      "Provider": "mysql",
+      "Backend": {
+        "BackendDB": "sqlite",
+        "SQLite3DataFile": "/var/lib/orchestrator/mariadb-a.db"
+      },
+      "Config": {
+        "MySQLTopologyCredentialsConfigFile": "/run/secrets/mariadb_a_topology",
+        "DiscoverySeeds": ["mariadb-a-1.example.com:3306", "mariadb-a-2.example.com:3306"],
+        "HostnameResolveMethod": "none",
+        "MySQLHostnameResolveMethod": "none",
+        "InstancePollSeconds": 5,
+        "DetectClusterAliasQuery": "select 'mariadb-a'",
+        "KVClusterMasterPrefix": "mariadb-a/master"
+      }
+    },
+    {
+      "ID": "mariadb-b",
+      "Provider": "mysql",
+      "Backend": {
+        "BackendDB": "sqlite",
+        "SQLite3DataFile": "/var/lib/orchestrator/mariadb-b.db"
+      },
+      "Config": {
+        "MySQLTopologyUser": "orchestrator_b",
+        "MySQLTopologyPassword": "${ORC_B_TOPOLOGY_PASSWORD}",
+        "DiscoverySeeds": ["mariadb-b-1.example.com:3306", "mariadb-b-2.example.com:3306"],
+        "HostnameResolveMethod": "none",
+        "MySQLHostnameResolveMethod": "none",
+        "InstancePollSeconds": 10,
+        "ReasonableReplicationLagSeconds": 60,
+        "DetectClusterAliasQuery": "select 'mariadb-b'",
+        "KVClusterMasterPrefix": "mariadb-b/master"
+      }
+    },
+    {
+      "ID": "postgres-c",
+      "Provider": "postgresql",
+      "Backend": {
+        "BackendDB": "sqlite",
+        "SQLite3DataFile": "/var/lib/orchestrator/postgres-c.db"
+      },
+      "Config": {
+        "PostgreSQLTopologyUser": "orchestrator_c",
+        "PostgreSQLTopologyPassword": "change-me-c",
+        "PostgreSQLSSLMode": "disable",
+        "DiscoverySeeds": ["postgres-c-1.example.com:5432", "postgres-c-2.example.com:5432"],
+        "HostnameResolveMethod": "none",
+        "InstancePollSeconds": 10,
+        "RecoveryPeriodBlockSeconds": 600,
+        "KVClusterMasterPrefix": "postgres-c/master"
+      }
+    }
+  ]
+}

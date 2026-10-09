@@ -1,0 +1,51 @@
+# One orchestrator node, three example tenants (mysql, mysql, postgresql), SQLite backends, Raft of ONE member.
+# Raft is mandatory as soon as there is more than one tenant (see docs/docker-multi-tenant.md).
+#
+#   cp .env.example .env && cp -r secrets.example secrets      # then edit both
+#   docker compose -f compose.single.yml build
+#   docker compose -f compose.single.yml up -d
+#   curl -s http://127.0.0.1:3000/api/tenants
+#
+# The Raft address is the container IP, so the network has a fixed subnet and the node a fixed address: keep
+# ORC_SUBNET / ORC_N1_IP in sync with RaftBind/RaftAdvertise of config/single/orchestrator.conf.json.
+name: orchestrator-mt-single
+
+services:
+  orchestrator:
+    image: ${ORCHESTRATOR_IMAGE:-orchestrator-mt:local}
+    build:
+      context: ../..
+      dockerfile: docker/multitenant/Dockerfile
+    init: true                      # reaps the processes spawned by recovery hooks
+    restart: unless-stopped
+    stop_grace_period: 40s          # SIGTERM first; orchestrator audits the shutdown of every tenant (up to 30 s)
+    mem_limit: ${ORC_MEM_LIMIT:-384m}
+    environment:
+      ORC_B_TOPOLOGY_PASSWORD: ${ORC_B_TOPOLOGY_PASSWORD:?set it in .env}
+    ports:
+      - "${ORC_HTTP_BIND:-127.0.0.1}:${ORC_HTTP_PORT:-3000}:3000"    # HTTP/API/dashboard. 10008 (Raft) is NOT published
+    volumes:
+      - orc-data:/var/lib/orchestrator                                # Raft directory + SQLite backends: do not lose it
+      - ./config/single/orchestrator.conf.json:/etc/orchestrator/orchestrator.conf.json:ro
+      - ./config/tenants.json:/etc/orchestrator/tenants.json:ro
+    secrets:
+      - mariadb_a_topology
+    networks:
+      orchnet:
+        ipv4_address: ${ORC_N1_IP:-172.28.60.11}
+    logging:
+      driver: json-file
+      options: {max-size: 20m, max-file: "5"}
+
+secrets:
+  mariadb_a_topology:
+    file: ./secrets/mariadb_a_topology.cnf
+
+volumes:
+  orc-data:
+
+networks:
+  orchnet:
+    ipam:
+      config:
+        - subnet: ${ORC_SUBNET:-172.28.60.0/24}
