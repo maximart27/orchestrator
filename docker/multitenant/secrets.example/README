@@ -1,0 +1,8 @@
+Copy this directory to ./secrets, replace every value and restrict it:
+
+  cp -r secrets.example secrets && chmod 0700 secrets && chmod 0400 secrets/*
+  sudo chown -R 10001:10001 secrets        # uid/gid of the "orchestrator" user inside the image
+
+compose mounts each file read-only under /run/secrets/. Credentials files use the my.cnf subset that orchestrator
+reads (MySQLTopologyCredentialsConfigFile / MySQLOrchestratorCredentialsConfigFile): a [client] section with
+user and password. Quote a password that contains spaces, '#', ';' or quotes.
