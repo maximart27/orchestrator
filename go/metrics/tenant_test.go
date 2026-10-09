@@ -247,3 +247,9 @@ func TestMetricsTickRegistration(t *testing.T) {
 		t.Fatal("only b should remain registered")
 	}
 }
+
+func TestRaftUnknownTenantCommandsIsExported(t *testing.T) {
+	if got := series(t, gatherer(t), "orchestrator_raft_unknown_tenant_commands_total"); len(got) == 0 {
+		t.Error("orchestrator_raft_unknown_tenant_commands_total is not registered")
+	}
+}

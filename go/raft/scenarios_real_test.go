@@ -9,10 +9,12 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/proxysql/golib/sqlutils"
 
 	"github.com/proxysql/orchestrator/go/inst"
 	"github.com/proxysql/orchestrator/go/logic"
+	ometrics "github.com/proxysql/orchestrator/go/metrics"
 	orcraft "github.com/proxysql/orchestrator/go/raft"
 )
 
@@ -139,6 +141,10 @@ func TestRealTenantsDifferBetweenNodes(t *testing.T) {
 			phase("published and converged")
 			if got := orcraft.UnknownTenantCommands() - before; got != rounds {
 				t.Errorf("UnknownTenantCommands rose by %d, want %d", got, rounds)
+			}
+			m := &dto.Metric{}
+			if err := ometrics.RaftUnknownTenantCommands.Write(m); err != nil || int64(m.GetCounter().GetValue()) != orcraft.UnknownTenantCommands() {
+				t.Errorf("the Prometheus counter of unknown tenant commands is %v (%v), want %d", m.GetCounter().GetValue(), err, orcraft.UnknownTenantCommands())
 			}
 			c.AssertIdentical("a", "b") // the node neither blocks nor diverges on the tenants it runs
 			if app0.Digest("x") != app1.Digest("x") {

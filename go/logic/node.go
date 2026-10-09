@@ -67,6 +67,9 @@ var (
 	// tenantSetMismatchGauge is 1 when the tenants of this node differ from the ones the
 	// Raft leader announced (see tenant_set.go); global, not per tenant.
 	tenantSetMismatchGauge = metrics.NewGauge()
+	// unknownTenantCommandsGauge counts the commands this node could not apply because their
+	// tenant is unknown here (see orcraft.UnknownTenantCommands); global, not per tenant.
+	unknownTenantCommandsGauge = metrics.NewFunctionalGauge(orcraft.UnknownTenantCommands)
 
 	registerNodeMetricsOnce sync.Once
 	processMetricsOnce      sync.Once
@@ -102,6 +105,7 @@ func registerNodeMetrics() {
 		_ = metrics.Register("raft.is_healthy", isRaftHealthyGauge)
 		_ = metrics.Register("raft.is_leader", isRaftLeaderGauge)
 		_ = metrics.Register("raft.tenant_set_mismatch", tenantSetMismatchGauge)
+		_ = metrics.Register("raft.unknown_tenant_commands", unknownTenantCommandsGauge)
 
 		ometrics.OnMetricsTick(func() {
 			isElectedGauge.Update(atomic.LoadInt64(&isElectedNode))
