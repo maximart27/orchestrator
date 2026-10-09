@@ -712,6 +712,27 @@ func (b *Backend) execInternal(db *sql.DB, query string, args ...interface{}) (s
 	return sqlutils.ExecNoPrepare(db, b.translateStatement(query), args...)
 }
 
+// isExpectedDeployError tells whether the error of an ALTER TABLE / CREATE INDEX / DROP INDEX of the
+// schema patches only says that the patch had already been applied (or has nothing to drop). Those are
+// not logged as errors. The message of DROP INDEX on a missing index is "check that column/key exists"
+// in MySQL, and "check that it exists" in MariaDB (>= 10.x, seen on 11.4).
+func isExpectedDeployError(err error) bool {
+	msg := err.Error()
+	for _, expected := range []string{
+		"duplicate column name",
+		"Duplicate column name",
+		"check that column/key exists",
+		"check that it exists",
+		"already exists",
+		"Duplicate key name",
+	} {
+		if strings.Contains(msg, expected) {
+			return true
+		}
+	}
+	return false
+}
+
 // deployStatements will issue given sql queries that are not already known to be deployed.
 // This iterates both lists (to-run and already-deployed) and also verifies no contraditions.
 func (b *Backend) deployStatements(db *sql.DB, queries []string) error {
@@ -750,11 +771,7 @@ func (b *Backend) deployStatements(db *sql.DB, queries []string) error {
 				_ = tx.Rollback()
 				return fmt.Errorf("cannot initiate orchestrator: %w; query=%+v", err, query)
 			}
-			if !strings.Contains(err.Error(), "duplicate column name") &&
-				!strings.Contains(err.Error(), "Duplicate column name") &&
-				!strings.Contains(err.Error(), "check that column/key exists") &&
-				!strings.Contains(err.Error(), "already exists") &&
-				!strings.Contains(err.Error(), "Duplicate key name") {
+			if !isExpectedDeployError(err) {
 				_ = log.Errorf("Error initiating orchestrator: %+v; query=%+v", err, query)
 			}
 		}
