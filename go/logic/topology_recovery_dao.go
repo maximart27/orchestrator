@@ -148,9 +148,10 @@ func (t *Tenant) acknowledgeInstanceFailureDetection(instanceKey *inst.InstanceK
 	return t.clearAcknowledgedFailureDetections(whereClause, args)
 }
 
-func (t *Tenant) writeTopologyRecovery(topologyRecovery *TopologyRecovery) (*TopologyRecovery, error) {
+// recoveryInsertStatement is the statement that inserts a topology_recovery row, and its arguments.
+func recoveryInsertStatement(topologyRecovery *TopologyRecovery) (string, []interface{}) {
 	analysisEntry := topologyRecovery.AnalysisEntry
-	sqlResult, err := t.Backend.Exec(`
+	return `
 			insert ignore
 				into topology_recovery (
 					recovery_id,
@@ -185,17 +186,25 @@ func (t *Tenant) writeTopologyRecovery(topologyRecovery *TopologyRecovery) (*Top
 					?,
 					(select ifnull(max(detection_id), 0) from topology_failure_detection where hostname=? and port=?)
 				)
-			`,
-		sqlutils.NilIfZero(topologyRecovery.Id),
-		topologyRecovery.UID,
-		analysisEntry.AnalyzedInstanceKey.Hostname, analysisEntry.AnalyzedInstanceKey.Port,
-		process.ThisHostname, util.ProcessToken.Hash,
-		string(analysisEntry.Analysis),
-		analysisEntry.ClusterDetails.ClusterName,
-		analysisEntry.ClusterDetails.ClusterAlias,
-		analysisEntry.CountReplicas, analysisEntry.Replicas.ToCommaDelimitedList(),
-		analysisEntry.AnalyzedInstanceKey.Hostname, analysisEntry.AnalyzedInstanceKey.Port,
-	)
+			`, sqlutils.Args(
+			sqlutils.NilIfZero(topologyRecovery.Id),
+			topologyRecovery.UID,
+			analysisEntry.AnalyzedInstanceKey.Hostname, analysisEntry.AnalyzedInstanceKey.Port,
+			process.ThisHostname, util.ProcessToken.Hash,
+			string(analysisEntry.Analysis),
+			analysisEntry.ClusterDetails.ClusterName,
+			analysisEntry.ClusterDetails.ClusterAlias,
+			analysisEntry.CountReplicas, analysisEntry.Replicas.ToCommaDelimitedList(),
+			analysisEntry.AnalyzedInstanceKey.Hostname, analysisEntry.AnalyzedInstanceKey.Port,
+		)
+}
+
+// registerTopologyRecovery registers a recovery this node (the leader) starts. The unique index of the
+// table (hostname, port, in_active_period, end_active_period_unixtime) is what makes a second active
+// recovery of the same instance impossible: it returns nil, nil when the instance already has one.
+func (t *Tenant) registerTopologyRecovery(topologyRecovery *TopologyRecovery) (*TopologyRecovery, error) {
+	query, args := recoveryInsertStatement(topologyRecovery)
+	sqlResult, err := t.Backend.Exec(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -211,6 +220,101 @@ func (t *Tenant) writeTopologyRecovery(topologyRecovery *TopologyRecovery) (*Top
 		return nil, err
 	}
 	topologyRecovery.Id = lastInsertId
+	return topologyRecovery, nil
+}
+
+// writeTopologyRecovery applies a recovery the leader registered and replicated ("write-recovery").
+//
+// The leader has decided that this recovery starts, so it must land here whatever this node's own
+// bookkeeping says. That bookkeeping is local: every node closes the active period of its recoveries
+// (ClearActiveRecoveries) by its own clock, from the instant it applied them, so a follower can still hold
+// the previous recovery of the instance as active when the next one arrives. The unique index would then
+// make a plain "insert ignore" drop the new row, silently, and the nodes would differ for good. The
+// instance's active recovery is therefore closed first, in the same transaction, with the end stamp
+// acknowledgeRecoveries uses (never lower than the last of the instance plus one).
+//
+// Applying a recovery this node already has (the leader's own application of what it registered, a log
+// replayed over a backend that kept its data) does nothing: it must not close what came after it.
+func (t *Tenant) writeTopologyRecovery(topologyRecovery *TopologyRecovery) (*TopologyRecovery, error) {
+	analysisEntry := topologyRecovery.AnalysisEntry
+	instanceKey := analysisEntry.AnalyzedInstanceKey
+	if topologyRecovery.UID == "" && instanceKey.Hostname == "" {
+		// an empty entry (a leader that published a nil recovery, see AttemptRecoveryRegistration)
+		return nil, nil
+	}
+	query, args := recoveryInsertStatement(topologyRecovery)
+	query = t.Backend.TranslateStatement(query)
+
+	inserted := false
+	err := t.Store.ExecDBWriteFunc(func() error {
+		orcdb, err := t.Backend.Open()
+		if err != nil {
+			return err
+		}
+		tx, err := orcdb.Begin()
+		if err != nil {
+			return err
+		}
+		fail := func(err error) error {
+			_ = tx.Rollback()
+			return err
+		}
+
+		var known int
+		if topologyRecovery.UID != "" {
+			err = tx.QueryRow(`select count(*) from topology_recovery where uid = ?`, topologyRecovery.UID).Scan(&known)
+		} else if topologyRecovery.Id != 0 {
+			err = tx.QueryRow(`select count(*) from topology_recovery where recovery_id = ?`, topologyRecovery.Id).Scan(&known)
+		}
+		if err != nil {
+			return fail(err)
+		}
+		if known > 0 {
+			return tx.Commit()
+		}
+
+		var activeId int64
+		err = tx.QueryRow(`select recovery_id from topology_recovery where hostname = ? and port = ? and in_active_period = 1`,
+			instanceKey.Hostname, instanceKey.Port).Scan(&activeId)
+		switch {
+		case err == sql.ErrNoRows:
+		case err != nil:
+			return fail(err)
+		default:
+			var lastEnd int64
+			if err := tx.QueryRow(`select IFNULL(max(end_active_period_unixtime), 0) from topology_recovery where hostname = ? and port = ? and in_active_period = 0`,
+				instanceKey.Hostname, instanceKey.Port).Scan(&lastEnd); err != nil {
+				return fail(err)
+			}
+			end := time.Now().Unix()
+			if end <= lastEnd {
+				end = lastEnd + 1
+			}
+			if _, err := tx.Exec(`update topology_recovery set in_active_period = 0, end_active_period_unixtime = ? where recovery_id = ?`, end, activeId); err != nil {
+				return fail(err)
+			}
+		}
+
+		sqlResult, err := tx.Exec(query, args...)
+		if err != nil {
+			return fail(err)
+		}
+		rows, err := sqlResult.RowsAffected()
+		if err != nil {
+			return fail(err)
+		}
+		if rows == 0 {
+			return fail(fmt.Errorf("recovery %s of %+v was not written: its id %d is taken", topologyRecovery.UID, instanceKey, topologyRecovery.Id))
+		}
+		inserted = true
+		return tx.Commit()
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !inserted {
+		return nil, nil
+	}
 	return topologyRecovery, nil
 }
 
@@ -249,9 +353,13 @@ func (t *Tenant) AttemptRecoveryRegistration(analysisEntry *inst.ReplicationAnal
 
 	topologyRecovery := NewTopologyRecovery(*analysisEntry)
 
-	topologyRecovery, err := t.writeTopologyRecovery(topologyRecovery)
+	topologyRecovery, err := t.registerTopologyRecovery(topologyRecovery)
 	if err != nil {
 		return nil, log.Errore(err)
+	}
+	if topologyRecovery == nil {
+		// the instance already has an active recovery: nothing was registered, nothing to replicate
+		return nil, nil
 	}
 	if orcraft.IsRaftEnabled() {
 		if _, err := orcraft.PublishTenantCommand(t.ID, "write-recovery", topologyRecovery); err != nil {
