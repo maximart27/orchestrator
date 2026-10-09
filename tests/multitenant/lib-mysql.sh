@@ -24,7 +24,7 @@ BK_NAME=bk
 BK_IP="$ORCMT_PFX.200"
 BK_USER="${BK_USER:-orcbk}"
 BK_PW="${BK_PW:-orcbk-secret}"
-MEM_BK="${MEM_BK:-256m}"
+MEM_BK="${MEM_BK:-384m}"
 BK_MAX_CONN="${BK_MAX_CONN:-400}"
 # 1 = databases per node (M2), 0 = one set (M1)
 BK_PER_NODE="${BK_PER_NODE:-0}"
