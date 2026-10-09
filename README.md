@@ -64,6 +64,29 @@ See [ProxySQL hooks documentation](docs/proxysql-hooks.md).
 
 See [Observability documentation](docs/observability.md) and [API v2 documentation](docs/api-v2.md).
 
+#### Multi-tenant mode
+
+One `orchestrator` process can manage several independent *tenants*: unrelated MySQL/MariaDB and PostgreSQL
+topologies, each with its own configuration, backend, discovery, analysis and recovery, behind **one Raft group, one
+leader, one HTTP listener and one dashboard**. It is enabled by pointing the node setting `TenantsConfigFile` to a
+tenants file; without it nothing changes (a single implicit tenant, `default`). It covers per-tenant API
+(`/api/tenants/{id}/...`), CLI (`-tenant`), `orchestrator-client` (`-T`), hooks (`ORC_TENANT_ID`), metrics (`tenant`
+label), ProxySQL and KV (Consul/ZooKeeper) integration, and rolling upgrades from single-tenant Raft clusters.
+
+Status and limitations: with more than one tenant Raft is mandatory and every node must run the same tenants; one
+authentication realm for all tenants; agents/seeds (`ServeAgentsHttp`) and PostgreSQL as an *orchestrator backend* are
+not supported; `SIGHUP` reloads only the global configuration (restart to change a tenant). The end-to-end, chaos and
+mixed-version suites are in [`tests/multitenant`](tests/multitenant/README.md).
+
+- [Multi-tenant orchestrator](docs/multi-tenant.md): model, requirements, API, CLI, hooks, metrics, limitations
+- [Multi-tenant configuration](docs/multi-tenant-config.md): tenants file format and where each setting goes
+- [Installing in multi-tenant mode](docs/install-multi-tenant.md): from source or packages, systemd, first start, troubleshooting
+- [Upgrading to multi-tenant](docs/upgrade-multi-tenant.md): migrate a single-tenant install, rolling upgrade, activating the second tenant, rollback
+- [Multi-tenant Raft deployment](docs/deployment-raft-multi-tenant.md): three nodes, same tenants everywhere
+- [MySQL backend for multi-tenant](docs/multi-tenant-mysql-backend.md): one database per tenant
+- [Multi-tenant on Docker](docs/docker-multi-tenant.md): images and Compose
+- [Multi-tenant operations](docs/multi-tenant-operations.md): day-2 operations
+
 #### Additional perks
 
 - Highly available (shared backend or Raft consensus)
