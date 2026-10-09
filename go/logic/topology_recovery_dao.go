@@ -95,17 +95,27 @@ func (t *Tenant) AttemptFailureDetectionRegistration(analysisEntry *inst.Replica
 	return (rows > 0), nil
 }
 
+// timeColumn is how a time column is compared with NOW() in this tenant's backend. SQLite compares
+// text, so a value stored in a form that is not the canonical "YYYY-MM-DD HH:MM:SS" (an RFC3339
+// 'T' sorts after every ' ') would never be older than anything: datetime() reads both forms.
+func (t *Tenant) timeColumn(column string) string {
+	if t.Backend.IsSQLite() {
+		return fmt.Sprintf("datetime(%s)", column)
+	}
+	return column
+}
+
 // ClearActiveFailureDetections clears the "in_active_period" flag for old-enough detections, thereby allowing for
 // further detections on cleared instances.
 func (t *Tenant) ClearActiveFailureDetections() error {
-	_, err := t.Backend.Exec(`
+	_, err := t.Backend.Exec(fmt.Sprintf(`
 			update topology_failure_detection set
 				in_active_period = 0,
 				end_active_period_unixtime = UNIX_TIMESTAMP()
 			where
 				in_active_period = 1
-				AND start_active_period < NOW() - INTERVAL ? MINUTE
-			`,
+				AND %s < NOW() - INTERVAL ? MINUTE
+			`, t.timeColumn("start_active_period")),
 		t.Cfg.FailureDetectionPeriodBlockMinutes,
 	)
 	return log.Errore(err)
@@ -254,14 +264,14 @@ func (t *Tenant) AttemptRecoveryRegistration(analysisEntry *inst.ReplicationAnal
 // ClearActiveRecoveries clears the "in_active_period" flag for old-enough recoveries, thereby allowing for
 // further recoveries on cleared instances.
 func (t *Tenant) ClearActiveRecoveries() error {
-	_, err := t.Backend.Exec(`
+	_, err := t.Backend.Exec(fmt.Sprintf(`
 			update topology_recovery set
 				in_active_period = 0,
 				end_active_period_unixtime = UNIX_TIMESTAMP()
 			where
 				in_active_period = 1
-				AND start_active_period < NOW() - INTERVAL ? SECOND
-			`,
+				AND %s < NOW() - INTERVAL ? SECOND
+			`, t.timeColumn("start_active_period")),
 		t.Cfg.RecoveryPeriodBlockSeconds,
 	)
 	return log.Errore(err)
