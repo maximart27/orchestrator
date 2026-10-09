@@ -43,6 +43,9 @@ func testBase(t *testing.T) *config.Configuration {
 	base := config.Config.Clone()
 	base.BackendDB = "sqlite3"
 	base.SQLite3DataFile = filepath.Join(t.TempDir(), "control.sqlite3")
+	if srv := mysqlTestServer(t); srv != nil {
+		useMySQLBackend(base, srv, mysqlTestDatabase(t, srv, "control"))
+	}
 	base.HostnameResolveMethod = "none"
 	base.InstanceFlushIntervalMilliseconds = 20
 	base.InstanceWriteBufferSize = 10
@@ -57,14 +60,20 @@ func testTenantConfigs(t *testing.T, base *config.Configuration, ids []string, e
 	t.Helper()
 	dir := t.TempDir()
 	var entries []string
+	srv := mysqlTestServer(t)
 	for _, id := range ids {
 		cfg := fmt.Sprintf(`"KVClusterMasterPrefix": "%s/master/"`, id)
 		if e := extra[id]; e != "" {
 			cfg += ", " + e
 		}
+		backend := fmt.Sprintf(`{"BackendDB": "sqlite3", "SQLite3DataFile": %q}`, filepath.Join(dir, id+".sqlite3"))
+		if srv != nil {
+			// the tenant inherits host, port, user and password of the base; only its database is its own
+			backend = fmt.Sprintf(`{"BackendDB": "mysql", "MySQLOrchestratorDatabase": %q}`, mysqlTestDatabase(t, srv, id))
+		}
 		entries = append(entries, fmt.Sprintf(`{"ID": %q, "Provider": "mysql",
-			"Backend": {"BackendDB": "sqlite3", "SQLite3DataFile": %q},
-			"Config": {%s}}`, id, filepath.Join(dir, id+".sqlite3"), cfg))
+			"Backend": %s,
+			"Config": {%s}}`, id, backend, cfg))
 	}
 	tenants, err := config.ParseTenantConfigs(base, []byte(`{"Tenants": [`+strings.Join(entries, ",")+`]}`))
 	if err != nil {

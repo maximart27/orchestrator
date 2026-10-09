@@ -457,3 +457,43 @@ func TestSQLiteInMissingDirectoryFails(t *testing.T) {
 		t.Error("a SQLite file in a missing directory must be an error")
 	}
 }
+
+func TestExpectedDeployErrors(t *testing.T) {
+	for _, msg := range []string{
+		"Error 1091 (42000): Can't DROP INDEX `cluster_name_idx`; check that it exists",   // MariaDB 11.4
+		"Error 1091 (42000): Can't DROP 'cluster_name_idx'; check that column/key exists", // MySQL
+		"Error 1060 (42S21): Duplicate column name 'x'",                                   // MySQL / MariaDB
+		"Error 1061 (42000): Duplicate key name 'x'",                                      // MySQL / MariaDB
+		"duplicate column name: x",                                                        // SQLite
+		"index x already exists",                                                          // SQLite
+	} {
+		if !isExpectedDeployError(errors.New(msg)) {
+			t.Errorf("%q must be an expected error of a schema patch", msg)
+		}
+	}
+	for _, msg := range []string{
+		"Error 1064 (42000): You have an error in your SQL syntax",
+		"Error 1044 (42000): Access denied for user 'x'@'%' to database 'y'",
+	} {
+		if isExpectedDeployError(errors.New(msg)) {
+			t.Errorf("%q must not be silenced", msg)
+		}
+	}
+}
+
+func TestCreateDatabaseStatement(t *testing.T) {
+	for name, want := range map[string]string{
+		"orc_a":   "create database if not exists `orc_a`",
+		"orc-a":   "create database if not exists `orc-a`",
+		"we`ird":  "create database if not exists `we``ird`",
+		"orc.a b": "create database if not exists `orc.a b`",
+	} {
+		got, err := createDatabaseStatement(name)
+		if err != nil || got != want {
+			t.Errorf("createDatabaseStatement(%q) = %q, %v; want %q", name, got, err, want)
+		}
+	}
+	if _, err := createDatabaseStatement(""); err == nil {
+		t.Error("an empty database name must be an error, not a syntax error from the server")
+	}
+}

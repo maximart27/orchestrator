@@ -18,7 +18,6 @@ package logic
 
 import (
 	"context"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -115,7 +114,7 @@ func TestManagerFailsFastNamingTheTenant(t *testing.T) {
 	base := testBase(t)
 	good := testTenantConfigs(t, base, []string{"good"}, nil)
 	bad := testTenantConfigs(t, base, []string{"bad"}, nil)
-	bad[0].Cfg.SQLite3DataFile = filepath.Join(t.TempDir(), "no-such-dir", "deeper", "bad.sqlite3")
+	breakBackend(t, bad[0].Cfg)
 
 	waitGoroutines(t, runtime.NumGoroutine())
 	before := runtime.NumGoroutine()
@@ -172,7 +171,7 @@ func TestControlBackendIsTheDefaultTenantsOrADedicatedOne(t *testing.T) {
 
 	// without a default tenant and without a usable global backend there is nothing to host the control
 	base := testBase(t)
-	base.SQLite3DataFile = ""
+	unsetBackend(base)
 	if _, err := NewTenantManagerFor(base, testTenantConfigs(t, base, []string{"a", "b"}, nil), WithoutProcessBootstrap()); err == nil {
 		t.Error("an unusable control backend must be an error")
 	}
