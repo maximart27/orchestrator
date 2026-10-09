@@ -320,13 +320,18 @@ func (t *Tenant) applyPutInstanceTag(value []byte) interface{} {
 	return err
 }
 
+// applyDeleteInstanceTag answers the instances the tag was removed from (the API of the leader
+// reports them) or the error.
 func (t *Tenant) applyDeleteInstanceTag(value []byte) interface{} {
-	instanceTag := inst.InstanceTag{}
-	if err := json.Unmarshal(value, &instanceTag); err != nil {
+	untag := inst.InstanceUntag{}
+	if err := json.Unmarshal(value, &untag); err != nil {
 		return log.Errore(err)
 	}
-	_, err := t.Store.Untag(&instanceTag.Key, &instanceTag.T)
-	return err
+	untagged, err := t.Store.Untag(untag.Key, &untag.T)
+	if err != nil {
+		return err
+	}
+	return untagged
 }
 
 func (t *Tenant) applySetClusterAliasManualOverride(value []byte) interface{} {

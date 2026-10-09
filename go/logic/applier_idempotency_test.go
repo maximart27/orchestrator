@@ -77,7 +77,11 @@ func TestApplierReapplyingACommandIsIdempotentOrDocumented(t *testing.T) {
 				if c.value != nil {
 					payload = mustJSON(t, c.value)
 				}
-				if res := applier.ApplyTenantCommand("a", c.op, payload); res != nil && len(allowError) == 0 {
+				res := applier.ApplyTenantCommand("a", c.op, payload)
+				if _, isMap := res.(*inst.InstanceKeyMap); isMap && c.op == "delete-instance-tag" {
+					res = nil // it answers the instances it untagged
+				}
+				if res != nil && len(allowError) == 0 {
 					t.Fatalf("%s: %v", c.op, res)
 				}
 			}

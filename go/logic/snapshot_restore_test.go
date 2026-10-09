@@ -155,8 +155,10 @@ func TestSnapshotRestoreDropsRowsDeletedWhileTheNodeWasDown(t *testing.T) {
 	}
 	// the stale node goes down; meanwhile the leader deletes the tag and ends the downtime
 	la := NewCommandApplier(leader)
-	if res := la.ApplyTenantCommand("a", "delete-instance-tag", mustJSON(t, inst.InstanceTag{Key: key, T: inst.Tag{TagName: "doomed"}})); res != nil {
-		t.Fatal(res)
+	if res := la.ApplyTenantCommand("a", "delete-instance-tag", mustJSON(t, inst.InstanceTag{Key: key, T: inst.Tag{TagName: "doomed"}})); res == nil {
+		t.Fatal("delete-instance-tag answered nothing")
+	} else if err, isErr := res.(error); isErr {
+		t.Fatal(err)
 	}
 	if res := la.ApplyTenantCommand("a", "end-downtime", mustJSON(t, key)); res != nil {
 		t.Fatal(res)

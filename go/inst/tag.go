@@ -102,6 +102,13 @@ type InstanceTag struct {
 	T   Tag
 }
 
+// InstanceUntag is the payload of the "delete-instance-tag" Raft command. A nil Key removes the
+// tag from every instance that has it (untag-all). It decodes an InstanceTag payload as well.
+type InstanceUntag struct {
+	Key *InstanceKey
+	T   Tag
+}
+
 func (s *Store) GetInstanceKeysByTags(tagsString string) (tagged *InstanceKeyMap, err error) {
 	tags, err := ParseIntersectTags(tagsString)
 	if err != nil {
