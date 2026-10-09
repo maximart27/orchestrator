@@ -387,6 +387,10 @@ func createSQLiteFile(path string) error {
 // connection that is not tied to a database.
 func (b *Backend) createMySQLDatabase() error {
 	cfg := b.cfg
+	stmt, err := createDatabaseStatement(cfg.MySQLOrchestratorDatabase)
+	if err != nil {
+		return err
+	}
 	uri, err := b.mysqlGenericDSN()
 	if err != nil {
 		return err
@@ -396,8 +400,17 @@ func (b *Backend) createMySQLDatabase() error {
 		return err
 	}
 	defer sqlutils.CloseDB(db)
-	_, err = db.Exec(fmt.Sprintf("create database if not exists %s", cfg.MySQLOrchestratorDatabase))
+	_, err = db.Exec(stmt)
 	return err
+}
+
+// createDatabaseStatement is the statement that creates the backend database. The name is quoted: a database
+// called "orc-a" or "orc.a" is valid (and the DSN carries it as is) but not as a bare identifier.
+func createDatabaseStatement(name string) (string, error) {
+	if name == "" {
+		return "", errors.New("MySQLOrchestratorDatabase is not set")
+	}
+	return "create database if not exists `" + strings.ReplaceAll(name, "`", "``") + "`", nil
 }
 
 func (b *Backend) mysqlGenericDSN() (string, error) {

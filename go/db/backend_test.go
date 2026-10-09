@@ -480,3 +480,20 @@ func TestExpectedDeployErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestCreateDatabaseStatement(t *testing.T) {
+	for name, want := range map[string]string{
+		"orc_a":   "create database if not exists `orc_a`",
+		"orc-a":   "create database if not exists `orc-a`",
+		"we`ird":  "create database if not exists `we``ird`",
+		"orc.a b": "create database if not exists `orc.a b`",
+	} {
+		got, err := createDatabaseStatement(name)
+		if err != nil || got != want {
+			t.Errorf("createDatabaseStatement(%q) = %q, %v; want %q", name, got, err, want)
+		}
+	}
+	if _, err := createDatabaseStatement(""); err == nil {
+		t.Error("an empty database name must be an error, not a syntax error from the server")
+	}
+}
