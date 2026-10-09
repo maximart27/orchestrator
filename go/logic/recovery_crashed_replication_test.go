@@ -195,3 +195,26 @@ func TestReplicatedFailureDetectionCarriesTheLeadersInstant(t *testing.T) {
 		t.Errorf("start_active_period of the detection: %q and %q", a, b)
 	}
 }
+
+// A node that restores a snapshot holds the same NULLs as the node that took it: a recovery that is not
+// finished keeps end_recovery NULL (and acknowledged_at, the acknowledgement being absent), which is what
+// the recognition of a crashed recovery looks for. A NULL restored as an empty string made an orphan
+// recovery of a restored node invisible, and the rows differ from the other nodes'.
+func TestSnapshotRestoreKeepsTheNullsOfARecovery(t *testing.T) {
+	leaderM, _ := newTestManager(t, []string{"a"}, nil)
+	restoredM, restoredLeadership := newTestManager(t, []string{"a"}, nil)
+	leader, restored := mustTenant(t, leaderM, "a"), mustTenant(t, restoredM, "a")
+	orphan := replicatedRecovery(1, "uid-orphan", "db1")
+	orphan.ProcessingNodeHostname, orphan.ProcessingNodeToken = "dead-leader", "dead-token"
+	applyWriteRecovery(t, NewCommandApplier(leaderM), orphan)
+	restoreInto(t, restoredM, snapshotOf(t, leaderM))
+
+	if l, r := recoveryRowsExact(t, leader), recoveryRowsExact(t, restored); l != r {
+		t.Errorf("the restored node holds another row:\nleader   %s\nrestored %s", l, r)
+	}
+	restoredLeadership.leader.Store(true)
+	acks, err := restored.CrashedRecoveryAcknowledgements()
+	if err != nil || len(acks) != 1 {
+		t.Fatalf("the orphan recovery of a restored node must be recognised as crashed: %v, %v", acks, err)
+	}
+}
