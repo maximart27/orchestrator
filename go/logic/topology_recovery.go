@@ -256,6 +256,7 @@ func (t *Tenant) resolveRecovery(topologyRecovery *TopologyRecovery, successorIn
 		topologyRecovery.SuccessorBinlogCoordinates = &successorInstance.SelfBinlogCoordinates
 	}
 	if orcraft.IsRaftEnabled() {
+		topologyRecovery.RecoveryEndTimestamp = t.backendTimestamp(time.Now())
 		_, err := orcraft.PublishTenantCommand(t.ID, "resolve-recovery", topologyRecovery)
 		return err
 	} else {
@@ -433,6 +434,7 @@ func (t *Tenant) persistResolvedRecovery(topologyRecovery *TopologyRecovery) err
 		return nil
 	}
 	if orcraft.IsRaftEnabled() {
+		topologyRecovery.RecoveryEndTimestamp = t.backendTimestamp(time.Now())
 		_, err := orcraft.PublishTenantCommand(t.ID, "resolve-recovery", topologyRecovery)
 		return err
 	}
@@ -1996,6 +1998,11 @@ func (t *Tenant) executeCheckAndRecoverFunction(analysisEntry inst.ReplicationAn
 	}
 
 	// Initiate detection:
+	if orcraft.IsRaftEnabled() && analysisEntry.StartActivePeriod == "" {
+		// the instant the detection starts is the leader's: the entry published below carries it, so that
+		// every node (and a node that applies it again later) registers the same start_active_period
+		analysisEntry.StartActivePeriod = t.backendTimestamp(time.Now())
+	}
 	registrationSuccess, _, err := t.checkAndExecuteFailureDetectionProcesses(analysisEntry, skipProcesses)
 	if registrationSuccess {
 		if orcraft.IsRaftEnabled() {

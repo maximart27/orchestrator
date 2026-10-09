@@ -101,3 +101,97 @@ func TestCrashedRecoveryAcknowledgementIsReplicated(t *testing.T) {
 		t.Errorf("the nodes hold different rows:\nleader   %s\nfollower %s", l, f)
 	}
 }
+
+// A recovery the leader stamped is written with the leader's instants on every node, however late a node
+// applies it (a follower that was down, a node that restarts and replays the log): start_active_period,
+// the end stamp with which the next recovery of the instance closes it, end_recovery.
+func TestReplicatedRecoveryCarriesTheLeadersInstants(t *testing.T) {
+	apply := func(t *testing.T, pause time.Duration) string {
+		m, _ := newTestManager(t, []string{"a"}, nil)
+		tn := mustTenant(t, m, "a")
+		applier := NewCommandApplier(m)
+		time.Sleep(pause)
+		first := replicatedRecovery(1, "uid-1", "db1")
+		first.RecoveryStartTimestamp = "2026-10-09 00:55:20"
+		second := replicatedRecovery(2, "uid-2", "db1")
+		second.RecoveryStartTimestamp = "2026-10-09 00:55:23"
+		applyWriteRecovery(t, applier, first)
+		applyWriteRecovery(t, applier, second) // the first one is still active here: it is closed by the arrival of the second
+		resolved := replicatedRecovery(2, "uid-2", "db1")
+		resolved.IsSuccessful = true
+		resolved.RecoveryEndTimestamp = "2026-10-09 00:55:43"
+		resolved.SuccessorKey = &resolved.AnalysisEntry.AnalyzedInstanceKey
+		if res := applier.ApplyTenantCommand("a", "resolve-recovery", mustJSON(t, resolved)); res != nil {
+			t.Fatal(res)
+		}
+		return recoveryRowsExact(t, tn)
+	}
+	onTime, late := apply(t, 0), apply(t, 1100*time.Millisecond)
+	if onTime != late {
+		t.Errorf("a node that applied the same entries a second later holds other rows:\n%s\n---\n%s", onTime, late)
+	}
+	for _, want := range []string{"start_active_period=2026-10-09T00:55:20Z", "start_active_period=2026-10-09T00:55:23Z", "end_recovery=2026-10-09T00:55:43Z"} {
+		if !strings.Contains(onTime, want) {
+			t.Errorf("the rows lack %q:\n%s", want, onTime)
+		}
+	}
+	// the first recovery was closed at the instant the second started
+	if want := fmt.Sprintf("end_active_period_unixtime=%d", time.Date(2026, 10, 9, 0, 55, 23, 0, time.UTC).Unix()); !strings.Contains(onTime, want) {
+		t.Errorf("the first recovery is not closed at the start of the second (%s):\n%s", want, onTime)
+	}
+}
+
+// A leader that registers a recovery under Raft stamps the entry it publishes with the instant it wrote in
+// its own row, so the followers write the very same row (down to start_active_period).
+func TestRegisteredRecoveryIsPublishedWithItsInstant(t *testing.T) {
+	leaderM, _ := newTestManager(t, []string{"a"}, nil)
+	followerM, _ := newTestManager(t, []string{"a"}, nil)
+	leader, follower := mustTenant(t, leaderM, "a"), mustTenant(t, followerM, "a")
+	raftRecoveries(t, true)
+
+	registered, err := leader.registerTopologyRecovery(replicatedRecovery(0, "uid-1", "db1"))
+	if err != nil || registered == nil {
+		t.Fatalf("registering: %v, %v", registered, err)
+	}
+	if registered.RecoveryStartTimestamp == "" {
+		t.Fatal("the entry to publish carries no instant")
+	}
+	time.Sleep(1100 * time.Millisecond)
+	applyWriteRecovery(t, NewCommandApplier(followerM), registered)
+	if l, f := recoveryRowsExact(t, leader), recoveryRowsExact(t, follower); l != f {
+		t.Errorf("the follower wrote another row:\nleader   %s\nfollower %s", l, f)
+	}
+
+	// without Raft nothing is stamped: the clock of the backend is the only one
+	alone, _ := newTestManager(t, []string{"a"}, nil)
+	raftRecoveries(t, false)
+	plain, err := mustTenant(t, alone, "a").registerTopologyRecovery(replicatedRecovery(0, "uid-2", "db2"))
+	if err != nil || plain == nil || plain.RecoveryStartTimestamp != "" {
+		t.Fatalf("without Raft: %+v, %v", plain, err)
+	}
+}
+
+// The detection the leader publishes carries the instant it registered it at.
+func TestReplicatedFailureDetectionCarriesTheLeadersInstant(t *testing.T) {
+	startOf := func(t *testing.T, pause time.Duration) string {
+		m, _ := newTestManager(t, []string{"a"}, nil)
+		tn := mustTenant(t, m, "a")
+		analysis := replicatedRecovery(0, "", "db1").AnalysisEntry
+		analysis.StartActivePeriod = "2026-10-09 00:55:20"
+		time.Sleep(pause)
+		if res := NewCommandApplier(m).ApplyTenantCommand("a", "register-failure-detection", mustJSON(t, analysis)); res != nil {
+			t.Fatal(res)
+		}
+		var start string
+		if err := tn.Backend.QueryRowsMap(`select start_active_period from topology_failure_detection`, func(m sqlutils.RowMap) error {
+			start = m.GetString("start_active_period")
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return start
+	}
+	if a, b := startOf(t, 0), startOf(t, 1100*time.Millisecond); a != b || a != "2026-10-09T00:55:20Z" {
+		t.Errorf("start_active_period of the detection: %q and %q", a, b)
+	}
+}

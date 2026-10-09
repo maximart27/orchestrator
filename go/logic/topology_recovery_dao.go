@@ -161,7 +161,27 @@ func recoveryInsertStatement(topologyRecovery *TopologyRecovery) (string, []inte
 	if processingNodeHostname == "" || processingNodeToken == "" {
 		processingNodeHostname, processingNodeToken = process.ThisHostname, util.ProcessToken.Hash
 	}
-	return `
+	// the leader stamps the instant the recovery starts (with Raft): every node, and a node that applies the
+	// entry again later, writes the same start_active_period instead of the instant it applies it
+	startActivePeriod, startArgs := "NOW()", []interface{}{}
+	if topologyRecovery.RecoveryStartTimestamp != "" {
+		startActivePeriod, startArgs = "?", []interface{}{topologyRecovery.RecoveryStartTimestamp}
+	}
+	args := sqlutils.Args(
+		sqlutils.NilIfZero(topologyRecovery.Id),
+		topologyRecovery.UID,
+		analysisEntry.AnalyzedInstanceKey.Hostname, analysisEntry.AnalyzedInstanceKey.Port,
+	)
+	args = append(args, startArgs...)
+	args = append(args, sqlutils.Args(
+		processingNodeHostname, processingNodeToken,
+		string(analysisEntry.Analysis),
+		analysisEntry.ClusterDetails.ClusterName,
+		analysisEntry.ClusterDetails.ClusterAlias,
+		analysisEntry.CountReplicas, analysisEntry.Replicas.ToCommaDelimitedList(),
+		analysisEntry.AnalyzedInstanceKey.Hostname, analysisEntry.AnalyzedInstanceKey.Port,
+	)...)
+	return fmt.Sprintf(`
 			insert ignore
 				into topology_recovery (
 					recovery_id,
@@ -185,7 +205,7 @@ func recoveryInsertStatement(topologyRecovery *TopologyRecovery) (string, []inte
 					?,
 					?,
 					1,
-					NOW(),
+					%s,
 					0,
 					?,
 					?,
@@ -196,17 +216,7 @@ func recoveryInsertStatement(topologyRecovery *TopologyRecovery) (string, []inte
 					?,
 					(select ifnull(max(detection_id), 0) from topology_failure_detection where hostname=? and port=?)
 				)
-			`, sqlutils.Args(
-			sqlutils.NilIfZero(topologyRecovery.Id),
-			topologyRecovery.UID,
-			analysisEntry.AnalyzedInstanceKey.Hostname, analysisEntry.AnalyzedInstanceKey.Port,
-			processingNodeHostname, processingNodeToken,
-			string(analysisEntry.Analysis),
-			analysisEntry.ClusterDetails.ClusterName,
-			analysisEntry.ClusterDetails.ClusterAlias,
-			analysisEntry.CountReplicas, analysisEntry.Replicas.ToCommaDelimitedList(),
-			analysisEntry.AnalyzedInstanceKey.Hostname, analysisEntry.AnalyzedInstanceKey.Port,
-		)
+			`, startActivePeriod), args
 }
 
 // registerTopologyRecovery registers a recovery this node (the leader) starts. The unique index of the
@@ -215,6 +225,9 @@ func recoveryInsertStatement(topologyRecovery *TopologyRecovery) (string, []inte
 func (t *Tenant) registerTopologyRecovery(topologyRecovery *TopologyRecovery) (*TopologyRecovery, error) {
 	// this node originates the recovery: the entry that is replicated carries who it is
 	topologyRecovery.ProcessingNodeHostname, topologyRecovery.ProcessingNodeToken = process.ThisHostname, util.ProcessToken.Hash
+	if recoveryRaftEnabled() {
+		topologyRecovery.RecoveryStartTimestamp = t.backendTimestamp(time.Now())
+	}
 	query, args := recoveryInsertStatement(topologyRecovery)
 	sqlResult, err := t.Backend.Exec(query, args...)
 	if err != nil {
@@ -298,7 +311,9 @@ func (t *Tenant) writeTopologyRecovery(topologyRecovery *TopologyRecovery) (*Top
 				instanceKey.Hostname, instanceKey.Port).Scan(&lastEnd); err != nil {
 				return fail(err)
 			}
-			end := time.Now().Unix()
+			// closed at the instant the next recovery starts, which the leader stamped: the end stamp is
+			// the same on every node, whatever second each applies it in
+			end := t.recoveryStartUnix(topologyRecovery)
 			if end <= lastEnd {
 				end = lastEnd + 1
 			}
@@ -328,6 +343,21 @@ func (t *Tenant) writeTopologyRecovery(topologyRecovery *TopologyRecovery) (*Top
 		return nil, nil
 	}
 	return topologyRecovery, nil
+}
+
+// recoveryStartUnix is the instant (unix seconds) the leader stamped on a recovery when it started, or this
+// node's clock for the entries of a log written before the leader stamped them.
+func (t *Tenant) recoveryStartUnix(topologyRecovery *TopologyRecovery) int64 {
+	if topologyRecovery.RecoveryStartTimestamp != "" {
+		loc := time.UTC
+		if !t.Backend.IsSQLite() {
+			loc = time.Local
+		}
+		if at, err := time.ParseInLocation("2006-01-02 15:04:05", topologyRecovery.RecoveryStartTimestamp, loc); err == nil {
+			return at.Unix()
+		}
+	}
+	return time.Now().Unix()
 }
 
 // AttemptRecoveryRegistration tries to add a recovery entry; if this fails that means recovery is already in place.
@@ -824,7 +854,18 @@ func (t *Tenant) writeResolveRecovery(topologyRecovery *TopologyRecovery) error 
 	if topologyRecovery.IsSuccessful {
 		successorKeyToWrite = *topologyRecovery.SuccessorKey
 	}
-	_, err := t.Backend.Exec(`
+	// the leader stamps the end of the recovery (with Raft), so that every node writes the same end_recovery
+	endRecovery, endArgs := "NOW()", []interface{}{}
+	if topologyRecovery.RecoveryEndTimestamp != "" {
+		endRecovery, endArgs = "?", []interface{}{topologyRecovery.RecoveryEndTimestamp}
+	}
+	args := sqlutils.Args(topologyRecovery.IsSuccessful, successorKeyToWrite.Hostname, successorKeyToWrite.Port,
+		topologyRecovery.SuccessorAlias, topologyRecovery.LostReplicas.ToCommaDelimitedList(),
+		topologyRecovery.ParticipatingInstanceKeys.ToCommaDelimitedList(),
+		strings.Join(topologyRecovery.AllErrors, "\n"))
+	args = append(args, endArgs...)
+	args = append(args, topologyRecovery.UID)
+	_, err := t.Backend.Exec(fmt.Sprintf(`
 			update topology_recovery set
 				is_successful = ?,
 				successor_hostname = ?,
@@ -833,15 +874,10 @@ func (t *Tenant) writeResolveRecovery(topologyRecovery *TopologyRecovery) error 
 				lost_slaves = ?,
 				participating_instances = ?,
 				all_errors = ?,
-				end_recovery = NOW()
+				end_recovery = %s
 			where
 				uid = ?
-			`, topologyRecovery.IsSuccessful, successorKeyToWrite.Hostname, successorKeyToWrite.Port,
-		topologyRecovery.SuccessorAlias, topologyRecovery.LostReplicas.ToCommaDelimitedList(),
-		topologyRecovery.ParticipatingInstanceKeys.ToCommaDelimitedList(),
-		strings.Join(topologyRecovery.AllErrors, "\n"),
-		topologyRecovery.UID,
-	)
+			`, endRecovery), args...)
 	return log.Errore(err)
 }
 
