@@ -95,3 +95,30 @@ func TestSQLiteTenantMustNotUseRaftStore(t *testing.T) {
 		t.Errorf("expected a Raft store error, got %v", err)
 	}
 }
+
+// The tenant "default" is the control backend of the node: it may use the node's own backend
+// (the natural migration of a single-tenant installation), but no other tenant may share it.
+func TestDefaultTenantMayUseTheNodeBackend(t *testing.T) {
+	dir := t.TempDir()
+	base := newConfiguration()
+	base.BackendDB = "sqlite"
+	base.SQLite3DataFile = filepath.Join(dir, "node.db")
+	mk := func(ids ...string) []*TenantConfig {
+		var out []*TenantConfig
+		for _, id := range ids {
+			cfg := base.Clone()
+			out = append(out, &TenantConfig{ID: id, Provider: ProviderMySQL, Cfg: cfg})
+		}
+		return out
+	}
+	if err := validateTenantSet(base, mk(DefaultTenantID)); err != nil {
+		t.Fatalf("the default tenant on the node backend must be accepted: %v", err)
+	}
+	if err := validateTenantSet(base, mk("a")); err == nil {
+		t.Fatal("a tenant other than default on the node backend must be rejected")
+	}
+	// default on the node backend and another tenant that also inherits it: shared
+	if err := validateTenantSet(base, mk(DefaultTenantID, "a")); err == nil {
+		t.Fatal("two tenants on the same backend must be rejected")
+	}
+}

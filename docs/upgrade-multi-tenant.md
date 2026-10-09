@@ -132,12 +132,13 @@ KV store, ProxySQL) go to the `Config` section of `default`.
 
 Rules behind that split:
 
-* **Move the backend, do not copy it.** A tenant that does not declare its own `Backend` inherits the node's, and a
-  tenant whose backend equals the node's own is rejected
-  (`tenant "default" uses the SQLite3DataFile ... of the node's own (control) backend: give the tenant its own Backend.SQLite3DataFile`).
-  With a tenant called `default` the node has no separate control backend: `default`'s backend plays that role, so
-  the global `BackendDB`/`SQLite3DataFile`/`MySQLOrchestrator*` settings must not be there at all. (Without a tenant
-  called `default`, the global backend settings describe the control backend and must be usable.)
+* **The tenant called `default` may keep the node's backend.** The tenant `default` is the control backend of the node
+  (the manager uses its backend as the control one), so it can inherit the global
+  `BackendDB`/`SQLite3DataFile`/`MySQLOrchestrator*` settings: the data of a single-tenant installation stays where it
+  is. Any other tenant must have its own `Backend`: a tenant other than `default` that uses the node's backend, or two
+  tenants that share one backend, is rejected
+  (`tenant "x" uses the SQLite3DataFile ... of the node's own (control) backend: give the tenant its own Backend.SQLite3DataFile`).
+  Without a tenant called `default`, the global backend settings describe a separate control backend.
 * **`Provider` is the engine of the tenant**: `mysql` (also MariaDB) or `postgresql`. It replaces `ProviderType`,
   which is not accepted inside a tenant. A single-tenant PostgreSQL installation becomes `"Provider": "postgresql"`.
 * **Why move the tenant-scoped settings and not leave them in the node file.** A tenant inherits *everything* it

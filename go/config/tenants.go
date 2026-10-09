@@ -324,6 +324,12 @@ func validateTenantSet(base *Configuration, tenants []*TenantConfig) error {
 			if other, found := sqliteFiles[key]; found {
 				switch other {
 				case controlBackendOwner:
+					if t.ID == DefaultTenantID {
+						// the tenant "default" IS the control backend of the node (the
+						// manager uses its backend as the control one): sharing it is its role
+						sqliteFiles[key] = t.ID
+						break
+					}
 					errs = append(errs, fmt.Errorf("tenant %q uses the SQLite3DataFile %s of the node's own (control) backend: give the tenant its own Backend.SQLite3DataFile", t.ID, cfg.SQLite3DataFile))
 				case raftStoreOwner:
 					errs = append(errs, fmt.Errorf("tenant %q SQLite3DataFile %s is the Raft store", t.ID, cfg.SQLite3DataFile))
@@ -336,7 +342,10 @@ func validateTenantSet(base *Configuration, tenants []*TenantConfig) error {
 		case cfg.IsMySQL() && cfg.MySQLOrchestratorHost != "":
 			key := mysqlBackendKey(cfg)
 			if other, found := mysqlBackends[key]; found {
-				if other == controlBackendOwner {
+				if other == controlBackendOwner && t.ID == DefaultTenantID {
+					// the tenant "default" IS the control backend of the node (see above)
+					mysqlBackends[key] = t.ID
+				} else if other == controlBackendOwner {
 					errs = append(errs, fmt.Errorf("tenant %q uses the MySQL backend %s of the node's own (control) backend: give the tenant its own Backend.MySQLOrchestratorDatabase", t.ID, key))
 				} else {
 					errs = append(errs, fmt.Errorf("tenants %q and %q share the same MySQL backend %s", other, t.ID, key))
