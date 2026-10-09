@@ -8,6 +8,11 @@ classification of every setting are in [Multi-tenant configuration](multi-tenant
 Without a tenants file nothing changes: the process runs one implicit tenant called `default`, driven by the regular
 configuration. Everything on this page applies only when `TenantsConfigFile` is set.
 
+Related guides: [installation](install-multi-tenant.md) (source, packages, systemd, first start, troubleshooting),
+[upgrading](upgrade-multi-tenant.md) (migrating a single-tenant install, rolling upgrade, activating the second
+tenant, rollback), [Raft deployment](deployment-raft-multi-tenant.md), [MySQL backend](multi-tenant-mysql-backend.md),
+[Docker](docker-multi-tenant.md) and [operations](multi-tenant-operations.md).
+
 ## Model
 
 ```
@@ -53,7 +58,8 @@ configuration. Everything on this page applies only when `TenantsConfigFile` is 
    second tenant. Raft logs and snapshots written by a single-tenant node are read as the tenant `default`
    (`LegacyTenantID`); name the tenant that holds the existing data `default`.
 
-   Rolling upgrade of an existing single-tenant cluster (tested by `tests/multitenant/run-mixed.sh`): with the
+   Rolling upgrade of an existing single-tenant cluster (tested by `tests/multitenant/run-mixed.sh`; step by step in
+   [Upgrading to multi-tenant](upgrade-multi-tenant.md)): with the
    legacy configuration (no tenants file) old and new nodes interoperate -- the Raft log entries of the legacy
    tenant are byte for byte the old ones, and a legacy deployment keeps writing the snapshot format that old
    nodes read -- so upgrade the followers first, the leader last, one node at a time. A node can also be
