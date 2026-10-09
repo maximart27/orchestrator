@@ -88,8 +88,15 @@ leader's `raft_log` first index moved past 1 before it wipes a node.
 
 ## Findings
 
-Found by this suite in the binary of this tree (not by the scripts). None was fixed (out of scope; evidence in
-`$ORCMT_WORK/logs/<scenario>/`). *Pre-existing* = the same code exists in the legacy single-tenant orchestrator.
+Found by this suite in the binary of this tree (not by the scripts); evidence in `$ORCMT_WORK/logs/<scenario>/`.
+*Pre-existing* = the same code exists in the legacy single-tenant orchestrator. Most were fixed afterwards (**Status** line
+of each finding; the commits are on `feat/multitenant`, from the branches `mt/fx-raft`, `mt/fx-ha1` and `mt/fx-ha2`): the
+scenario results in the table above are those **before** the fixes, so scenarios 3b, 4, 5b and 10 should now be repeated
+(see "Remaining limitations" at the end for what was deliberately left).
+
+Other fixes that came out of the same work (found by the Go tests, not by the scripts): the Raft snapshot is taken at
+`fsm.Snapshot()` time and not lazily in `Persist` (`5a83494c`), and the restore deletes atomically, per tenant, what the
+Raft-only tables no longer hold (`f91f9b50`).
 
 1. **Recovery rows restored from a Raft snapshot never leave their active period** (scenario 10; the soak hit it as a
    failover that did not happen for 4 minutes). A node that restarts restores the latest snapshot, whose
@@ -100,39 +107,64 @@ Found by this suite in the binary of this tree (not by the scripts). None was fi
    rest of the day, the row stays `in_active_period=1`, and if that node becomes the leader it refuses to fail over the cluster
    (`instance X has recently been promoted ... and is in active period. It will not be failed over`). Workaround:
    `ack-recovery/cluster/<name>`. *Pre-existing* (shared snapshot code), but fatal for HA.
+   **Status: fixed** (`64cc8a59`, `mt/fx-ha1`): the timestamps are restored in their canonical form.
 2. **A replicated recovery row can be silently dropped on a follower** (scenario 4, 3 runs of 4; scenario 10). The new row is
    applied with `insert ignore` (`topology_recovery_dao.go:141`) against the unique index
    `hostname_port_active_period_uidx_topology_recovery` (`go/db/generate_base.go:344`) while the follower has not yet cleared its
    own previous row (clearing is local, per node). Evidence (scenario 4): n1 cleared row 1 at 23:42:55
    (`end_active_period_unixtime=1791502975`) and applied `write-recovery` (log index 35) in the same second; n1 never got row 2,
    n2/n3 did. The nodes then differ in `topology_recovery`. *Pre-existing.*
+   **Status: fixed** (`71bb2bf5`, `mt/fx-ha1`): a replicated `write-recovery` no longer loses its row on a follower.
 3. **A recovery in flight is not aborted when the leader loses the term** (scenario 3b, 3/3). `executeCheckAndRecoverFunction`
    checks `t.isLeader()` once (`go/logic/topology_recovery.go:1911`). Observed: a leader frozen for 24 s inside its
    pre-failover hook woke up as Follower, promoted the replica, ran the post hook (`state=Follower`), tried to write KV and
    every Raft write failed with `not leader`; the recovery row was never resolved on any node (`successor` empty, `is_successful=0`).
    *Pre-existing design.*
+   **Status: fixed** (`a18dfb8d`, `mt/fx-ha1`): a recovery in flight stops when the leader loses the Raft term. Limit: see (e) below.
 4. **An orphan recovery is not recognised as crashed** (scenario 4). Replicated rows are stamped with the applying node's
    hostname and token (`topology_recovery_dao.go:180`), so `AcknowledgeCrashedRecoveries` (`:471`, anti-join with `node_health`)
    never matches. After `kill -9` of the leader mid-failover the new leader waits the whole `RecoveryPeriodBlockSeconds` and
    then repeats the recovery from scratch: with a 60 s block and a 20 s pre hook the topology was repaired 86 s after the kill
    (120 s with 90 s); the pre hook ran twice, the post hook once, the topology ended consistent. Acceptable as anti-flapping,
    but it is the block period, not a crash detection, that bounds the outage. *Pre-existing.*
+   **Status: fixed** (`e512aa41`, `mt/fx-ha1`): a replicated recovery keeps the node that originated it, so an orphan one is recognised as crashed.
 5. **`Untag`/`UntagAll` are not replicated** (scenario 5b, 3/3): `go/http/api.go:2148,2165` call `tenant.Store.Untag` directly;
    the `delete-instance-tag` op that the applier knows (`command_applier.go:150`) is never published. *Pre-existing.*
+   **Status: fixed** (`mt/fx-ha2`, "publish untag and untag-all through Raft"): with Raft the handlers publish `delete-instance-tag`
+   (payload `inst.InstanceUntag`, nil `Key` for untag-all); the leader's applier answers the untagged instances to its API.
 6. **Commands a node fails to apply are never retried** (scenario 7, 3/3). With its tenant backend full, the node answers an
    error to the FSM and moves on; snapshots are published after every recovery (`topology_recovery.go:986`, `async-snapshot`),
    so even a restart restores a snapshot built from the backend that had missed them. Only wiping the node (Raft dir and tenant
    backends) rebuilds it (verified). The yield itself works as specified (5-6 s, exact log line, process alive).
+   **Status: not fixed, documented limitation (a).**
 7. `UnknownTenantCommands()` (`go/raft/tenant.go:78`) counts the commands a node could not apply for an unknown tenant but
    nothing exports it (no metric, no API); the log line is the only trace (scenario 8).
+   **Status: fixed** (`mt/fx-ha2`): exported as `raft.unknown_tenant_commands` (go-metrics) and
+   `orchestrator_raft_unknown_tenant_commands_total` (Prometheus).
 8. The `lost-in-recovery` downtime is written by the recovering leader locally, not through Raft (*pre-existing*): excluded
-   from the convergence fingerprint.
+   from the convergence fingerprint. **Status: not fixed, documented limitation (b).**
 9. A process frozen for longer than `fatalAfterUnhealthyDuration` (30 s) may `log.Fatal("node is unable to register health")` on
    wake-up (seen once after a 50 s freeze; a 60 s freeze survived in the next run): a race between the health tick and the
    heartbeat goroutine (`go/logic/node.go`, *pre-existing*).
+   **Status: fixed** (`mt/fx-ha2`): a gap between health ticks above 5 s is a pause of the process, and restarts the count of
+   unhealthy time from the wake-up (`go/logic/node_health_watch.go`). A control backend that really fails still yields after 5 s and
+   is fatal after 30 s.
 
 What held: no panic, nil dereference or stray `unknown tenant` in any run of any scenario; one Leader at every sample of
 the soak; commands of tenant A never landed in B or C (partitions, snapshot install, tenant mismatch); partitioned or
 frozen leaders never ran a recovery or hook after a new term had started (3a, 1, 3c); every accepted command survived a
 rolling restart; snapshot v2 install and restore into populated backends work; a broken tenant backend makes the node yield
 without killing it.
+
+## Remaining limitations
+
+Deliberately not fixed (also in `docs/multi-tenant.md`, "Known limitations"):
+
+* **(a) A command a node could not apply is never retried** (finding 6). The mitigation is the `tenant-set` detection plus
+  rebuilding the node: delete its Raft data (and, if needed, its tenant backends) and re-join it.
+* **(b) The `lost-in-recovery` downtime is written locally by the recovering leader**, not through Raft (finding 8).
+* **(c) A client retry after an ambiguous error applies the command twice**: there is no deduplication of commands.
+* **(d) `AttemptFailureDetectionRegistration` / `topology_failure_detection` have the same sealing and unique-index pattern** that
+  was fixed in `topology_recovery` (finding 2); not touched.
+* **(e) The leadership check during a recovery only helps once Raft has already demoted the node**: a few seconds of staleness
+  (a leader that has lost the term but does not know yet) are not covered.
