@@ -70,7 +70,7 @@ func TestWriteRecoveryAfterALocalClearInTheSameSecond(t *testing.T) {
 	a.Cfg.RecoveryPeriodBlockSeconds = 1
 	applier := NewCommandApplier(m)
 	age := func() {
-		execOn(t, a, `update topology_recovery set start_active_period = datetime('now', '-10 seconds') where in_active_period = 1`)
+		execOn(t, a, `update topology_recovery set start_active_period = now() - interval 10 second where in_active_period = 1`)
 	}
 
 	applyWriteRecovery(t, applier, replicatedRecovery(1, "uid-1", "db1"))

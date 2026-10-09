@@ -102,8 +102,10 @@ func TestAcknowledgeCrashedRecoveriesWaitsForTheNodeHealthMirror(t *testing.T) {
 	process.ThisNodeHealth.Update()
 	const active = `select count(*) as c from topology_recovery where in_active_period = 1`
 	if _, err := a.Backend.Exec(`insert into topology_recovery
-		(hostname, port, in_active_period, processing_node_hostname, processcing_node_token)
-		values ('db1', 3306, 1, ?, ?)`, process.ThisNodeHealth.Hostname, process.ThisNodeHealth.Token); err != nil {
+		(hostname, port, in_active_period, processing_node_hostname, processcing_node_token, uid, analysis, cluster_name,
+		 cluster_alias, count_affected_slaves, slave_hosts, acknowledged_by, acknowledge_comment, participating_instances,
+		 lost_slaves, all_errors, last_detection_id)
+		values ('db1', 3306, 1, ?, ?, 'uid-test', '', '', '', 0, '', '', '', '', '', '', 0)`, process.ThisNodeHealth.Hostname, process.ThisNodeHealth.Token); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := a.acknowledgeCrashedRecoveries(); err != nil || n != 0 {

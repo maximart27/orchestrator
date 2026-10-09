@@ -140,8 +140,8 @@ func TestApplierReapplyingBeginDowntimeDoesNotExtendNorResurrect(t *testing.T) {
 	}
 	second, _ := endOf()
 	// same absolute end (SQLite NOW() has one second resolution)
-	t1, err1 := time.Parse(time.RFC3339, first)
-	t2, err2 := time.Parse(time.RFC3339, second)
+	t1, err1 := parseBackendTime(first)
+	t2, err2 := parseBackendTime(second)
 	if err1 != nil || err2 != nil {
 		t.Fatalf("unparsable end_timestamp %q / %q", first, second)
 	}

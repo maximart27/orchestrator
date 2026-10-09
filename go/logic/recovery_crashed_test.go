@@ -77,7 +77,7 @@ func TestReplicatedRecoveryOfALiveNodeIsNotCrashed(t *testing.T) {
 		applyWriteRecovery(t, applier, tr)
 	}
 	followerM.Control().Heartbeat(process.ThisNodeHealth)
-	if _, err := follower.Backend.Exec(`insert into node_health (hostname, token, first_seen_active, last_seen_active) values ('alive-leader', 'alive-token', now(), now())`); err != nil {
+	if _, err := follower.Backend.Exec(`insert into node_health (hostname, token, first_seen_active, last_seen_active, extra_info, command) values ('alive-leader', 'alive-token', now(), now(), '', '')`); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := follower.acknowledgeCrashedRecoveries(); err != nil || n != 0 {

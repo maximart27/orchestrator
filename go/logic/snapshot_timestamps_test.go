@@ -19,8 +19,10 @@ func TestRestoredRecoveriesLeaveTheirActivePeriod(t *testing.T) {
 	leader, restored := mustTenant(t, leaderM, "a"), mustTenant(t, restoredM, "a")
 
 	execOn(t, leader, `insert into topology_recovery
-		(hostname, port, in_active_period, start_active_period, end_active_period_unixtime, processing_node_hostname, processcing_node_token)
-		values ('db1', 3306, 1, now() - interval 2 hour, 0, 'n1', 'tok')`)
+		(hostname, port, in_active_period, start_active_period, end_active_period_unixtime, processing_node_hostname, processcing_node_token,
+		 uid, analysis, cluster_name, cluster_alias, count_affected_slaves, slave_hosts, acknowledged_by, acknowledge_comment,
+		 participating_instances, lost_slaves, all_errors, last_detection_id)
+		values ('db1', 3306, 1, now() - interval 2 hour, 0, 'n1', 'tok', 'uid-1', '', '', '', 0, '', '', '', '', '', '', 0)`)
 	restoreInto(t, restoredM, snapshotOf(t, leaderM))
 
 	if n := countRowsOf(t, restored, activeRecoveries); n != 1 {
@@ -36,6 +38,7 @@ func TestRestoredRecoveriesLeaveTheirActivePeriod(t *testing.T) {
 
 // Defence in depth: rows already restored in RFC3339 (by a node without the fix) are still cleared.
 func TestClearActiveRecoveriesReadsRFC3339Timestamps(t *testing.T) {
+	skipOnMySQL(t, "RFC3339 text in a time column is a SQLite-driver artefact; MySQL rejects it")
 	m, _ := newTestManager(t, []string{"a"}, nil)
 	a := mustTenant(t, m, "a")
 	// a minute ago, on the same day as now(): only then does the text comparison depend on the 'T'
@@ -65,6 +68,7 @@ func TestClearActiveRecoveriesReadsRFC3339Timestamps(t *testing.T) {
 // For each table a snapshot carries: whatever time columns it has, a snapshot that holds them as
 // RFC3339 (what every node has written so far) is restored as text that compares with now().
 func TestRestoredTimestampsAreComparableWithNowInEveryTable(t *testing.T) {
+	skipOnMySQL(t, "inspects the SQLite schema (pragma table_info) and its RFC3339 time columns")
 	m, _ := newTestManager(t, []string{"a"}, nil)
 	a := mustTenant(t, m, "a")
 	orcdb, err := a.Backend.Open()

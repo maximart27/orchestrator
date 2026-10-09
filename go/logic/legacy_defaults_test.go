@@ -2,7 +2,6 @@ package logic
 
 import (
 	"errors"
-	"path/filepath"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -59,7 +58,7 @@ func TestManagerFromTenantsDisablesTheLegacyDefaults(t *testing.T) {
 func TestFailedManagerConstructionReenablesTheLegacyDefaults(t *testing.T) {
 	base := testBase(t)
 	bad := testTenantConfigs(t, base, []string{"bad"}, nil)
-	bad[0].Cfg.SQLite3DataFile = filepath.Join(t.TempDir(), "no-such-dir", "deeper", "bad.sqlite3")
+	breakBackend(t, bad[0].Cfg)
 	if _, err := NewTenantManagerFor(base, bad, WithoutProcessBootstrap()); err == nil {
 		t.Fatal("expected the construction to fail")
 	}
