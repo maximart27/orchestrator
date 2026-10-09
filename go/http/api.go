@@ -2131,6 +2131,30 @@ func (this *HttpAPI) Tag(w http.ResponseWriter, r *http.Request) {
 	respondTenant(w, r, &APIResponse{Code: OK, Message: fmt.Sprintf("%+v tagged with %s", instanceKey, tag.String()), Details: instanceKey})
 }
 
+// Seams of the Raft publication of the tag removal (replaced by tests).
+var (
+	raftEnabled          = orcraft.IsRaftEnabled
+	publishTenantCommand = orcraft.PublishTenantCommand
+)
+
+// untagInstances removes tag from instanceKey, or from every instance when it is nil, and answers
+// the instances it was removed from. With Raft the removal is published like every other
+// mutation, so that all nodes drop the tag; the leader's applier answers the instances.
+func untagInstances(tenant *logic.Tenant, instanceKey *inst.InstanceKey, tag *inst.Tag) (*inst.InstanceKeyMap, error) {
+	if !raftEnabled() {
+		return tenant.Store.Untag(instanceKey, tag)
+	}
+	response, err := publishTenantCommand(tenant.ID, "delete-instance-tag", inst.InstanceUntag{Key: instanceKey, T: *tag})
+	if err != nil {
+		return nil, err
+	}
+	untagged, _ := response.(*inst.InstanceKeyMap)
+	if untagged == nil {
+		untagged = inst.NewInstanceKeyMap()
+	}
+	return untagged, nil
+}
+
 // Untag removes a tag from an instance
 func (this *HttpAPI) Untag(w http.ResponseWriter, r *http.Request) {
 	tenant := tenantOf(r)
@@ -2145,7 +2169,7 @@ func (this *HttpAPI) Untag(w http.ResponseWriter, r *http.Request) {
 		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	untagged, err := tenant.Store.Untag(&instanceKey, tag)
+	untagged, err := untagInstances(tenant, &instanceKey, tag)
 	if err != nil {
 		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
@@ -2162,7 +2186,7 @@ func (this *HttpAPI) UntagAll(w http.ResponseWriter, r *http.Request) {
 		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	untagged, err := tenant.Store.Untag(nil, tag)
+	untagged, err := untagInstances(tenant, nil, tag)
 	if err != nil {
 		respondTenant(w, r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return

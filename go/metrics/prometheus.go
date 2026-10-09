@@ -278,6 +278,13 @@ var (
 		return 0
 	})
 
+	RaftUnknownTenantCommands = prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "orchestrator_raft_unknown_tenant_commands_total",
+		Help: "Raft commands this node could not apply since start because their tenant is unknown here (the tenants differ between nodes).",
+	}, func() float64 {
+		return float64(orcraft.UnknownTenantCommands())
+	})
+
 	RaftIsPartOfQuorum = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "orchestrator_raft_is_part_of_quorum",
 		Help: "1 if the node is part of raft quorum, 0 otherwise.",
@@ -321,5 +328,6 @@ func registerPrometheusUnchecked(reg prometheus.Registerer) {
 		RaftPeersTotal,
 		RaftIsPartOfQuorum,
 		TenantSetMismatch,
+		RaftUnknownTenantCommands,
 	)
 }

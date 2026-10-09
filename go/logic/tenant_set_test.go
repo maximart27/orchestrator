@@ -8,6 +8,7 @@ import (
 
 	"github.com/proxysql/orchestrator/go/config"
 	orcraft "github.com/proxysql/orchestrator/go/raft"
+	"github.com/rcrowley/go-metrics"
 )
 
 // tenantSetFixture is a manager of tenants a and b, identified as node n1, with the
@@ -204,5 +205,17 @@ func TestTenantSetCarriesNoCredentials(t *testing.T) {
 	m2, _ := newTestManager(t, []string{"a"}, map[string]string{"a": `"MySQLTopologyPassword": "another"`})
 	if !orcraft.SameTenants(m.TenantSet(), m2.TenantSet()) {
 		t.Error("nodes that differ only in credentials run the same tenant set")
+	}
+}
+
+// The count of commands a node could not apply (unknown tenant) is exported as a global metric.
+func TestUnknownTenantCommandsMetricIsRegistered(t *testing.T) {
+	registerNodeMetrics()
+	g, ok := metrics.Get("raft.unknown_tenant_commands").(metrics.Gauge)
+	if !ok {
+		t.Fatal("raft.unknown_tenant_commands is not registered as a gauge")
+	}
+	if g.Value() != orcraft.UnknownTenantCommands() {
+		t.Errorf("gauge = %d, want %d", g.Value(), orcraft.UnknownTenantCommands())
 	}
 }

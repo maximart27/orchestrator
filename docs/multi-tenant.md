@@ -34,7 +34,7 @@ configuration. Everything on this page applies only when `TenantsConfigFile` is 
    tenant and `RaftEnabled: false`:
    `process: 2 tenants configured but Raft is disabled: ...`.
 2. **The same tenants file on every Raft node.** A Raft command names its tenant; a node that does not know it
-   cannot apply it (it logs and counts `unknown tenant` commands and does not apply the command to another
+   cannot apply it (it logs and counts `unknown tenant` commands -- metric `raft.unknown_tenant_commands` / `orchestrator_raft_unknown_tenant_commands_total` -- and does not apply the command to another
    tenant). The tenants file is node-local, so keeping the files equivalent is up to the deployment
    (Ansible, config management...). Tenant IDs, providers and each tenant's configuration should be identical;
    the backend (`Backend` section) is the part that may legitimately differ per node.
@@ -188,6 +188,13 @@ registered once; process-wide metrics (health, Raft) have none. In the legacy se
 * **No PostgreSQL as orchestrator backend**: SQLite or MySQL. PostgreSQL is only a topology engine.
 * **`disable-global-recoveries` is per tenant**, not per process.
 * **No hot upgrade** from a version without multi-tenancy while a second tenant is active (see Requirements).
+* **Raft commands have no delivery guarantee beyond the log.** A command a node could not apply (unknown tenant, full or
+  broken tenant backend) is never retried on that node; rebuild it by deleting its Raft data and re-joining it. A client that
+  retries after an ambiguous error (timeout, lost leadership) may apply the command twice: there is no deduplication.
+* **Some recovery bookkeeping is local to the leader.** The `lost-in-recovery` downtime is not written through Raft, and
+  `topology_failure_detection` keeps the sealing/unique-index pattern that `topology_recovery` no longer has.
+* **The leadership check during a recovery only helps once Raft has demoted the node**; the few seconds before a leader
+  notices it has lost the term are not covered.
 
 ## Verifying
 
