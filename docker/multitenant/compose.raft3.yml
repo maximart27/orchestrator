@@ -1,0 +1,85 @@
+# Three orchestrator nodes, ONE Raft group, the same three example tenants on every node.
+# Each node has its own configuration file (its own Raft address), its own data volume and its own SQLite
+# backends; the tenants file is the same on all of them (a local copy per replica: in production keep the
+# three copies equivalent with your configuration management).
+#
+#   cp .env.example .env && cp -r secrets.example secrets      # then edit both
+#   docker compose -f compose.raft3.yml up -d --build
+#   for p in 3001 3002 3003; do curl -s http://127.0.0.1:$p/api/raft-state; echo; done     # one "Leader"
+#
+# Fixed addresses (Raft identifies a member by IP:port): keep ORC_SUBNET / ORC_N<i>_IP in sync with the
+# RaftBind / RaftAdvertise / RaftNodes of config/raft3/orchestrator-<i>.conf.json.
+name: orchestrator-mt-raft3
+
+x-orchestrator: &orchestrator
+  image: ${ORCHESTRATOR_IMAGE:-orchestrator-mt:local}
+  build:
+    context: ../..
+    dockerfile: docker/multitenant/Dockerfile
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 40s
+  mem_limit: ${ORC_MEM_LIMIT:-384m}
+  environment:
+    ORC_B_TOPOLOGY_PASSWORD: ${ORC_B_TOPOLOGY_PASSWORD:?set it in .env}
+  secrets:
+    - mariadb_a_topology
+  logging:
+    driver: json-file
+    options: {max-size: 20m, max-file: "5"}
+
+services:
+  orchestrator-1:
+    <<: *orchestrator
+    hostname: orchestrator-1
+    ports: ["${ORC_HTTP_BIND:-127.0.0.1}:3001:3000"]
+    volumes:
+      - orc-data-1:/var/lib/orchestrator
+      - ./config/raft3/orchestrator-1.conf.json:/etc/orchestrator/orchestrator.conf.json:ro
+      - ./config/tenants.json:/etc/orchestrator/tenants.json:ro
+    networks:
+      orchnet:
+        ipv4_address: ${ORC_N1_IP:-172.28.61.11}
+
+  orchestrator-2:
+    <<: *orchestrator
+    hostname: orchestrator-2
+    depends_on:
+      orchestrator-1: {condition: service_healthy}
+    ports: ["${ORC_HTTP_BIND:-127.0.0.1}:3002:3000"]
+    volumes:
+      - orc-data-2:/var/lib/orchestrator
+      - ./config/raft3/orchestrator-2.conf.json:/etc/orchestrator/orchestrator.conf.json:ro
+      - ./config/tenants.json:/etc/orchestrator/tenants.json:ro
+    networks:
+      orchnet:
+        ipv4_address: ${ORC_N2_IP:-172.28.61.12}
+
+  orchestrator-3:
+    <<: *orchestrator
+    hostname: orchestrator-3
+    depends_on:
+      orchestrator-1: {condition: service_healthy}
+    ports: ["${ORC_HTTP_BIND:-127.0.0.1}:3003:3000"]
+    volumes:
+      - orc-data-3:/var/lib/orchestrator
+      - ./config/raft3/orchestrator-3.conf.json:/etc/orchestrator/orchestrator.conf.json:ro
+      - ./config/tenants.json:/etc/orchestrator/tenants.json:ro
+    networks:
+      orchnet:
+        ipv4_address: ${ORC_N3_IP:-172.28.61.13}
+
+secrets:
+  mariadb_a_topology:
+    file: ./secrets/mariadb_a_topology.cnf
+
+volumes:
+  orc-data-1:
+  orc-data-2:
+  orc-data-3:
+
+networks:
+  orchnet:
+    ipam:
+      config:
+        - subnet: ${ORC_SUBNET:-172.28.61.0/24}

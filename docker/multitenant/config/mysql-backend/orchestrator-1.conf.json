@@ -1,0 +1,18 @@
+{
+  "Debug": false,
+  "ListenAddress": ":3000",
+  "HTTPAdvertise": "http://172.28.62.11:3000",
+  "BackendDB": "mysql",
+  "MySQLOrchestratorHost": "backend",
+  "MySQLOrchestratorPort": 3306,
+  "MySQLOrchestratorDatabase": "orc_n1_control",
+  "MySQLOrchestratorCredentialsConfigFile": "/run/secrets/orchestrator_backend",
+  "MySQLOrchestratorMaxPoolConnections": 20,
+  "RaftEnabled": true,
+  "RaftDataDir": "/var/lib/orchestrator/raft",
+  "RaftBind": "172.28.62.11",
+  "RaftAdvertise": "172.28.62.11",
+  "DefaultRaftPort": 10008,
+  "RaftNodes": ["172.28.62.11", "172.28.62.12", "172.28.62.13"],
+  "TenantsConfigFile": "/etc/orchestrator/tenants.json"
+}

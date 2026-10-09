@@ -1,0 +1,117 @@
+# Three orchestrator nodes (one Raft group) whose backends are DATABASES of ONE MariaDB server:
+# per node a control database (orc_n<i>_control) and one database per tenant (orc_n<i>_<tenant>).
+# Every Raft node needs its OWN set of databases: Raft replicates commands and each node applies them to its
+# own backend; sharing a database between nodes would apply every command three times to the same rows.
+# The Raft directory (volume orc-data-<i>) is still local to each node.
+#
+#   cp .env.example .env && cp -r secrets.example secrets      # then edit both
+#   docker compose -f compose.mysql-backend.yml up -d --build
+#   docker compose -f compose.mysql-backend.yml exec backend mariadb -uroot -p"$(cat secrets/mariadb_root_password)" -e 'show databases'
+#
+# Keep ORC_SUBNET / ORC_N<i>_IP in sync with config/mysql-backend/orchestrator-<i>.conf.json.
+name: orchestrator-mt-mysql
+
+x-orchestrator: &orchestrator
+  image: ${ORCHESTRATOR_IMAGE:-orchestrator-mt:local}
+  build:
+    context: ../..
+    dockerfile: docker/multitenant/Dockerfile
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 40s
+  mem_limit: ${ORC_MEM_LIMIT:-384m}
+  environment:
+    ORC_B_TOPOLOGY_PASSWORD: ${ORC_B_TOPOLOGY_PASSWORD:?set it in .env}
+  secrets:
+    - mariadb_a_topology
+    - orchestrator_backend
+  depends_on:
+    backend: {condition: service_healthy}
+  logging:
+    driver: json-file
+    options: {max-size: 20m, max-file: "5"}
+
+services:
+  backend:
+    image: ${MARIADB_IMAGE:-mariadb:11.4}
+    restart: unless-stopped
+    mem_limit: ${BACKEND_MEM_LIMIT:-384m}
+    environment:
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/mariadb_root_password
+    command:
+      - --innodb-buffer-pool-size=64M
+      - --innodb-log-file-size=32M
+      - --performance-schema=OFF
+      - --max-connections=400            # 3 nodes x (1 control + 3 tenants) x MySQLOrchestratorMaxPoolConnections(20) = 240
+      - --skip-name-resolve
+    volumes:
+      - backend-data:/var/lib/mysql                                   # the orchestrator state: do not lose it
+      - ./config/mysql-backend/initdb/01-orchestrator-backend.sh:/docker-entrypoint-initdb.d/01-orchestrator-backend.sh:ro
+    secrets:
+      - mariadb_root_password
+      - orchestrator_backend
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks:
+      orchnet:
+        ipv4_address: ${BACKEND_IP:-172.28.62.200}
+
+  orchestrator-1:
+    <<: *orchestrator
+    hostname: orchestrator-1
+    ports: ["${ORC_HTTP_BIND:-127.0.0.1}:3001:3000"]
+    volumes:
+      - orc-data-1:/var/lib/orchestrator
+      - ./config/mysql-backend/orchestrator-1.conf.json:/etc/orchestrator/orchestrator.conf.json:ro
+      - ./config/mysql-backend/tenants-1.json:/etc/orchestrator/tenants.json:ro
+    networks:
+      orchnet:
+        ipv4_address: ${ORC_N1_IP:-172.28.62.11}
+
+  orchestrator-2:
+    <<: *orchestrator
+    hostname: orchestrator-2
+    ports: ["${ORC_HTTP_BIND:-127.0.0.1}:3002:3000"]
+    volumes:
+      - orc-data-2:/var/lib/orchestrator
+      - ./config/mysql-backend/orchestrator-2.conf.json:/etc/orchestrator/orchestrator.conf.json:ro
+      - ./config/mysql-backend/tenants-2.json:/etc/orchestrator/tenants.json:ro
+    networks:
+      orchnet:
+        ipv4_address: ${ORC_N2_IP:-172.28.62.12}
+
+  orchestrator-3:
+    <<: *orchestrator
+    hostname: orchestrator-3
+    ports: ["${ORC_HTTP_BIND:-127.0.0.1}:3003:3000"]
+    volumes:
+      - orc-data-3:/var/lib/orchestrator
+      - ./config/mysql-backend/orchestrator-3.conf.json:/etc/orchestrator/orchestrator.conf.json:ro
+      - ./config/mysql-backend/tenants-3.json:/etc/orchestrator/tenants.json:ro
+    networks:
+      orchnet:
+        ipv4_address: ${ORC_N3_IP:-172.28.62.13}
+
+secrets:
+  mariadb_a_topology:
+    file: ./secrets/mariadb_a_topology.cnf
+  orchestrator_backend:
+    file: ./secrets/orchestrator_backend.cnf
+  mariadb_root_password:
+    file: ./secrets/mariadb_root_password
+
+volumes:
+  backend-data:
+  orc-data-1:
+  orc-data-2:
+  orc-data-3:
+
+networks:
+  orchnet:
+    ipam:
+      config:
+        - subnet: ${ORC_SUBNET:-172.28.62.0/24}
