@@ -498,12 +498,19 @@ func (t *Tenant) ExpireBlockedRecoveries() error {
 // acknowledged within the same second collided on the node that applied them in that second, and not on a
 // node that applied them in different seconds. The stamp is now never lower than the last one of the
 // instance plus one, so an acknowledgement does not fail whatever second it is applied in, on any node.
-func (t *Tenant) acknowledgeRecoveries(owner string, comment string, markEndRecovery bool, whereClause string, args []interface{}) (countAcknowledgedEntries int64, err error) {
-	additionalSet := ``
-	if markEndRecovery {
-		additionalSet = `
-				end_recovery=IFNULL(end_recovery, NOW()),
-			`
+func (t *Tenant) acknowledgeRecoveries(owner string, comment string, opts ackOptions, whereClause string, args []interface{}) (countAcknowledgedEntries int64, err error) {
+	// the instant of the acknowledgement: the one the leader stamped in the entry, so that every node writes
+	// the same (acknowledged_at, end_recovery); the clock of the node only when the entry carries none
+	nowExpr, nowArgs := "NOW()", []interface{}{}
+	if !opts.at.IsZero() {
+		nowExpr, nowArgs = "?", []interface{}{t.backendTimestamp(opts.at)}
+	}
+	additionalSet, endRecoveryArgs := ``, []interface{}{}
+	if opts.markEndRecovery {
+		additionalSet = fmt.Sprintf(`
+				end_recovery=IFNULL(end_recovery, %s),
+			`, nowExpr)
+		endRecoveryArgs = nowArgs
 	}
 	selectQuery := t.Backend.TranslateStatement(fmt.Sprintf(`
 			select
@@ -521,12 +528,12 @@ func (t *Tenant) acknowledgeRecoveries(owner string, comment string, markEndReco
 				end_active_period_unixtime = ?,
 				%s
 				acknowledged = 1,
-				acknowledged_at = NOW(),
+				acknowledged_at = %s,
 				acknowledged_by = ?,
 				acknowledge_comment = ?
 			where
 				recovery_id = ?
-		`, additionalSet))
+		`, additionalSet, nowExpr))
 	lastEndQuery := `
 			select
 				IFNULL(max(end_active_period_unixtime), 0) as last_end
@@ -576,7 +583,10 @@ func (t *Tenant) acknowledgeRecoveries(owner string, comment string, markEndReco
 		_ = rows.Close()
 
 		var acknowledged int64
-		now := time.Now().Unix()
+		now := opts.at.Unix()
+		if opts.at.IsZero() {
+			now = time.Now().Unix()
+		}
 		for _, tg := range targets {
 			end := tg.end
 			if end == 0 {
@@ -590,7 +600,10 @@ func (t *Tenant) acknowledgeRecoveries(owner string, comment string, markEndReco
 					end = lastEnd + 1
 				}
 			}
-			result, err := tx.Exec(updateQuery, end, owner, comment, tg.id)
+			updateArgs := append([]interface{}{end}, endRecoveryArgs...)
+			updateArgs = append(updateArgs, nowArgs...)
+			updateArgs = append(updateArgs, owner, comment, tg.id)
+			result, err := tx.Exec(updateQuery, updateArgs...)
 			if err != nil {
 				_ = tx.Rollback()
 				return err
@@ -614,34 +627,71 @@ func (t *Tenant) acknowledgeRecoveries(owner string, comment string, markEndReco
 	return countAcknowledgedEntries, nil
 }
 
+// ackOptions are the two things an acknowledgement can carry from the leader that decided it.
+type ackOptions struct {
+	// at is the instant of the acknowledgement; zero means the clock of this node
+	at time.Time
+	// markEndRecovery also stamps end_recovery, for the recoveries that will never finish
+	markEndRecovery bool
+}
+
+// ackOptionsOf are the options of an acknowledgement that came through Raft.
+func ackOptionsOf(ack *RecoveryAcknowledgement) ackOptions {
+	return ackOptions{at: ack.CreatedAt, markEndRecovery: ack.EndRecovery}
+}
+
+// backendTimestamp renders an instant the way NOW() of this tenant's backend does (UTC in SQLite).
+func (t *Tenant) backendTimestamp(at time.Time) string {
+	if t.Backend.IsSQLite() {
+		at = at.UTC()
+	}
+	return at.Format("2006-01-02 15:04:05")
+}
+
 // AcknowledgeAllRecoveries acknowledges all unacknowledged recoveries.
 func (t *Tenant) AcknowledgeAllRecoveries(owner string, comment string) (countAcknowledgedEntries int64, err error) {
+	return t.acknowledgeAllRecoveries(ackOptions{}, owner, comment)
+}
+
+func (t *Tenant) acknowledgeAllRecoveries(opts ackOptions, owner string, comment string) (countAcknowledgedEntries int64, err error) {
 	whereClause := `1 = 1`
-	return t.acknowledgeRecoveries(owner, comment, false, whereClause, sqlutils.Args())
+	return t.acknowledgeRecoveries(owner, comment, opts, whereClause, sqlutils.Args())
 }
 
 // AcknowledgeRecovery acknowledges a particular recovery.
 // This also implied clearing their active period, which in turn enables further recoveries on those topologies
 func (t *Tenant) AcknowledgeRecovery(recoveryId int64, owner string, comment string) (countAcknowledgedEntries int64, err error) {
-	whereClause := `recovery_id = ?`
-	return t.acknowledgeRecoveries(owner, comment, false, whereClause, sqlutils.Args(recoveryId))
+	return t.acknowledgeRecovery(ackOptions{}, recoveryId, owner, comment)
 }
 
-// AcknowledgeRecovery acknowledges a particular recovery.
+func (t *Tenant) acknowledgeRecovery(opts ackOptions, recoveryId int64, owner string, comment string) (countAcknowledgedEntries int64, err error) {
+	whereClause := `recovery_id = ?`
+	return t.acknowledgeRecoveries(owner, comment, opts, whereClause, sqlutils.Args(recoveryId))
+}
+
+// AcknowledgeRecoveryByUID acknowledges a particular recovery.
 // This also implied clearing their active period, which in turn enables further recoveries on those topologies
 func (t *Tenant) AcknowledgeRecoveryByUID(recoveryUID string, owner string, comment string) (countAcknowledgedEntries int64, err error) {
+	return t.acknowledgeRecoveryByUID(ackOptions{}, recoveryUID, owner, comment)
+}
+
+func (t *Tenant) acknowledgeRecoveryByUID(opts ackOptions, recoveryUID string, owner string, comment string) (countAcknowledgedEntries int64, err error) {
 	whereClause := `uid = ?`
-	return t.acknowledgeRecoveries(owner, comment, false, whereClause, sqlutils.Args(recoveryUID))
+	return t.acknowledgeRecoveries(owner, comment, opts, whereClause, sqlutils.Args(recoveryUID))
 }
 
 // AcknowledgeClusterRecoveries marks active recoveries for given cluster as acknowledged.
 // This also implied clearing their active period, which in turn enables further recoveries on those topologies
 func (t *Tenant) AcknowledgeClusterRecoveries(clusterName string, owner string, comment string) (countAcknowledgedEntries int64, err error) {
+	return t.acknowledgeClusterRecoveries(ackOptions{}, clusterName, owner, comment)
+}
+
+func (t *Tenant) acknowledgeClusterRecoveries(opts ackOptions, clusterName string, owner string, comment string) (countAcknowledgedEntries int64, err error) {
 	{
 		whereClause := `cluster_name = ?`
 		args := sqlutils.Args(clusterName)
 		t.clearAcknowledgedFailureDetections(whereClause, args)
-		count, err := t.acknowledgeRecoveries(owner, comment, false, whereClause, args)
+		count, err := t.acknowledgeRecoveries(owner, comment, opts, whereClause, args)
 		if err != nil {
 			return count, err
 		}
@@ -655,7 +705,7 @@ func (t *Tenant) AcknowledgeClusterRecoveries(clusterName string, owner string, 
 		whereClause := `cluster_alias = ? and cluster_alias != ''`
 		args := sqlutils.Args(clusterInfo.ClusterAlias)
 		t.clearAcknowledgedFailureDetections(whereClause, args)
-		count, err := t.acknowledgeRecoveries(owner, comment, false, whereClause, args)
+		count, err := t.acknowledgeRecoveries(owner, comment, opts, whereClause, args)
 		if err != nil {
 			return count, err
 		}
@@ -668,13 +718,17 @@ func (t *Tenant) AcknowledgeClusterRecoveries(clusterName string, owner string, 
 // AcknowledgeInstanceRecoveries marks active recoveries for given instance as acknowledged.
 // This also implied clearing their active period, which in turn enables further recoveries on those topologies
 func (t *Tenant) AcknowledgeInstanceRecoveries(instanceKey *inst.InstanceKey, owner string, comment string) (countAcknowledgedEntries int64, err error) {
+	return t.acknowledgeInstanceRecoveries(ackOptions{}, instanceKey, owner, comment)
+}
+
+func (t *Tenant) acknowledgeInstanceRecoveries(opts ackOptions, instanceKey *inst.InstanceKey, owner string, comment string) (countAcknowledgedEntries int64, err error) {
 	whereClause := `
 			hostname = ?
 			and port = ?
 		`
 	args := sqlutils.Args(instanceKey.Hostname, instanceKey.Port)
 	t.clearAcknowledgedFailureDetections(whereClause, args)
-	return t.acknowledgeRecoveries(owner, comment, false, whereClause, args)
+	return t.acknowledgeRecoveries(owner, comment, opts, whereClause, args)
 }
 
 // AcknowledgeInstanceCompletedRecoveries marks active and COMPLETED recoveries for given instance as acknowledged.
@@ -685,7 +739,53 @@ func (t *Tenant) AcknowledgeInstanceCompletedRecoveries(instanceKey *inst.Instan
 			and port = ?
 			and end_recovery is not null
 		`
-	return t.acknowledgeRecoveries(owner, comment, false, whereClause, sqlutils.Args(instanceKey.Hostname, instanceKey.Port))
+	return t.acknowledgeRecoveries(owner, comment, ackOptions{}, whereClause, sqlutils.Args(instanceKey.Hostname, instanceKey.Port))
+}
+
+// crashedRecoveriesWhere selects the active recoveries that are not finished and whose processing node is
+// not in node_health.
+const crashedRecoveriesWhere = `
+			in_active_period = 1
+			and end_recovery is null
+			and concat(processing_node_hostname, ':', processcing_node_token) not in (
+				select concat(hostname, ':', token) from node_health
+			)
+		`
+
+// crashedRecoveryComment and crashedRecoveryOwner are what the rows of an acknowledged crashed recovery say.
+const (
+	crashedRecoveryOwner   = "orchestrator"
+	crashedRecoveryComment = "detected crashed recovery"
+)
+
+// recoveryPublish is how a recovery acknowledgement reaches the other nodes. A seam for the tests.
+var recoveryPublish = orcraft.PublishTenantCommand
+
+// CrashedRecoveryAcknowledgements are the "ack-recovery" entries that acknowledge the recoveries whose
+// processing node has crashed, one per recovery, all stamped with the same instant. The leader publishes
+// them (see AcknowledgeCrashedRecoveries); a node that is not the leader has none.
+func (t *Tenant) CrashedRecoveryAcknowledgements() ([]*RecoveryAcknowledgement, error) {
+	if !t.isLeader() {
+		return nil, nil
+	}
+	var acks []*RecoveryAcknowledgement
+	now := time.Now()
+	err := t.Backend.Query(t.Backend.TranslateStatement(`
+			select recovery_id, uid
+			from topology_recovery
+			where acknowledged = 0 and `+crashedRecoveriesWhere+`
+			order by recovery_id
+		`), sqlutils.Args(), func(m sqlutils.RowMap) error {
+		ack := &RecoveryAcknowledgement{CreatedAt: now, Owner: crashedRecoveryOwner, Comment: crashedRecoveryComment, EndRecovery: true}
+		if uid := m.GetString("uid"); uid != "" {
+			ack.UID = uid
+		} else {
+			ack.Id = m.GetInt64("recovery_id")
+		}
+		acks = append(acks, ack)
+		return nil
+	})
+	return acks, log.Errore(err)
 }
 
 // AcknowledgeCrashedRecoveries marks recoveries whose processing nodes has crashed as acknowledged.
@@ -693,21 +793,28 @@ func (t *Tenant) AcknowledgeInstanceCompletedRecoveries(instanceKey *inst.Instan
 // node_health only knows the nodes this node heard from (each node has its own, and itself), and a
 // replicated recovery carries the node that originated it: a recovery of any other node than the one
 // that acknowledges is orphaned. Only the leader may acknowledge them: it is the one that needs the
-// instance released, and an acknowledgement is local, so a follower doing it would make its rows differ
-// from the leader's for the recoveries that are alive. Without Raft the leader is the elected node,
-// which is who runs the recovery loop anyway.
+// instance released. Without Raft the leader is the elected node, which is who runs the recovery loop
+// anyway, and the acknowledgement is local. With Raft it is replicated ("ack-recovery", stamped by the
+// leader), so that every node ends with the same acknowledged rows and none of them keeps an orphan
+// recovery that the leader closed.
 func (t *Tenant) AcknowledgeCrashedRecoveries() (countAcknowledgedEntries int64, err error) {
 	if !t.isLeader() {
 		return 0, nil
 	}
-	whereClause := `
-			in_active_period = 1
-			and end_recovery is null
-			and concat(processing_node_hostname, ':', processcing_node_token) not in (
-				select concat(hostname, ':', token) from node_health
-			)
-		`
-	return t.acknowledgeRecoveries("orchestrator", "detected crashed recovery", true, whereClause, sqlutils.Args())
+	if recoveryRaftEnabled() {
+		acks, err := t.CrashedRecoveryAcknowledgements()
+		if err != nil {
+			return 0, err
+		}
+		for _, ack := range acks {
+			if _, err := recoveryPublish(t.ID, "ack-recovery", ack); err != nil {
+				return countAcknowledgedEntries, log.Errore(err)
+			}
+			countAcknowledgedEntries++
+		}
+		return countAcknowledgedEntries, nil
+	}
+	return t.acknowledgeRecoveries(crashedRecoveryOwner, crashedRecoveryComment, ackOptions{markEndRecovery: true}, crashedRecoveriesWhere, sqlutils.Args())
 }
 
 // ResolveRecovery is called on completion of a recovery process and updates the recovery status.

@@ -56,6 +56,9 @@ type RecoveryAcknowledgement struct {
 	Id            int64
 	UID           string
 	AllRecoveries bool
+	// EndRecovery also stamps end_recovery (at CreatedAt) on the recoveries it acknowledges: the ones of a
+	// node that crashed, which will never finish them. Optional: an entry without it acknowledges as before.
+	EndRecovery bool `json:",omitempty"`
 }
 
 func NewRecoveryAcknowledgement(owner string, comment string) *RecoveryAcknowledgement {

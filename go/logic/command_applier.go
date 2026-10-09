@@ -226,20 +226,22 @@ func (t *Tenant) applyAckRecovery(value []byte) interface{} {
 	if err != nil {
 		return log.Errore(err)
 	}
+	// every node acknowledges at the instant the leader stamped, not at its own
+	opts := ackOptionsOf(&ack)
 	if ack.AllRecoveries {
-		_, err = t.AcknowledgeAllRecoveries(ack.Owner, ack.Comment)
+		_, err = t.acknowledgeAllRecoveries(opts, ack.Owner, ack.Comment)
 	}
 	if ack.ClusterName != "" {
-		_, err = t.AcknowledgeClusterRecoveries(ack.ClusterName, ack.Owner, ack.Comment)
+		_, err = t.acknowledgeClusterRecoveries(opts, ack.ClusterName, ack.Owner, ack.Comment)
 	}
 	if ack.Key.IsValid() {
-		_, err = t.AcknowledgeInstanceRecoveries(&ack.Key, ack.Owner, ack.Comment)
+		_, err = t.acknowledgeInstanceRecoveries(opts, &ack.Key, ack.Owner, ack.Comment)
 	}
 	if ack.Id > 0 {
-		_, err = t.AcknowledgeRecovery(ack.Id, ack.Owner, ack.Comment)
+		_, err = t.acknowledgeRecovery(opts, ack.Id, ack.Owner, ack.Comment)
 	}
 	if ack.UID != "" {
-		_, err = t.AcknowledgeRecoveryByUID(ack.UID, ack.Owner, ack.Comment)
+		_, err = t.acknowledgeRecoveryByUID(opts, ack.UID, ack.Owner, ack.Comment)
 	}
 	return err
 }
