@@ -29,7 +29,7 @@ log "infrastructure + config ready after $((SECONDS-T0))s"
 
 node_start $N
 wait_until "$T_NODE_READY" "$NC HTTP" node_http_ready $N || { node_logs $N | tail -40 >&2; die "orchestrator did not come up"; }
-wait_until "$T_RAFT_ELECTION" "$NC is the raft Leader" bash -c "[ \"\$(source $ORCMT_DIR/lib.sh; raft_state $N)\" = Leader ]" \
+wait_until "$T_RAFT_ELECTION" "$NC is the raft Leader" bash -c "[ \"\$(source $ORCMT_DIR/lib-mysql.sh; raft_state $N)\" = Leader ]" \
   && pass "raft of one: $N is Leader" || fail "raft of one: $N never became Leader" "$(api $N /api/raft-status)"
 T_UP=$SECONDS
 
