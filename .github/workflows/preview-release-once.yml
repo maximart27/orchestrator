@@ -1,0 +1,107 @@
+name: Publish multi-tenant preview (one-shot)
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/preview-release-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Linux ${{ matrix.goarch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goarch: amd64
+          - runner: ubuntu-24.04-arm
+            goarch: arm64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.7'
+          cache: true
+
+      - name: Build preview binary
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: 4.30.0-multitenant-preview.1
+        run: |
+          mkdir -p package
+          GOOS=linux GOARCH="$GOARCH" go build -ldflags "-X main.AppVersion=${VERSION} -X main.GitCommit=${GITHUB_SHA}" -o package/orchestrator ./go/cmd/orchestrator
+          cp LICENSE README.md package/
+          tar -C package -czf "orchestrator-v${VERSION}-linux-${GOARCH}.tar.gz" .
+          sha256sum "orchestrator-v${VERSION}-linux-${GOARCH}.tar.gz" > "orchestrator-v${VERSION}-linux-${GOARCH}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preview-${{ matrix.goarch }}
+          path: |
+            orchestrator-v4.30.0-multitenant-preview.1-linux-${{ matrix.goarch }}.tar.gz
+            orchestrator-v4.30.0-multitenant-preview.1-linux-${{ matrix.goarch }}.tar.gz.sha256
+
+  release:
+    name: Publish prerelease
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: v4.30.0-multitenant-preview.1
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: preview-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write release notes
+        run: |
+          cat > /tmp/release-notes.md <<'EOF'
+          ## Multi-tenant Preview 1
+
+          This is the first public preview of the multi-tenant Orchestrator implementation in this fork.
+
+          ### What this preview adds
+          - Multiple isolated tenants managed by one Orchestrator deployment
+          - Tenant-aware discovery, topology state, analysis and recovery
+          - Tenant-aware API and CLI
+          - Tenant-aware hooks and Prometheus metrics
+          - ProxySQL and KV integration per tenant
+          - Multi-tenant Raft deployment and rolling-upgrade documentation
+          - End-to-end, chaos and mixed-version test coverage under `tests/multitenant`
+
+          ### Important preview limitations
+          - Treat this as a testing/feedback release, not a production recommendation yet.
+          - With more than one tenant, Raft is required and all nodes must use the same tenant definitions.
+          - Authentication is shared across tenants.
+          - `ServeAgentsHttp` agents/seeds are not supported in multi-tenant mode.
+          - PostgreSQL cannot be used as the Orchestrator backend in multi-tenant mode.
+          - Tenant configuration changes require a restart.
+
+          ### Documentation
+          Start with `docs/multi-tenant.md`, then see the configuration, installation, Raft, Docker, upgrade and operations guides linked from the repository README.
+
+          ### Downloads
+          Linux amd64 and arm64 preview tarballs are attached, together with SHA-256 checksum files. GitHub also provides the source archives automatically.
+
+          Feedback, real-world test results and edge cases are very welcome.
+          EOF
+
+      - name: Create GitHub prerelease
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target master \
+            --title "Multi-tenant Preview 1" \
+            --prerelease \
+            --notes-file /tmp/release-notes.md
